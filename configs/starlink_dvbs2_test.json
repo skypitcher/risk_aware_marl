@@ -1,0 +1,49 @@
+{
+    "time_limit_seconds": 30,
+    "traffic_type": "poisson",
+    "poisson_traffic_rate": 10,
+    "prob_normal_packet": 0.8,
+    "small_packet_size": 0.016,
+    "normal_packet_size": 0.064,
+    "small_packet_delay_limit": 999,
+    "normal_packet_delay_limit": 999,
+    "default_ttl": 64,
+    "reroute_latency": 5,
+    "train_interval_ms": 1,
+    "update_interval_ms": 100,
+    "verbose": true,
+    "network": {
+        "altitude": 600,
+        "inclination": 53,
+        "num_orbits": 72,
+        "num_sats_per_orbit": 22,
+        "phasing": 3,
+        "min_elevation_angle_deg": 15,
+        "max_gsl_per_gs": 4,
+        "max_gsl_per_sat": 4,
+        "node_buffer_size": 16.0,
+        "link_buffer_size": 16.0,
+        "gsl_data_rate": 1.0,
+        "isl_data_rate": 0.05,
+        "ground_stations": [
+            {
+                "name": "Beijing",
+                "latitude": 39.9087,
+                "longitude": 116.3975,
+                "population": 10
+            },
+            {
+                "name": "Luxembourg",
+                "latitude": 49.6116,
+                "longitude": 6.1319,
+                "population": 10
+            },
+            {
+                "name": "Dubai",
+                "latitude": 25.2769,
+                "longitude": 55.2962,
+                "population": 10
+            }
+        ]
+    }
+}

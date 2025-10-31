@@ -1,0 +1,22 @@
+{
+    "name": "MaDQN",
+    "hidden_dim": 512,
+    "num_hidden_layers": 2,
+    "weight_init": "orthogonal",
+    "learning_rate": 0.0001,
+    "batch_size": 2048,
+    "buffer_size": 300000,
+    "gamma": 0.99,
+    "epsilon_start": 0.99,
+    "epsilon_end": 0.01,
+    "epsilon_decay_method": "exponential",
+    "epsilon_decay_steps": 200000,
+    "train_start_size": 1000,
+    "train_steps_per_update": 1,
+    "update_method": "soft",
+    "soft_update_tau": 0.05,
+    "hard_update_interval": 10,
+    "clip_grad_norm": 0.5,
+    "use_layer_norm": true,
+    "device": "cuda"
+}

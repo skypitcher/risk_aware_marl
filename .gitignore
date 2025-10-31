@@ -1,0 +1,30 @@
+# IDEs and editors
+.idea/
+.vscode/
+
+# Python cache files
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# related docs read/created during development
+doc/
+
+# simulation results
+runs_train/
+runs_eval/
+
+# slurm output
+slurm-*.out
+
+# powershell scripts
+*.psm1
+*.ps1
+*.sh
+
+# vibe coding tools
+CLAUDE.md
+.claude/
+GEMINI.md
+.gemini/
