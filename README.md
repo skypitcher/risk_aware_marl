@@ -2,14 +2,14 @@
 
 [![Python 3.11](https://img.shields.io/badge/python-3.11-blue.svg)](https://www.python.org/downloads/release/python-3110/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-[![arXiv](https://img.shields.io/badge/arXiv-2025.XXXXX-b31b1b.svg)](https://arxiv.org/abs/2025.XXXXX)
+[![arXiv](https://img.shields.io/badge/arXiv-2510.27506-b31b1b.svg)](https://[arxiv.org/abs/2510.27506](https://arxiv.org/abs/2510.27506))
 [![PyTorch](https://img.shields.io/badge/PyTorch-2.0+-red.svg)](https://pytorch.org/)
 
 > **Official implementation** of the preprint paper: "Asynchronous Risk-Aware Multi-Agent Packet Routing for Ultra-Dense LEO Satellite Networks"
 >
 > **Authors**: Ke He, Thang X. Vu, Le He, Lisheng Fan, Symeon Chatzinotas, and Björn Ottersten
 >
-> 📄 **[Read Paper (PDF)](./manuscript.pdf)**
+> 📄 **[Read Paper (PDF)](https://arxiv.org/abs/2510.27506)**
 
 ![Ultra-Dense LEO Constellation](figs/topology.svg)
 
@@ -169,7 +169,7 @@ If you use this code in your research, please cite our related papers:
 
 ```bash
 # Clone the repository
-git clone https://github.com/yourusername/risk_aware_marl.git
+git clone https://github.com/skypitcher/risk_aware_marl.git
 cd risk_aware_marl
 
 # Create conda environment
