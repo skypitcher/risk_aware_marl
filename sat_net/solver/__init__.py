@@ -9,9 +9,12 @@ from sat_net.solver.primal_avg import PrimalAvg
 from sat_net.solver.primal_cvar import PrimalCVaR
 from sat_net.solver.sac import MaSAC
 from sat_net.solver.spf import SPF
+from typing import Optional
+from sat_net.util import NamedDict
+from torch.utils.tensorboard import SummaryWriter
 
 
-def create_solver(obs_dim, action_dim, solver_config, tf_writer):
+def create_solver(obs_dim: int, action_dim: int, solver_config: NamedDict, tf_writer: Optional[SummaryWriter] = None) -> BaseSolver:
     if solver_config.name == "PrimalCVaR":
         solver = PrimalCVaR(
             obs_dim=obs_dim,
@@ -59,7 +62,6 @@ __all__ = [
     "BaseSolver",
     "SPF",
     "MaDQN",
-    "MaIQN",
     "MaSAC",
     "PrimalCVaR",
     "PrimalAvg",

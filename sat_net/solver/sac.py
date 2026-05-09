@@ -1,6 +1,6 @@
 import os
 from pathlib import Path
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Optional, Dict
 
 import numpy as np
 import torch
@@ -13,7 +13,8 @@ from sat_net.nn import (
     TwinCritic,
     calc_heuristic_entropy,
     hard_update,
-    soft_update, ReplayBuffer,
+    soft_update,
+    ReplayBuffer,
 )
 from sat_net.solver.base_solver import BaseSolver
 from sat_net.util import NamedDict
@@ -22,15 +23,16 @@ if TYPE_CHECKING:
     from sat_net.datablock import DataBlock
 
 
-class MaSAC(BaseSolver):
+class SACAgent:
     """
-    Multi-agent soft actor-critic solver using a global model (CTDE).
+    SAC Agent encapsulating the Soft Actor-Critic logic.
     """
 
     def __init__(self, obs_dim: int, action_dim: int, config: "NamedDict", tf_writer: Optional[SummaryWriter] = None):
-        super().__init__(tf_writer=tf_writer)
         self.config = config
-        
+        self._tf_writer = tf_writer
+        self.device = config.device
+
         # Dimensions
         self.state_dim = obs_dim
         self.action_dim = action_dim
@@ -40,8 +42,6 @@ class MaSAC(BaseSolver):
         self.actor_use_layer_norm = config.actor_use_layer_norm
         self.critic_use_layer_norm = config.critic_use_layer_norm
         self.softmax_temperature = config.softmax_temperature
-
-        assert self.weight_init in ["orthogonal", "xavier", "he"]
 
         # Training parameters
         self.discount = config.discount
@@ -53,7 +53,6 @@ class MaSAC(BaseSolver):
         self.train_steps_per_update = config.train_steps_per_update
 
         self.learning_rate = config.learning_rate
-        self.device = config.device
 
         self.train_start_size = config.train_start_size
         self.actor_update_freq = config.actor_update_freq
@@ -74,16 +73,7 @@ class MaSAC(BaseSolver):
         self.log_alpha = torch.tensor(np.log(1.0), requires_grad=True, device=self.device)
         self.opt_log_alpha = torch.optim.Adam([self.log_alpha], lr=self.learning_rate)
 
-        self.replay_buffers = ReplayBuffer(
-            state_dim=self.state_dim,
-            action_dim=self.action_dim,
-            buffer_size=self.buffer_size,
-            device=self.device
-        )
-
-    @property
-    def name(self):
-        return "MaSAC"
+        self.replay_buffer = ReplayBuffer(state_dim=self.state_dim, action_dim=self.action_dim, buffer_size=self.buffer_size, device=self.device)
 
     def alpha(self):
         return F.softplus(self.log_alpha)
@@ -130,12 +120,11 @@ class MaSAC(BaseSolver):
         lr_scheduler_actor = torch.optim.lr_scheduler.StepLR(opt_actor, step_size=10000, gamma=0.95)
         return actor, opt_actor, lr_scheduler_actor
 
-    def route(self, obs: np.ndarray, info: dict) -> tuple[Optional[int], Optional[dict]]:
+    def act(self, obs: np.ndarray, action_mask: Optional[np.ndarray] = None, eval_mode: bool = False):
         """Select action using actor policy."""
         state_tensor = torch.tensor(obs, dtype=torch.float).unsqueeze(0).to(self.device)
 
-        if "action_mask" in info:
-            action_mask = info["action_mask"]
+        if action_mask is not None:
             action_mask_tensor = torch.tensor(action_mask, dtype=torch.bool).to(self.device)
         else:
             action_mask_tensor = None
@@ -143,50 +132,34 @@ class MaSAC(BaseSolver):
         with torch.no_grad():
             self.actor.eval()
             logits = self.actor.forward(state_tensor, action_mask_tensor)
-            if self.is_eval:
+            if eval_mode:
                 chosen_action = logits.argmax(dim=-1).item()
             else:
                 probs = F.softmax(logits, dim=-1)
                 chosen_action = torch.multinomial(probs, 1).item()
 
-            return chosen_action, None
+            return chosen_action
 
-    def on_action_over(self, packet: "DataBlock"):
+    def store_experience(self, packet: "DataBlock"):
         """Store experience in replay buffer."""
-        if self.is_eval:
-            return
-
         last_action = packet.last_action
 
-        state = last_action.state
-        action = last_action.action
-        action_mask = last_action.action_mask
-        baseline_reward = last_action.baseline_reward
-        done = last_action.done
-        truncated = last_action.truncated
-        next_state = last_action.next_state
-        next_action_mask = last_action.next_action_mask
-
-        self.replay_buffers.add(
-            state=state,
-            action=action,
-            action_mask=action_mask,
-            reward=baseline_reward,
+        self.replay_buffer.add(
+            state=last_action.state,
+            action=last_action.action,
+            action_mask=last_action.action_mask,
+            reward=last_action.baseline_reward,
             cost=None,
-            done=done,
-            truncated=truncated,
-            next_state=next_state,
-            next_action_mask=next_action_mask,
+            done=last_action.done,
+            truncated=last_action.truncated,
+            next_state=last_action.next_state,
+            next_action_mask=last_action.next_action_mask,
             target_cost=None,
         )
 
     def learn(self):
-        """Train the networks if we have enough experiences in the replay buffers."""
-        if self.is_eval:
-            return
-
-        # Check if we have enough experiences to train
-        if len(self.replay_buffers) < self.batch_size:
+        """Train the networks if we have enough experiences."""
+        if len(self.replay_buffer) < self.batch_size:
             return
 
         for _ in range(self.train_steps_per_update):
@@ -194,14 +167,14 @@ class MaSAC(BaseSolver):
             self._train_step()
 
     def _train_step(self):
-        if len(self.replay_buffers) < max(self.train_start_size, self.batch_size):
+        if len(self.replay_buffer) < max(self.train_start_size, self.batch_size):
             return
 
         self.Qr.train()
         self.actor.train()
 
         # Sample a batch of experiences
-        batch = self.replay_buffers.sample(self.batch_size)
+        batch = self.replay_buffer.sample(self.batch_size)
         bootstrap_mask = ~(batch.dones & ~batch.truncateds)
 
         # ========= critic loss =========
@@ -230,7 +203,7 @@ class MaSAC(BaseSolver):
             self._tf_writer.add_scalar("sac/critic_loss", critic_loss, global_step=self.training_steps)
 
         # ========= actor loss =========
-        if self.training_steps % self.actor_update_freq == 0: # delayed policy update
+        if self.training_steps % self.actor_update_freq == 0:  # delayed policy update
             logits = self.actor.forward(batch.states, batch.action_masks)
             probs = F.softmax(logits, dim=-1)
             log_probs = F.log_softmax(logits, dim=-1)
@@ -265,30 +238,6 @@ class MaSAC(BaseSolver):
         elif (self.training_steps + 1) % self.hard_update_interval == 0:
             hard_update(target=target, source=source)
 
-    def train(self):
-        """Set to training mode"""
-        self.is_eval = False
-
-    def eval(self):
-        """Set to evaluation mode"""
-        self.is_eval = True
-
-    def on_train_signal(self):
-        """Train the networks if we have enough experiences in the replay buffers."""
-        self.learn()
-
-    def set_train(self):
-        """Set the solver to training mode."""
-        self.train()
-
-    def set_eval(self):
-        """Set the solver to evaluation mode."""
-        self.eval()
-
-    def is_train(self):
-        """Check if the solver is in training mode."""
-        return not self.is_eval
-
     def get_model_dict(self):
         state_dict = {
             "agent_id": 0,  # For backward compatibility
@@ -300,11 +249,94 @@ class MaSAC(BaseSolver):
         }
         return state_dict
 
+    def load_model_dict(self, checkpoint):
+        self.training_steps = checkpoint.get("training_steps", 0)
+        self.Qr.load_state_dict(checkpoint["Qr"])
+        self.Qr_target.load_state_dict(checkpoint["Qr_target"])
+        self.actor.load_state_dict(checkpoint["actor"])
+        if "log_alpha" in checkpoint:
+            self.log_alpha = torch.tensor(checkpoint["log_alpha"], requires_grad=True, device=self.device)
+            self.opt_log_alpha = torch.optim.Adam([self.log_alpha], lr=self.learning_rate)
+
+    def load_from_other(self, other: "SACAgent"):
+        self.Qr.load_state_dict(other.Qr.state_dict())
+        self.Qr_target.load_state_dict(other.Qr_target.state_dict())
+        self.actor.load_state_dict(other.actor.state_dict())
+        self.log_alpha = other.log_alpha.clone().detach().requires_grad_(True)
+        self.opt_log_alpha = torch.optim.Adam([self.log_alpha], lr=self.learning_rate)
+        self.training_steps = other.training_steps
+
+
+class MaSAC(BaseSolver):
+    """
+    Multi-agent soft actor-critic solver using a global model (CTDE).
+    Supports switching to online mode where each agent has its own model.
+    """
+
+    def __init__(self, obs_dim: int, action_dim: int, config: "NamedDict", tf_writer: Optional[SummaryWriter] = None):
+        super().__init__(tf_writer=tf_writer)
+        self.config = config
+        self.state_dim = obs_dim
+        self.action_dim = action_dim
+
+        # Global agent for offline training
+        self.global_agent = SACAgent(obs_dim, action_dim, config, tf_writer)
+        self.local_agents: Dict[int, SACAgent] = {}
+
+    @property
+    def name(self):
+        return "MaSAC"
+
+    def _get_agent(self, node_id: int) -> SACAgent:
+        """Get the appropriate agent for the given node."""
+        if not self.online_mode:
+            return self.global_agent
+
+        if node_id not in self.local_agents:
+            # Initialize new agent from global agent
+            agent = SACAgent(self.state_dim, self.action_dim, self.config, self._tf_writer)
+            agent.load_from_other(self.global_agent)
+            self.local_agents[node_id] = agent
+
+        return self.local_agents[node_id]
+
+    def route(self, obs: np.ndarray, info: dict) -> tuple[Optional[int], Optional[dict]]:
+        """Select action using actor policy."""
+        node = info["node"]
+        agent = self._get_agent(node.id)
+
+        action_mask = info.get("action_mask")
+        chosen_action = agent.act(obs, action_mask, eval_mode=self.is_eval())
+
+        return chosen_action, None
+
+    def on_action_over(self, packet: "DataBlock"):
+        """Store experience in replay buffer."""
+        if self.is_eval():
+            return
+
+        node_id = packet.last_action.node_id
+        agent = self._get_agent(node_id)
+        agent.store_experience(packet)
+
+    def learn(self):
+        """Train the networks."""
+        if self.online_mode:
+            for agent in self.local_agents.values():
+                agent.learn()
+        else:
+            self.global_agent.learn()
+
+    def on_train_signal(self):
+        """Train the networks if we have enough experiences in the replay buffers."""
+        if self.is_train():
+            self.learn()
+
     def save_models(self, model_dir_path: str):
         """Save model to file."""
         model_path = f"{model_dir_path}/{self.name}_agent_0.pth"
         os.makedirs(os.path.dirname(model_path), exist_ok=True)
-        torch.save(self.get_model_dict(), model_path)
+        torch.save(self.global_agent.get_model_dict(), model_path)
         print(f"Saved {self.name} model: {model_dir_path}")
 
     def load_models(self, model_dir_path: str):
@@ -312,13 +344,12 @@ class MaSAC(BaseSolver):
         model_path = f"{model_dir_path}/{self.name}.pth"
         if not Path(model_path).exists():
             raise RuntimeError(f"Model file not found at {model_path}")
-        
-        checkpoint = torch.load(model_path, weights_only=False, map_location=self.device)
 
-        self.training_steps = checkpoint.get("training_steps", 0)
-        self.Qr.load_state_dict(checkpoint["Qr"])
-        self.Qr_target.load_state_dict(checkpoint["Qr_target"])
-        self.actor.load_state_dict(checkpoint["actor"])
-        if "log_alpha" in checkpoint:
-            self.log_alpha = checkpoint["log_alpha"]
+        checkpoint = torch.load(model_path, weights_only=False, map_location=self.global_agent.device)
+        self.global_agent.load_model_dict(checkpoint)
         print(f"Loaded {self.name} model: {model_dir_path}")
+
+        # If in online mode, update all initialized agents
+        if self.online_mode:
+            for agent in self.local_agents.values():
+                agent.load_model_dict(checkpoint)

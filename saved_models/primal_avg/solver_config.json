@@ -3,7 +3,7 @@
     "cost_limit": 10,
     "hidden_dim": 512,
     "num_hidden_layers": 2,
-    "device": "cuda",
+    "device": "mps",
     "use_single_cost_critic": false,
     "weight_init": "orthogonal",
     "discount_reward": 0.99,

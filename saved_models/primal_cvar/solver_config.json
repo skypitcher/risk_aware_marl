@@ -7,7 +7,7 @@
     "embedding_dim": 64,
     "num_quantiles": 64,
     "num_hidden_layers": 2,
-    "device": "cuda",
+    "device": "mps",
     "weight_init": "orthogonal",
     "discount_reward": 0.99,
     "discount_cost": 0.97,

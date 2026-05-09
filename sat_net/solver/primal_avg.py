@@ -1,6 +1,6 @@
 import os
 from pathlib import Path
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Optional, Dict
 
 import numpy as np
 import torch
@@ -24,9 +24,9 @@ if TYPE_CHECKING:
     from sat_net.datablock import DataBlock
 
 
-class PrimalAvg(BaseSolver):
+class PrimalAvgAgent:
     """
-    Principled RIsk-aware Multi-Agent Learning (PRIMAL) with average cost constraint
+    PrimalAvg Agent encapsulating the PRIMAL logic.
     """
 
     def __init__(
@@ -36,9 +36,10 @@ class PrimalAvg(BaseSolver):
         config: "NamedDict",
         tf_writer: Optional[SummaryWriter] = None,
     ):
-        super().__init__(tf_writer=tf_writer)
         self.config = config
-        
+        self._tf_writer = tf_writer
+        self.device = config.device
+
         # Dimensions
         self.state_dim = obs_dim
         self.action_dim = action_dim
@@ -48,8 +49,6 @@ class PrimalAvg(BaseSolver):
         self.actor_use_layer_norm = config.actor_use_layer_norm
         self.critic_use_layer_norm = config.critic_use_layer_norm
         self.softmax_temperature = config.softmax_temperature
-
-        assert self.weight_init in ["orthogonal", "xavier", "he"]
 
         # Cost constraint
         self.cost_limit = config.cost_limit
@@ -69,7 +68,6 @@ class PrimalAvg(BaseSolver):
         self.cost_multiplier_update_freq = config.cost_multiplier_update_freq
 
         self.learning_rate = config.learning_rate
-        self.device = config.device
 
         self.train_start_size = config.train_start_size
 
@@ -95,22 +93,13 @@ class PrimalAvg(BaseSolver):
 
         self.target_entropy = calc_heuristic_entropy(self.action_dim, self.max_action_prob)
 
-        self.log_alpha = torch.tensor(np.log(1.0), requires_grad=True, device=self.device)
+        self.log_alpha = torch.tensor(np.log(1.0), dtype=torch.float32, requires_grad=True, device=self.device)
         self.opt_log_alpha = torch.optim.Adam([self.log_alpha], lr=self.learning_rate)
 
-        self.log_lambda = torch.tensor(np.log(1.0), requires_grad=True, device=self.device)
+        self.log_lambda = torch.tensor(np.log(1.0), dtype=torch.float32, requires_grad=True, device=self.device)
         self.opt_log_lambda = torch.optim.Adam([self.log_lambda], lr=self.learning_rate)
 
-        self.replay_buffers = ReplayBuffer(
-            state_dim=self.state_dim, 
-            action_dim=self.action_dim, 
-            buffer_size=self.buffer_size, 
-            device=self.device
-        )
-
-    @property
-    def name(self):
-        return "PrimalAvg"
+        self.replay_buffer = ReplayBuffer(state_dim=self.state_dim, action_dim=self.action_dim, buffer_size=self.buffer_size, device=self.device)
 
     def alpha(self):
         return F.softplus(self.log_alpha)
@@ -185,33 +174,25 @@ class PrimalAvg(BaseSolver):
         lr_scheduler_actor = torch.optim.lr_scheduler.StepLR(opt_actor, step_size=10000, gamma=0.95)
         return actor, opt_actor, lr_scheduler_actor
 
-    def route(self, obs: np.ndarray, info: dict):
-        """
-        Select action using actor policy.
-        """
+    def act(self, obs: np.ndarray, action_mask: Optional[np.ndarray] = None, eval_mode: bool = False):
+        """Select action using actor policy."""
         state_tensor = torch.tensor(obs, dtype=torch.float).unsqueeze(0).to(self.device)
 
-        if "action_mask" in info:
-            action_mask = info["action_mask"]
+        if action_mask is not None:
             action_mask_tensor = torch.tensor(action_mask, dtype=torch.bool).to(self.device)
         else:
             action_mask_tensor = None
 
         with torch.no_grad():
             self.actor.eval()
-            logits = self.actor.forward(state_tensor, action_mask_tensor) 
+            logits = self.actor.forward(state_tensor, action_mask_tensor)
             probs = F.softmax(logits, dim=-1)
             chosen_action = torch.multinomial(probs, 1).item()
 
-            return chosen_action, None
+            return chosen_action
 
-    def on_action_over(self, packet: "DataBlock"):
-        """
-        Store experience in replay buffer and train the model.
-        """
-        if self.is_eval():
-            return
-
+    def store_experience(self, packet: "DataBlock"):
+        """Store experience in replay buffer."""
         # basic transition information
         state = packet.last_action.state
         action = packet.last_action.action
@@ -244,7 +225,7 @@ class PrimalAvg(BaseSolver):
         else:
             target_cost = cost_limit
 
-        self.replay_buffers.add(
+        self.replay_buffer.add(
             state=state,
             action=action,
             action_mask=action_mask,
@@ -266,13 +247,8 @@ class PrimalAvg(BaseSolver):
         return info_text
 
     def learn(self):
-        """
-        Train the networks if we have enough experiences in the replay buffers.
-        """
-        # Check if any agent has enough experiences to train
-        agents_ready_to_train = len(self.replay_buffers) >= self.batch_size
-
-        if not agents_ready_to_train:
+        """Train the networks if we have enough experiences."""
+        if len(self.replay_buffer) < self.batch_size:
             return
 
         for _ in range(self.train_steps_per_update):
@@ -280,14 +256,14 @@ class PrimalAvg(BaseSolver):
             self._train_step()
 
     def _train_step(self):
-        if len(self.replay_buffers) < max(self.train_start_size, self.batch_size):
+        if len(self.replay_buffer) < max(self.train_start_size, self.batch_size):
             return
 
         self.Qr.train()
         self.actor.train()
 
         # Sample a batch of experiences
-        batch = self.replay_buffers.sample(self.batch_size)
+        batch = self.replay_buffer.sample(self.batch_size)
         bootstrap_mask = ~(batch.dones & ~batch.truncateds)
 
         # ========= reward critic loss =========
@@ -419,11 +395,6 @@ class PrimalAvg(BaseSolver):
         elif (self.training_steps + 1) % self.hard_update_interval == 0:
             hard_update(target=target, source=source)
 
-    def on_train_signal(self):
-        """Train the networks if we have enough experiences in the replay buffers."""
-        if self.is_train():
-            self.learn()
-
     def get_model_dict(self):
         state_dict = {
             "training_steps": self.training_steps,
@@ -437,31 +408,7 @@ class PrimalAvg(BaseSolver):
         }
         return state_dict
 
-    def save_models(self, model_dir_path: str):
-        """
-        Save model to file.
-
-        Args:
-            model_dir_path: Directory path for the saved model files
-        """
-        model_path = f"{model_dir_path}/{self.name}.pth"
-        os.makedirs(os.path.dirname(model_path), exist_ok=True)
-        torch.save(self.get_model_dict(), model_path)
-        print(f"Saved {self.name} model: {model_dir_path}")
-
-    def load_models(self, model_dir_path: str):
-        """
-        Load model from file.
-
-        Args:
-            model_dir_path: Directory path for the saved model files
-        """
-        model_path = f"{model_dir_path}/{self.name}.pth"
-        if not Path(model_path).exists():
-            raise RuntimeError(f"Model file not found at {model_path}")
-
-        checkpoint = torch.load(model_path, weights_only=False, map_location=self.device)
-
+    def load_model_dict(self, checkpoint):
         self.training_steps = checkpoint.get("training_steps", 0)
         self.Qr.load_state_dict(checkpoint["Qr"])
         self.Qr_target.load_state_dict(checkpoint["Qr_target"])
@@ -474,4 +421,118 @@ class PrimalAvg(BaseSolver):
         if "log_lambda" in checkpoint:
             self.log_lambda = torch.tensor(checkpoint["log_lambda"], requires_grad=True, device=self.device)
             self.opt_log_lambda = torch.optim.Adam([self.log_lambda], lr=self.learning_rate)
+
+    def load_from_other(self, other: "PrimalAvgAgent"):
+        self.Qr.load_state_dict(other.Qr.state_dict())
+        self.Qr_target.load_state_dict(other.Qr_target.state_dict())
+        self.Qc.load_state_dict(other.Qc.state_dict())
+        self.Qc_target.load_state_dict(other.Qc_target.state_dict())
+        self.actor.load_state_dict(other.actor.state_dict())
+        self.log_alpha = other.log_alpha.clone().detach().requires_grad_(True)
+        self.opt_log_alpha = torch.optim.Adam([self.log_alpha], lr=self.learning_rate)
+        self.log_lambda = other.log_lambda.clone().detach().requires_grad_(True)
+        self.opt_log_lambda = torch.optim.Adam([self.log_lambda], lr=self.learning_rate)
+        self.training_steps = other.training_steps
+
+
+class PrimalAvg(BaseSolver):
+    """
+    Principled RIsk-aware Multi-Agent Learning (PRIMAL) with average cost constraint
+    Supports switching to online mode where each agent has its own model.
+    """
+
+    def __init__(
+        self,
+        obs_dim: int,
+        action_dim: int,
+        config: "NamedDict",
+        tf_writer: Optional[SummaryWriter] = None,
+    ):
+        super().__init__(tf_writer=tf_writer)
+        self.config = config
+        self.state_dim = obs_dim
+        self.action_dim = action_dim
+
+        # Global agent for offline training
+        self.global_agent = PrimalAvgAgent(obs_dim, action_dim, config, tf_writer)
+        self.local_agents: Dict[int, PrimalAvgAgent] = {}
+
+    @property
+    def name(self):
+        return "PrimalAvg"
+
+    def _get_agent(self, node_id: int) -> PrimalAvgAgent:
+        """Get the appropriate agent for the given node."""
+        if not self.online_mode:
+            return self.global_agent
+
+        if node_id not in self.local_agents:
+            # Initialize new agent from global agent
+            agent = PrimalAvgAgent(self.state_dim, self.action_dim, self.config, self._tf_writer)
+            agent.load_from_other(self.global_agent)
+            self.local_agents[node_id] = agent
+
+        return self.local_agents[node_id]
+
+    def route(self, obs: np.ndarray, info: dict):
+        """Select action using actor policy."""
+        node = info["node"]
+        agent = self._get_agent(node.id)
+
+        action_mask = info.get("action_mask")
+        chosen_action = agent.act(obs, action_mask, eval_mode=self.is_eval())
+
+        return chosen_action, None
+
+    def on_action_over(self, packet: "DataBlock"):
+        """Store experience in replay buffer."""
+        if self.is_eval():
+            return
+
+        node_id = packet.last_action.node_id
+        agent = self._get_agent(node_id)
+        agent.store_experience(packet)
+
+    def get_stats(self) -> str:
+        # Return stats from global agent or average of local agents?
+        # For now, return global agent stats or first local agent
+        if not self.online_mode:
+            return self.global_agent.get_stats()
+        elif self.local_agents:
+            return list(self.local_agents.values())[0].get_stats()
+        return ""
+
+    def learn(self):
+        """Train the networks."""
+        if self.online_mode:
+            for agent in self.local_agents.values():
+                agent.learn()
+        else:
+            self.global_agent.learn()
+
+    def on_train_signal(self):
+        """Train the networks if we have enough experiences in the replay buffers."""
+        if self.is_train():
+            self.learn()
+
+    def save_models(self, model_dir_path: str):
+        """Save model to file."""
+        model_path = f"{model_dir_path}/{self.name}.pth"
+        os.makedirs(os.path.dirname(model_path), exist_ok=True)
+        torch.save(self.global_agent.get_model_dict(), model_path)
+        print(f"Saved {self.name} model: {model_dir_path}")
+
+    def load_models(self, model_dir_path: str):
+        """Load model from file."""
+        model_path = f"{model_dir_path}/{self.name}.pth"
+        if not Path(model_path).exists():
+            raise RuntimeError(f"Model file not found at {model_path}")
+
+        checkpoint = torch.load(model_path, weights_only=False, map_location=self.global_agent.device)
+        self.global_agent.load_model_dict(checkpoint)
         print(f"Loaded {self.name} model: {model_dir_path}")
+
+        # If in online mode, update all initialized agents
+        if self.online_mode:
+            for agent in self.local_agents.values():
+                agent.load_model_dict(checkpoint)

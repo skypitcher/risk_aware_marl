@@ -14,6 +14,8 @@ class BaseSolver(ABC):
     def __init__(self, tf_writer: Optional[SummaryWriter] = None):
         self._tf_writer = tf_writer
         self._is_eval = False
+        # Online learning support
+        self.online_mode = False
 
     @property
     @abstractmethod
@@ -23,6 +25,11 @@ class BaseSolver(ABC):
     @staticmethod
     def class_name(cls):
         return cls.__class__.__name__
+
+    def switch_mode(self, online: bool):
+        """Switch the solver to online mode where each agent has its own model and buffer."""
+        self.online_mode = online
+        print("Switched to online mode. Agents will now learn independently." if online else "Switched to offline mode.")
 
     @abstractmethod
     def route(self, obs: np.ndarray, info: dict) -> tuple[Optional[int], Optional[dict]]:
@@ -64,11 +71,11 @@ class BaseSolver(ABC):
     def set_eval(self):
         """Set the solver to evaluation mode (e.g., disable exploration, use greedy policy)."""
         self._is_eval = True
-    
+
     def is_train(self):
         """Check if the solver is in training mode."""
         return not self._is_eval
-    
+
     def is_eval(self):
         """Check if the solver is in evaluation mode."""
         return self._is_eval

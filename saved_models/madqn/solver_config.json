@@ -18,5 +18,5 @@
     "hard_update_interval": 10,
     "clip_grad_norm": 0.5,
     "use_layer_norm": true,
-    "device": "cuda"
+    "device": "mps"
 }

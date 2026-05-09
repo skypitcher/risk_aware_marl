@@ -123,8 +123,8 @@ if __name__ == "__main__":
         model_path_list=[
             "saved_models/madqn",
             "saved_models/primal_avg",
-            "saved_models/primal_cvar",           
-        ], 
-        eval_seed=3333, 
-        num_eval_seeds=5
+            "saved_models/primal_cvar",
+        ],
+        eval_seed=3333,
+        num_eval_seeds=5,
     )
