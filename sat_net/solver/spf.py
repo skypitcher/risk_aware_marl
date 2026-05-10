@@ -3,9 +3,7 @@ from typing import TYPE_CHECKING
 import numpy as np
 
 if TYPE_CHECKING:
-    from sat_net.datablock import DataBlock
     from sat_net.network import SatelliteNetwork
-    from sat_net.node import Node
     from sat_net.traffic_region import TrafficRegion
 
 from sat_net.solver.base_solver import BaseSolver
@@ -26,9 +24,9 @@ class SPF(BaseSolver):
         return "SPF"
 
     def route(self, obs: np.ndarray, info: dict):
-        packet: "DataBlock" = info["packet"]
+        packet = info["packet"]
         network: "SatelliteNetwork" = info["network"]
-        node: "Node" = info["node"]
+        node_id: int = info["node_id"]
         action_list: list[int] = info["action_list"]
         _action_mask: np.ndarray = info["action_mask"]
 
@@ -41,7 +39,7 @@ class SPF(BaseSolver):
             return None, None
 
         if current_node_id == target_access_sat_id:
-            # The DataBlock is already at its destination
+            # The flowlet is already at its destination access satellite.
             return None, None
 
         next_hop = network.get_shortest_next_hop(
@@ -56,7 +54,7 @@ class SPF(BaseSolver):
                 return i, None
 
         raise ValueError(
-            f"Invalid next hop: {next_hop} for node {node.id} {node.name}, "
+            f"Invalid next hop: {next_hop} for node {node_id}, "
             f"action_list: {action_list}"
         )
 
@@ -69,10 +67,10 @@ class SPF(BaseSolver):
             return info["target_access_sat_id"]
 
         target_region: "TrafficRegion" = info["target_region"]
-        target_sat, _distance = network.get_nearest_satellite_for_position(
+        target_sat_id, _distance = network.get_nearest_satellite_for_position(
             target_region.position
         )
-        return target_sat.id if target_sat is not None else None
+        return target_sat_id
 
     def is_train(self):
         """Check if the solver is in training mode."""

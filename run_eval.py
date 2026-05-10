@@ -11,7 +11,7 @@ from typing import List
 
 import pandas as pd
 
-from sat_net.routing_env import RoutingEnvAsync
+from sat_net.routing_env import RoutingEnv
 from sat_net.solver import SPF, BaseSolver, create_solver
 from sat_net.util import NamedDict
 
@@ -41,7 +41,7 @@ def setup_logging(log_dir: str):
     )
 
 
-def evaluate_multi_seed(env: RoutingEnvAsync, solvers: List[BaseSolver], base_seed: int, num_seeds: int):
+def evaluate_multi_seed(env: RoutingEnv, solvers: List[BaseSolver], base_seed: int, num_seeds: int):
     """
     Evaluate multiple solvers with multiple seeds and collect comprehensive results.
 
@@ -81,7 +81,7 @@ def evaluate_multi_seed(env: RoutingEnvAsync, solvers: List[BaseSolver], base_se
         logging.info("Solver: %s evaluated", solver.name)
 
         generated_df = pd.concat(all_flowlet_frames, ignore_index=True) if all_flowlet_frames else pd.DataFrame()
-        generated_path = os.path.join(LOG_DIR, f"{solver.name}_packets.csv")
+        generated_path = os.path.join(LOG_DIR, f"{solver.name}_flowlets.csv")
         generated_df.to_csv(generated_path, index=False)
         logging.info("%d flowlets saved to %s", len(generated_df), generated_path)
         print("")
@@ -111,7 +111,7 @@ def run_evaluation(model_path_list: list[str], eval_seed: int, num_eval_seeds: i
     # Load config and initialize environment and solver
     env_config = NamedDict.load("configs/starlink_dvbs2_test.json")
     logging.info("env_config: %s", env_config.to_string())
-    env = RoutingEnvAsync(env_config, tf_writer=None)
+    env = RoutingEnv(env_config, tf_writer=None)
 
     # Initialize solvers
     solvers = [load_solver_from(env, model_path) for model_path in model_path_list]

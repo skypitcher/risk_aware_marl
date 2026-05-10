@@ -1,7 +1,7 @@
 import math
 import os
 from pathlib import Path
-from typing import TYPE_CHECKING, Optional
+from typing import Optional
 
 import numpy as np
 import torch
@@ -11,9 +11,6 @@ from torch.utils.tensorboard import SummaryWriter
 from sat_net.nn import ReplayBuffer, MLP, hard_update, soft_update
 from sat_net.solver.base_solver import BaseSolver
 from sat_net.util import NamedDict
-
-if TYPE_CHECKING:
-    from sat_net.datablock import DataBlock
 
 
 class DQNAgent:
@@ -130,7 +127,7 @@ class DQNAgent:
 
         self.epsilon_train = max(self.epsilon_train, self.epsilon_end)
 
-    def store_experience(self, packet: "DataBlock"):
+    def store_experience(self, packet):
         """Store experience in replay buffer."""
         last_action = packet.last_action
 
@@ -265,15 +262,15 @@ class MaDQN(BaseSolver):
 
     def route(self, obs: np.ndarray, info: dict):
         """Select action."""
-        node = info["node"]
-        agent = self._get_agent(node.id)
+        node_id = int(info["node_id"])
+        agent = self._get_agent(node_id)
 
         action_mask = info["action_mask"]
         chosen_action = agent.act(obs, action_mask, eval_mode=self.is_eval())
 
         return chosen_action, None
 
-    def on_action_over(self, packet: "DataBlock"):
+    def on_action_over(self, packet):
         """Store experience."""
         if self.is_eval():
             return

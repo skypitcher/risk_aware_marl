@@ -1,11 +1,8 @@
 from abc import ABC, abstractmethod
-from typing import TYPE_CHECKING, Optional
+from typing import Optional
 
 import numpy as np
 from torch.utils.tensorboard import SummaryWriter
-
-if TYPE_CHECKING:
-    from sat_net.datablock import DataBlock
 
 
 class BaseSolver(ABC):
@@ -34,7 +31,7 @@ class BaseSolver(ABC):
     @abstractmethod
     def route(self, obs: np.ndarray, info: dict) -> tuple[Optional[int], Optional[dict]]:
         """
-        Determine the next hop for a DataBlock at a given node.
+        Determine the next hop for the current flowlet/action context.
 
         Args:
             obs: The observation.
@@ -46,15 +43,15 @@ class BaseSolver(ABC):
         """
         raise NotImplementedError("Subclasses must implement this method")
 
-    def on_action_over(self, packet: "DataBlock"):
+    def on_action_over(self, packet):
         """
         Callback when a delayed action is over.
         """
         pass
 
-    def on_episode_over(self, packet: "DataBlock"):
+    def on_episode_over(self, packet):
         """
-        Callback when an asynchronous episode over (packet delivered or dropped).
+        Callback when an action episode finishes.
         """
         pass
 

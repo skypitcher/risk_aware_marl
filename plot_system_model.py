@@ -11,9 +11,6 @@ os.environ['KMP_DUPLICATE_LIB_OK'] = 'TRUE'
 import json
 import matplotlib.pyplot as plt
 import numpy as np
-from mpl_toolkits.mplot3d import Axes3D
-from matplotlib.patches import Circle
-import matplotlib.patches as mpatches
 
 from sat_net.network import SatelliteNetwork
 from sat_net.util import NamedDict
@@ -37,50 +34,21 @@ def create_small_constellation_config():
             "num_sats_per_orbit": 20,  # Small constellation for clarity
             "phasing": 3,
             "min_elevation_angle_deg": 15,
-            "max_gsl_per_gs": 2,
-            "max_gsl_per_sat": 2,
-            "node_buffer_size": 16.0,
             "link_buffer_size": 16.0,
-            "gsl_data_rate": 1.0,
             "isl_data_rate": 0.05,
-            "ground_stations": [
-                {
-                    "name": "Luxembourg",
-                    "latitude": 49.6116,
-                    "longitude": 6.1319,
-                    "population": 10
-                },
-                {
-                    "name": "Dubai",
-                    "latitude": 25.2769,
-                    "longitude": 55.2962,
-                    "population": 10
-                },
-                {
-                    "name": "Beijing",
-                    "latitude": 39.9087,
-                    "longitude": 116.3975,
-                    "population": 10
-                }
-            ]
         }
     return NamedDict(config)
 
 def create_network(network_config):
     """Create satellite network from config."""
     network = SatelliteNetwork(
-        ground_stations=network_config.ground_stations,
         altitude=network_config.altitude,
         inclination=network_config.inclination,
         num_orbits=network_config.num_orbits,
         num_sats_per_orbit=network_config.num_sats_per_orbit,
         phasing=network_config.phasing,
         min_elevation_angle_deg=network_config.min_elevation_angle_deg,
-        max_gsl_per_gs=network_config.max_gsl_per_gs,
-        max_gsl_per_sat=network_config.max_gsl_per_sat,
-        node_buffer_size=network_config.node_buffer_size,
         link_buffer_size=network_config.link_buffer_size,
-        gsl_data_rate=network_config.gsl_data_rate,
         isl_data_rate=network_config.isl_data_rate,
     )
     return network
@@ -94,14 +62,8 @@ def plot_3d_constellation(network, timestamp=0):
     network.update_topology(timestamp)
 
     # Get satellite positions
-    sat_positions = []
-    sat_ids = []
-    for sat in network.satellites.values():
-        pos = sat.position / 1000  # Convert to Earth radii for visualization
-        sat_positions.append(pos)
-        sat_ids.append(sat.id)
-
-    sat_positions = np.array(sat_positions)
+    sat_ids = network.satellite_ids.copy()
+    sat_positions = network.node_positions[sat_ids] / 1000.0
 
     # Calculate Earth radius for occlusion
     earth_radius = 6371 / 1000  # Normalized Earth radius
@@ -119,7 +81,7 @@ def plot_3d_constellation(network, timestamp=0):
     # Check which satellites are visible (dot product with view direction > 0 means facing viewer)
     visible_mask = np.dot(sat_positions, view_direction) > 0
     visible_positions = sat_positions[visible_mask]
-    visible_ids = [sat_ids[i] for i in range(len(sat_ids)) if visible_mask[i]]
+    visible_ids = sat_ids[visible_mask]
 
     # Plot Earth sphere with solid light cyan color (no mesh lines)
     u = np.linspace(0, 2 * np.pi, 50)
@@ -137,11 +99,12 @@ def plot_3d_constellation(network, timestamp=0):
                    c='darkblue', s=50, alpha=0.8, edgecolors='black', linewidth=0.5, zorder=2)
 
     # Find a visible satellite closest to the viewport center for highlighting
+    central_sat_id = None
     if len(visible_positions) > 0:
         # Find satellite with maximum projection along view direction (closest to viewport center)
         projections = np.dot(visible_positions, view_direction)
         central_idx = np.argmax(projections)
-        central_sat_id = visible_ids[central_idx]
+        central_sat_id = int(visible_ids[central_idx])
         central_pos = visible_positions[central_idx]
 
         # Highlight central satellite
@@ -155,98 +118,45 @@ def plot_3d_constellation(network, timestamp=0):
         # Plot ISL connections from central satellite
         connections_plotted = {'N': False, 'S': False, 'E': False, 'W': False}
 
-        # North connection
-        if central_sat_id in network.ISL_N:
-            north_sat_id = network.ISL_N[central_sat_id]
-            if north_sat_id in network.satellites:
-                north_sat = network.satellites[north_sat_id]
-                north_pos = north_sat.position / 1000
-                # Only show connection if target satellite is also visible
-                if np.dot(north_pos, view_direction) > 0:
-                    ax.plot([central_pos[0], north_pos[0]],
-                            [central_pos[1], north_pos[1]],
-                            [central_pos[2], north_pos[2]],
-                            'g-', linewidth=6, alpha=1.0, label='North', zorder=4)
-                    # Draw connection label at midpoint for better visibility
-                    mid_pos = (central_pos + north_pos) / 2
-                    ax.text(mid_pos[0]*1.15, mid_pos[1]*1.15, mid_pos[2]*1.15, 'N',
-                            fontsize=20, fontweight='bold', color='green',
-                            bbox=dict(boxstyle="round,pad=0.3", facecolor="white", alpha=0.8), zorder=6)
-                    connections_plotted['N'] = True
+        def plot_connection(label, neighbor_id, color, line_style):
+            if neighbor_id < 0:
+                return
+            neighbor_pos = network.node_positions[int(neighbor_id)] / 1000.0
+            # Only show connection if target satellite is also visible
+            if np.dot(neighbor_pos, view_direction) <= 0:
+                return
+            ax.plot([central_pos[0], neighbor_pos[0]],
+                    [central_pos[1], neighbor_pos[1]],
+                    [central_pos[2], neighbor_pos[2]],
+                    line_style, linewidth=6, alpha=1.0, label=label, zorder=4)
+            # Draw connection label at midpoint for better visibility
+            mid_pos = (central_pos + neighbor_pos) / 2
+            ax.text(mid_pos[0]*1.15, mid_pos[1]*1.15, mid_pos[2]*1.15, label[0],
+                    fontsize=20, fontweight='bold', color=color,
+                    bbox=dict(boxstyle="round,pad=0.3", facecolor="white", alpha=0.8), zorder=6)
+            connections_plotted[label[0]] = True
 
-        # South connection
-        if central_sat_id in network.ISL_S:
-            south_sat_id = network.ISL_S[central_sat_id]
-            if south_sat_id in network.satellites:
-                south_sat = network.satellites[south_sat_id]
-                south_pos = south_sat.position / 1000
-                # Only show connection if target satellite is also visible
-                if np.dot(south_pos, view_direction) > 0:
-                    ax.plot([central_pos[0], south_pos[0]],
-                            [central_pos[1], south_pos[1]],
-                            [central_pos[2], south_pos[2]],
-                            'g-', linewidth=6, alpha=1.0, label='South', zorder=4)
-                    # Draw connection label at midpoint for better visibility
-                    mid_pos = (central_pos + south_pos) / 2
-                    ax.text(mid_pos[0]*1.15, mid_pos[1]*1.15, mid_pos[2]*1.15, 'S',
-                            fontsize=20, fontweight='bold', color='green',
-                            bbox=dict(boxstyle="round,pad=0.3", facecolor="white", alpha=0.8), zorder=6)
-                    connections_plotted['S'] = True
-
-        # East connection
-        if central_sat_id in network.ISL_E:
-            east_sat_id = network.ISL_E[central_sat_id]
-            if east_sat_id in network.satellites:
-                east_sat = network.satellites[east_sat_id]
-                east_pos = east_sat.position / 1000
-                # Only show connection if target satellite is also visible
-                if np.dot(east_pos, view_direction) > 0:
-                    ax.plot([central_pos[0], east_pos[0]],
-                            [central_pos[1], east_pos[1]],
-                            [central_pos[2], east_pos[2]],
-                            'b-', linewidth=6, alpha=1.0, label='East', zorder=4)
-                    # Draw connection label at midpoint for better visibility
-                    mid_pos = (central_pos + east_pos) / 2
-                    ax.text(mid_pos[0]*1.15, mid_pos[1]*1.15, mid_pos[2]*1.15, 'E',
-                            fontsize=20, fontweight='bold', color='blue',
-                            bbox=dict(boxstyle="round,pad=0.3", facecolor="white", alpha=0.8), zorder=6)
-                    connections_plotted['E'] = True
-
-        # West connection
-        if central_sat_id in network.ISL_W:
-            west_sat_id = network.ISL_W[central_sat_id]
-            if west_sat_id in network.satellites:
-                west_sat = network.satellites[west_sat_id]
-                west_pos = west_sat.position / 1000
-                # Only show connection if target satellite is also visible
-                if np.dot(west_pos, view_direction) > 0:
-                    ax.plot([central_pos[0], west_pos[0]],
-                            [central_pos[1], west_pos[1]],
-                            [central_pos[2], west_pos[2]],
-                            'b-', linewidth=6, alpha=1.0, label='West', zorder=4)
-                    # Draw connection label at midpoint for better visibility
-                    mid_pos = (central_pos + west_pos) / 2
-                    ax.text(mid_pos[0]*1.15, mid_pos[1]*1.15, mid_pos[2]*1.15, 'W',
-                            fontsize=20, fontweight='bold', color='blue',
-                            bbox=dict(boxstyle="round,pad=0.3", facecolor="white", alpha=0.8), zorder=6)
-                    connections_plotted['W'] = True
+        plot_connection('North', int(network.isl_n[central_sat_id]), 'green', 'g-')
+        plot_connection('South', int(network.isl_s[central_sat_id]), 'green', 'g-')
+        plot_connection('East', int(network.isl_e[central_sat_id]), 'blue', 'b-')
+        plot_connection('West', int(network.isl_w[central_sat_id]), 'blue', 'b-')
 
     # Plot orbital lines using ISL_N connections (lighter) - only visible ones
-    for sat_id in network.satellites:
-        sat1_pos = network.satellites[sat_id].position / 1000
+    for sat_id in network.satellite_ids:
+        sat_id = int(sat_id)
+        sat1_pos = network.node_positions[sat_id] / 1000.0
         # Only show connections if source satellite is visible and not the central satellite
         if np.dot(sat1_pos, view_direction) > 0 and sat_id != central_sat_id:
             # Plot only North connections to show orbital structure
-            if sat_id in network.ISL_N:
-                next_sat_id = network.ISL_N[sat_id]
-                if next_sat_id in network.satellites:
-                    sat2_pos = network.satellites[next_sat_id].position / 1000
-                    # Only show if target satellite is also visible
-                    if np.dot(sat2_pos, view_direction) > 0:
-                        ax.plot([sat1_pos[0], sat2_pos[0]],
-                                [sat1_pos[1], sat2_pos[1]],
-                                [sat1_pos[2], sat2_pos[2]],
-                                'black', alpha=0.5, linewidth=1, zorder=3)
+            next_sat_id = int(network.isl_n[sat_id])
+            if next_sat_id >= 0:
+                sat2_pos = network.node_positions[next_sat_id] / 1000.0
+                # Only show if target satellite is also visible
+                if np.dot(sat2_pos, view_direction) > 0:
+                    ax.plot([sat1_pos[0], sat2_pos[0]],
+                            [sat1_pos[1], sat2_pos[1]],
+                            [sat1_pos[2], sat2_pos[2]],
+                            'black', alpha=0.5, linewidth=1, zorder=3)
 
     # Set axis properties for optimal viewing
     if len(sat_positions) > 0:
@@ -289,26 +199,25 @@ def print_network_info(network):
     print(f"Orbits: {network.num_orbits}")
     print(f"Satellites per orbit: {network.num_sats_per_orbit}")
     print(f"Total satellites: {network.num_satellites}")
-    print(f"Ground stations: {len(network.ground_stations)}")
 
     print(f"\n=== ISL Topology ===")
-    print(f"North connections: {len(network.ISL_N)}")
-    print(f"South connections: {len(network.ISL_S)}")
-    print(f"East connections: {len(network.ISL_E)}")
-    print(f"West connections: {len(network.ISL_W)}")
+    print(f"North connections: {int(np.count_nonzero(network.isl_n >= 0))}")
+    print(f"South connections: {int(np.count_nonzero(network.isl_s >= 0))}")
+    print(f"East connections: {int(np.count_nonzero(network.isl_e >= 0))}")
+    print(f"West connections: {int(np.count_nonzero(network.isl_w >= 0))}")
 
     # Show example connections for first satellite
-    if network.satellites:
-        first_sat_id = list(network.satellites.keys())[0]
+    if network.num_satellites:
+        first_sat_id = int(network.satellite_ids[0])
         print(f"\nExample satellite {first_sat_id} connections:")
-        if first_sat_id in network.ISL_N:
-            print(f"  North -> Satellite {network.ISL_N[first_sat_id]}")
-        if first_sat_id in network.ISL_S:
-            print(f"  South -> Satellite {network.ISL_S[first_sat_id]}")
-        if first_sat_id in network.ISL_E:
-            print(f"  East -> Satellite {network.ISL_E[first_sat_id]}")
-        if first_sat_id in network.ISL_W:
-            print(f"  West -> Satellite {network.ISL_W[first_sat_id]}")
+        for label, neighbor_id in (
+            ("North", int(network.isl_n[first_sat_id])),
+            ("South", int(network.isl_s[first_sat_id])),
+            ("East", int(network.isl_e[first_sat_id])),
+            ("West", int(network.isl_w[first_sat_id])),
+        ):
+            if neighbor_id >= 0:
+                print(f"  {label} -> Satellite {neighbor_id}")
 
 if __name__ == "__main__":
     print("Generating system model using actual satellite network implementation...")

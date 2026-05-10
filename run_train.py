@@ -15,15 +15,7 @@ import numpy as np
 import torch
 from torch.utils.tensorboard import SummaryWriter
 
-try:
-    import matplotlib.pyplot as plt
-
-    MATPLOTLIB_AVAILABLE = True
-except ImportError:
-    plt = None
-    MATPLOTLIB_AVAILABLE = False
-
-from sat_net.routing_env import RoutingEnvAsync
+from sat_net.routing_env import RoutingEnv
 from sat_net.solver import BaseSolver, create_solver
 from sat_net.util import NamedDict, ms2str
 
@@ -55,7 +47,7 @@ def set_seeds(seed):
         torch.manual_seed(seed)
 
 
-def eval_performace(env: RoutingEnvAsync, solver: BaseSolver):
+def eval_performace(env: RoutingEnv, solver: BaseSolver):
     """
     Evaluates the solver's performance over a fixed set of seeds.
     """
@@ -103,7 +95,7 @@ def eval_performace(env: RoutingEnvAsync, solver: BaseSolver):
     return avg_throughput, avg_drop_rate, avg_e2e_delay, avg_test_cost
 
 
-def train(env: RoutingEnvAsync, solver: BaseSolver, start_epoch: int, max_epoch: int, log_dir, tf_writer):
+def train(env: RoutingEnv, solver: BaseSolver, start_epoch: int, max_epoch: int, log_dir, tf_writer):
     """
     Main training loop.
     """
@@ -130,10 +122,10 @@ def train(env: RoutingEnvAsync, solver: BaseSolver, start_epoch: int, max_epoch:
         if solver_stats is not None:
             logging.info("Solver stats: %s", solver_stats)
 
-        packet_csv_path = os.path.join(log_dir, f"packets/packets_epoch_{epoch}.csv")
-        os.makedirs(os.path.dirname(packet_csv_path), exist_ok=True)
-        env.save_packets_to_csv(packet_csv_path)  # Assuming this method exists
-        logging.info("Packets saved to %s", packet_csv_path)
+        flowlet_csv_path = os.path.join(log_dir, f"flowlets/flowlets_epoch_{epoch}.csv")
+        os.makedirs(os.path.dirname(flowlet_csv_path), exist_ok=True)
+        env.save_flowlets_to_csv(flowlet_csv_path)
+        logging.info("Flowlets saved to %s", flowlet_csv_path)
 
         tf_writer.add_scalar("epoch/throughput", metrics.throughput, global_step=epoch)
         tf_writer.add_scalar("epoch/delivery_rate", metrics.delivery_rate, global_step=epoch)
@@ -148,19 +140,19 @@ def train(env: RoutingEnvAsync, solver: BaseSolver, start_epoch: int, max_epoch:
                 tf_writer.add_scalar("epoch/cost", np.mean(queue_costs), global_step=epoch)
                 tf_writer.add_scalar("epoch/cost_std", np.std(queue_costs), global_step=epoch)
 
-            first_gsl_delays = delivered_flowlets["first_gsl_delay"].to_numpy()
-            packet_delays = delivered_flowlets["total_delay"].to_numpy()
+            first_access_delays = delivered_flowlets["first_access_delay"].to_numpy()
+            flowlet_delays = delivered_flowlets["total_delay"].to_numpy()
             small_packet_delays = delivered_flowlets.loc[
                 ~delivered_flowlets["is_normal_packet"], "total_delay"
             ].to_numpy()
             normal_packet_delays = delivered_flowlets.loc[
                 delivered_flowlets["is_normal_packet"], "total_delay"
             ].to_numpy()
-            if len(packet_delays) > 0:
-                tf_writer.add_histogram("epoch/all_delays", packet_delays, global_step=epoch)
-                tf_writer.add_scalar("epoch/e2e_delay_mean", packet_delays.mean(), global_step=epoch)
-                tf_writer.add_scalar("epoch/e2e_delay_std", packet_delays.std(), global_step=epoch)
-                tf_writer.add_histogram("epoch/first_gsl_delays", first_gsl_delays, global_step=epoch)
+            if len(flowlet_delays) > 0:
+                tf_writer.add_histogram("epoch/all_delays", flowlet_delays, global_step=epoch)
+                tf_writer.add_scalar("epoch/e2e_delay_mean", flowlet_delays.mean(), global_step=epoch)
+                tf_writer.add_scalar("epoch/e2e_delay_std", flowlet_delays.std(), global_step=epoch)
+                tf_writer.add_histogram("epoch/first_access_delays", first_access_delays, global_step=epoch)
 
             if len(small_packet_delays) > 0:
                 tf_writer.add_histogram("epoch/small_packet_delays", small_packet_delays, global_step=epoch)
@@ -252,7 +244,7 @@ def main():
         logging.info("env_config: %s", env_config.to_string())
         logging.info("solver_config: %s", solver_config.to_string())
 
-        env = RoutingEnvAsync(env_config, tf_writer=tf_writer)
+        env = RoutingEnv(env_config, tf_writer=tf_writer)
         solver = create_solver(env.obs_dim, env.action_dim, solver_config, tf_writer)
         solver.load_models(f"{log_dir}/models/last_model")
     else:
@@ -275,7 +267,7 @@ def main():
         logging.info("Using seed: %d", args.seed)
 
         # create env and solver
-        env = RoutingEnvAsync(env_config, tf_writer=tf_writer)
+        env = RoutingEnv(env_config, tf_writer=tf_writer)
         solver = create_solver(env.obs_dim, env.action_dim, solver_config, tf_writer)
 
         logging.info("env_config: %s", env_config.to_string())

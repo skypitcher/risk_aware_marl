@@ -1,9 +1,6 @@
 import argparse
 import json
 from enum import IntEnum
-from typing import Optional
-
-import numpy as np
 
 
 def ms2str(ms: float) -> str:
@@ -98,20 +95,20 @@ class NamedDict:
 
 class NetworkError(IntEnum):
     """
-    Reason for failing to deliver a DataBlock in the network.
+    Reason for failing to deliver a flowlet in the network.
     - SUCCESS: The operation was successful
     - TTL_EXPIRED: The operation failed because the TTL expired
-    - NODE_FULL: The operation failed because the node buffer is full
     - LINK_FULL: The operation failed because the link is full
     - INVALID_NEXT_HOP: The operation failed because the selected next hop is invalid
+    - FAILED_TO_FIND_NEXT_HOP: The operation failed because no route exists
     - LINK_DISCONNECTED: The operation failed because the link is disconnected (e.g., due to satellite movement)
+    - NO_AVAILABLE_SAT: The operation failed because no access satellite is visible
     """
 
     SUCCESS = 0
     TTL_EXPIRED = 1
-    NODE_FULL = 2
-    LINK_FULL = 3
-    INVALID_NEXT_HOP = 4
-    FAILED_TO_FIND_NEXT_HOP = 5
-    LINK_DISCONNECTED = 6
-    NO_AVAIABLE_SAT = 7
+    LINK_FULL = 2
+    INVALID_NEXT_HOP = 3
+    FAILED_TO_FIND_NEXT_HOP = 4
+    LINK_DISCONNECTED = 5
+    NO_AVAILABLE_SAT = 6

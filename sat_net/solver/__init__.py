@@ -62,9 +62,9 @@ __all__ = [
     "BaseSolver",
     "SPF",
     "MaDQN",
+    "MaIQN",
     "MaSAC",
     "PrimalCVaR",
     "PrimalAvg",
-    "BackpressureSolver",
     "create_solver",
 ]

@@ -1,71 +1,14 @@
+from __future__ import annotations
+
 import json
-from dataclasses import dataclass, field
-from typing import TYPE_CHECKING
-
-from sat_net.util import NetworkError
-
-if TYPE_CHECKING:
-    from sat_net.datablock import DataBlock
+from dataclasses import asdict, dataclass
 
 
-def _safe_div(numerator: float, denominator: float) -> float:
-    """Safely divides two numbers, returning 0.0 if the denominator is zero."""
-    return numerator / denominator if denominator > 0 else 0.0
-
-
-@dataclass
-class TimeStats:
-    """Holds time-related statistics."""
-
-    elapsed: float = 0.0  # in ms
-
-    def reset(self):
-        """Resets time statistics."""
-        self.elapsed = 0.0
-
-    def update(self, delta_time: float):
-        """Updates the elapsed time."""
-        self.elapsed += delta_time
-
-    @property
-    def seconds(self) -> float:
-        """Returns the elapsed time in seconds."""
-        return self.elapsed / 1000.0
-
-
-@dataclass
-class DelayStats:
-    """Holds delay statistics components."""
-
-    total: float = 0.0
-    queue: float = 0.0
-    transmission: float = 0.0
-    propagation: float = 0.0
-
-    def reset(self):
-        """Resets all delay statistics to their initial values."""
-        self.total = 0.0
-        self.queue = 0.0
-        self.transmission = 0.0
-        self.propagation = 0.0
-
-    def update(self, packet: "DataBlock"):
-        """Updates the delay statistics from a DataBlock."""
-        total_delay = packet.total_delay
-        if total_delay is None:
-            return
-
-        weight = getattr(packet, "packet_count", 1)
-        self.total += total_delay * weight
-        self.queue += packet.queue_delay * weight
-        self.transmission += packet.transmission_delay * weight
-        self.propagation += packet.propagation_delay * weight
-
-
-@dataclass
+@dataclass(slots=True)
 class Metrics:
-    """A dataclass to hold all calculated metrics."""
+    """Packet-weighted aggregate metrics produced by the flowlet array kernel."""
 
+    # Counts.
     generated: int = 0
     generated_normal_packet: int = 0
     generated_small_packet: int = 0
@@ -76,6 +19,8 @@ class Metrics:
     dropped_by_ttl: int = 0
     dropped_normal_packet: int = 0
     dropped_small_packet: int = 0
+
+    # Rates.
     throughput: float = 0.0
     service_rate: float = 0.0
     delivery_rate: float = 0.0
@@ -84,6 +29,8 @@ class Metrics:
     normal_packet_drop_rate: float = 0.0
     small_packet_delivery_rate: float = 0.0
     small_packet_drop_rate: float = 0.0
+
+    # Mean delays.
     e2e_delay_mean: float = 0.0
     queue_delay_mean: float = 0.0
     transmission_delay_mean: float = 0.0
@@ -96,166 +43,47 @@ class Metrics:
     small_packet_queue_delay_mean: float = 0.0
     small_packet_transmission_delay_mean: float = 0.0
     small_packet_propagation_delay_mean: float = 0.0
+
+    # Mean queue-risk costs.
     cost_mean: float = 0.0
     cost_small_packet_mean: float = 0.0
     cost_normal_packet_mean: float = 0.0
 
+    def to_dict(self) -> dict[str, int | float]:
+        return asdict(self)
+
     def to_json(self, pretty: bool = False) -> str:
-        return json.dumps(self, default=lambda o: o.__dict__, indent=4 if pretty else None)
+        return json.dumps(self.to_dict(), indent=4 if pretty else None)
 
     def get_summary(self) -> str:
-        info_text = (
+        delay_all = self._format_delay(
+            self.e2e_delay_mean,
+            self.queue_delay_mean,
+            self.propagation_delay_mean,
+            self.transmission_delay_mean,
+        )
+        delay_small = self._format_delay(
+            self.small_packet_e2e_delay_mean,
+            self.small_packet_queue_delay_mean,
+            self.small_packet_propagation_delay_mean,
+            self.small_packet_transmission_delay_mean,
+        )
+        delay_normal = self._format_delay(
+            self.normal_packet_e2e_delay_mean,
+            self.normal_packet_queue_delay_mean,
+            self.normal_packet_propagation_delay_mean,
+            self.normal_packet_transmission_delay_mean,
+        )
+        return (
             f"TOT: {self.generated:<4} | "
             f"OK: {self.delivered:<4}({self.delivery_rate * 100:5.4f}%) | "
             f"DROP: {self.dropped:<4}({self.drop_rate * 100:5.4f}%) TTL={self.dropped_by_ttl:<4}| "
             f"TH: {self.throughput:6.2f} | "
             f"SR: {self.service_rate:6.2f} | "
-            f"DELAY(QPT) {self.e2e_delay_mean:.1f}({self.queue_delay_mean:.1f}+{self.propagation_delay_mean:.1f}+{self.transmission_delay_mean:.1f})  "
-            f"S:{self.small_packet_e2e_delay_mean:.1f}({self.small_packet_queue_delay_mean:.1f}+{self.small_packet_propagation_delay_mean:.1f}+{self.small_packet_transmission_delay_mean:.1f}) "
-            f"N:{self.normal_packet_e2e_delay_mean:.1f}({self.normal_packet_queue_delay_mean:.1f}+{self.normal_packet_propagation_delay_mean:.1f}+{self.normal_packet_transmission_delay_mean:.1f}) | "
+            f"DELAY(QPT) {delay_all} S:{delay_small} N:{delay_normal} | "
             f"C: {self.cost_mean:.2f}(S:{self.cost_small_packet_mean:.2f}|N:{self.cost_normal_packet_mean:.2f})"
         )
-        return info_text
 
-
-@dataclass
-class Stats:
-    """A class to hold statistics for the routing environment."""
-
-    time: TimeStats = field(default_factory=TimeStats)
-
-    num_packets_generated: int = 0
-    num_packets_generated_normal_packet: int = 0
-    num_packets_generated_small_packet: int = 0
-
-    num_packets_delivered: int = 0
-    num_normal_packet_packets_delivered: int = 0
-    num_small_packet_packets_delivered: int = 0
-
-    num_packets_dropped: int = 0
-    num_normal_packet_packets_dropped: int = 0
-    num_small_packet_packets_dropped: int = 0
-    num_packets_dropped_by_ttl: int = 0
-
-    total_throughput: float = 0.0
-
-    all_packet_delay: DelayStats = field(default_factory=DelayStats)
-    normal_packet_packet_delay: DelayStats = field(default_factory=DelayStats)
-    small_packet_packet_delay: DelayStats = field(default_factory=DelayStats)
-
-    total_cost: float = 0.0
-    total_cost_small_packet: float = 0.0
-    total_cost_normal_packet: float = 0.0
-
-    def reset(self):
-        """Resets all statistics to their initial values."""
-        self.time.reset()
-        self.num_packets_generated = 0
-        self.num_packets_generated_normal_packet = 0
-        self.num_packets_generated_small_packet = 0
-        self.num_packets_delivered = 0
-        self.num_normal_packet_packets_delivered = 0
-        self.num_small_packet_packets_delivered = 0
-        self.num_packets_dropped = 0
-        self.num_normal_packet_packets_dropped = 0
-        self.num_small_packet_packets_dropped = 0
-        self.num_packets_dropped_by_ttl = 0
-        self.total_throughput = 0.0
-
-        self.all_packet_delay.reset()
-        self.normal_packet_packet_delay.reset()
-        self.small_packet_packet_delay.reset()
-
-        self.total_cost: float = 0.0
-        self.total_cost_small_packet: float = 0.0
-        self.total_cost_normal_packet: float = 0.0
-
-    def on_packet_generated(self, packet: "DataBlock"):
-        """Updates the statistics when a packet is generated."""
-        weight = getattr(packet, "packet_count", 1)
-        self.num_packets_generated += weight
-        if packet.is_normal_packet:
-            self.num_packets_generated_normal_packet += weight
-        else:
-            self.num_packets_generated_small_packet += weight
-
-    def on_packet_finished(self, packet: "DataBlock"):
-        """Updates the statistics when a packet is finished (delivered or dropped)."""
-        if packet.delivered:
-            self._on_packet_delivered(packet)
-        elif packet.dropped:
-            self._on_packet_dropped(packet)
-
-    def _on_packet_delivered(self, packet: "DataBlock"):
-        """Update stats for a delivered packet."""
-        weight = getattr(packet, "packet_count", 1)
-        self.num_packets_delivered += weight
-        if packet.is_normal_packet:
-            self.num_normal_packet_packets_delivered += weight
-        else:
-            self.num_small_packet_packets_delivered += weight
-
-        self.total_throughput += packet.size
-
-        self.all_packet_delay.update(packet)
-
-        if packet.is_normal_packet:
-            self.normal_packet_packet_delay.update(packet)
-        else:
-            self.small_packet_packet_delay.update(packet)
-
-        self.total_cost += packet.total_queue_cost * weight
-        if packet.is_normal_packet:
-            self.total_cost_normal_packet += packet.total_queue_cost * weight
-        else:
-            self.total_cost_small_packet += packet.total_queue_cost * weight
-
-    def _on_packet_dropped(self, packet: "DataBlock"):
-        """Update stats for a dropped packet."""
-        weight = getattr(packet, "packet_count", 1)
-        self.num_packets_dropped += weight
-        if packet.is_normal_packet:
-            self.num_normal_packet_packets_dropped += weight
-        else:
-            self.num_small_packet_packets_dropped += weight
-
-        if packet.drop_reason == NetworkError.TTL_EXPIRED:
-            self.num_packets_dropped_by_ttl += weight
-
-    def calc_metrics(self) -> Metrics:
-        """Calculates and returns a dictionary of performance metrics."""
-        return Metrics(
-            generated=self.num_packets_generated,
-            generated_normal_packet=self.num_packets_generated_normal_packet,
-            generated_small_packet=self.num_packets_generated_small_packet,
-            delivered=self.num_packets_delivered,
-            delivered_normal_packet=self.num_normal_packet_packets_delivered,
-            delivered_small_packet=self.num_small_packet_packets_delivered,
-            dropped=self.num_packets_dropped,
-            dropped_by_ttl=self.num_packets_dropped_by_ttl,
-            dropped_normal_packet=self.num_normal_packet_packets_dropped,
-            dropped_small_packet=self.num_small_packet_packets_dropped,
-            throughput=_safe_div(self.total_throughput, self.time.seconds),
-            service_rate=_safe_div(self.num_packets_delivered, self.time.seconds),
-            delivery_rate=_safe_div(self.num_packets_delivered, self.num_packets_generated),
-            drop_rate=_safe_div(self.num_packets_dropped, self.num_packets_generated),
-            normal_packet_delivery_rate=_safe_div(self.num_normal_packet_packets_delivered, self.num_packets_generated_normal_packet),
-            normal_packet_drop_rate=_safe_div(self.num_normal_packet_packets_dropped, self.num_packets_generated_normal_packet),
-            small_packet_delivery_rate=_safe_div(self.num_small_packet_packets_delivered, self.num_packets_generated_small_packet),
-            small_packet_drop_rate=_safe_div(self.num_small_packet_packets_dropped, self.num_packets_generated_small_packet),
-            e2e_delay_mean=_safe_div(self.all_packet_delay.total, self.num_packets_delivered),
-            queue_delay_mean=_safe_div(self.all_packet_delay.queue, self.num_packets_delivered),
-            transmission_delay_mean=_safe_div(self.all_packet_delay.transmission, self.num_packets_delivered),
-            propagation_delay_mean=_safe_div(self.all_packet_delay.propagation, self.num_packets_delivered),
-            normal_packet_e2e_delay_mean=_safe_div(self.normal_packet_packet_delay.total, self.num_normal_packet_packets_delivered),
-            normal_packet_queue_delay_mean=_safe_div(self.normal_packet_packet_delay.queue, self.num_normal_packet_packets_delivered),
-            normal_packet_transmission_delay_mean=_safe_div(self.normal_packet_packet_delay.transmission, self.num_normal_packet_packets_delivered),
-            normal_packet_propagation_delay_mean=_safe_div(self.normal_packet_packet_delay.propagation, self.num_normal_packet_packets_delivered),
-            small_packet_e2e_delay_mean=_safe_div(self.small_packet_packet_delay.total, self.num_small_packet_packets_delivered),
-            small_packet_queue_delay_mean=_safe_div(self.small_packet_packet_delay.queue, self.num_small_packet_packets_delivered),
-            small_packet_transmission_delay_mean=_safe_div(self.small_packet_packet_delay.transmission, self.num_small_packet_packets_delivered),
-            small_packet_propagation_delay_mean=_safe_div(self.small_packet_packet_delay.propagation, self.num_small_packet_packets_delivered),
-            cost_mean=_safe_div(self.total_cost, self.num_packets_delivered),
-            cost_small_packet_mean=_safe_div(self.total_cost_small_packet, self.num_small_packet_packets_delivered),
-            cost_normal_packet_mean=_safe_div(self.total_cost_normal_packet, self.num_normal_packet_packets_delivered),
-        )
+    @staticmethod
+    def _format_delay(e2e: float, queue: float, propagation: float, transmission: float) -> str:
+        return f"{e2e:.1f}({queue:.1f}+{propagation:.1f}+{transmission:.1f})"

@@ -15,120 +15,29 @@
 
 ## 🌟 Overview
 
-This repository presents **PRIMAL** (Principled Risk-aware Independent Multi-Agent Learning), a novel multi-agent deep reinforcement learning framework for packet routing in ultra-dense LEO satellite networks. Our approach addresses the unique challenges of massive scale (1584 satellites, i.e., the first shell of Starlink), dynamic topology, and significant propagation delays inherent in next-generation mega-constellations.
+This repository presents **PRIMAL** (Principled Risk-aware Independent Multi-Agent Learning), a risk-aware multi-agent routing framework for ultra-dense LEO satellite networks. The current simulator targets the first shell of Starlink scale (1584 satellites), dynamic topology, region-based terrestrial traffic, and propagation/queueing delay modeling.
 
-This codebase contains a light-weight even-driven simulator for LEO satellite communications used as the environment for offline training of RL agents, i.e., Multi-agent deep reinforcement learning based networking in ultra-dense LEO satellite networks.
+### Slot-Array Simulator
 
-### 🔄 Event-Driven Simulator with Native RL Integration
+The simulator has been refactored from an event-queue packet model into a data-oriented slot-array kernel:
 
-Our simulator seamlessly integrates deep RL training into an event-driven network simulation without artificial episode boundaries. Here's how it works:
-
-```mermaid
-flowchart TD
-    Start([Start Simulation]) --> Init[Initialize Environment & Solver]
-    Init --> ScheduleInit[Schedule Initial Events:<br/>TOPOLOGY_CHANGE<br/>TIME_LIMIT_REACHED]
-    
-    ScheduleInit --> CheckTrainMode{Solver in<br/>Training Mode?}
-    CheckTrainMode -->|Yes| ScheduleTrain[Schedule Initial TRAIN_EVENT]
-    CheckTrainMode -->|No| Traffic
-    ScheduleTrain --> Traffic
-    Traffic[Inject Poisson Traffic:<br/>Schedule DATA_GENERATED events] --> Loop{Event Queue<br/>Empty?}
-    
-    Loop -->|No| PopEvent[Pop Next Event<br/>by Timestamp]
-    Loop -->|Yes| End([Simulation Complete])
-    
-    PopEvent --> UpdateTime[Update Current Time]
-    UpdateTime --> EventType{Event Type?}
-    
-    %% Event Type Handlers
-    EventType -->|TIME_LIMIT_REACHED| End
-    EventType -->|TOPOLOGY_CHANGE| TopoHandler[Update Network Topology<br/>Drop packets on broken links<br/>Schedule next TOPOLOGY_CHANGE]
-    EventType -->|DATA_GENERATED| DataGenHandler[Packet enters network at source GS]
-    EventType -->|TRANSMIT_END| TransmitHandler[Link transmission complete]
-    EventType -->|DATA_FORWARDED| ForwardHandler[Packet arrives at node]
-    EventType -->|TRAIN_EVENT| TrainHandler[Trigger solver.on_train_signal<br/>Schedule next TRAIN_EVENT]
-    
-    TopoHandler --> Loop
-    TrainHandler --> Loop
-    
-    %% Data Processing Flow
-    DataGenHandler --> ProcessPacket[Process Packet at Node]
-    
-    TransmitHandler --> Propagate[Schedule DATA_FORWARDED<br/>after propagation delay]
-    Propagate --> Loop
-    
-    ForwardHandler --> CheckDest{At Target<br/>GS?}
-    CheckDest -->|Yes| Delivered[Packet Delivered ✓<br/>Record Stats]
-    CheckDest -->|No| CheckTTL{TTL > 0?}
-    CheckTTL -->|No| Dropped[Packet Dropped ✗<br/>TTL Expired]
-    CheckTTL -->|Yes| ProcessPacket
-    
-    Delivered --> Loop
-    
-    TopoHandler --> DroppedLink[Packet Dropped ✗<br/>Link Disconnected]
-    DroppedLink --> FinalizeDropped
-    Dropped --> FinalizeDropped
-    
-    %% RL Integration & Routing Logic
-    ProcessPacket --> AtSourceGS{At Source<br/>GS?}
-    AtSourceGS --> |Yes| FindUplink[Find available uplink satellite]
-    FindUplink --> Forward[Forward packet to next hop<br/>Schedule TRANSMIT_END]
-    AtSourceGS --> |No| AtSatellite[At Satellite]
-
-    AtSatellite --> Finalize[Finalize previous transition<br/>if any]
-    Finalize --> GetObs[Get Observation & Action Mask]
-    
-    GetObs --> CheckDirectLink{Target GS<br/>is neighbor?}
-    CheckDirectLink --> |No| RLRoute[🤖 Call solver.route]
-    RLRoute --> ChosenAction[Get Chosen Action]
-    ChosenAction --> Forward
-
-    CheckDirectLink --> |Yes| ForwardToGS[Forward to Target GS]
-    ForwardToGS --> Forward
-
-    Forward --> Loop
-    
-    %% Experience and Episode Termination
-    Finalize --> StoreExperience[Calculate Reward/Cost<br/>Call solver.on_action_over]
-    StoreExperience --> CheckDone{Episode Done?}
-    CheckDone --> |Yes| OnEpisodeOver[Call solver.on_episode_over]
-    CheckDone --> |No| GetObs
-    OnEpisodeOver --> GetObs
-
-    FinalizeDropped[Finalize transition with penalty] --> StoreExperience
-    
-    style RLRoute fill:#ff6b6b,stroke:#c92a2a,color:#fff
-    style ChosenAction fill:#ff6b6b,stroke:#c92a2a,color:#fff
-    style Finalize fill:#4ecdc4,stroke:#0ca49c,color:#fff
-    style StoreExperience fill:#4ecdc4,stroke:#0ca49c,color:#fff
-    style TrainHandler fill:#ffd93d,stroke:#f8b500,color:#000
-    style Delivered fill:#95e1d3,stroke:#38ada9,color:#000
-    style Dropped fill:#fab1a0,stroke:#e17055,color:#000
-    style DroppedLink fill:#fab1a0,stroke:#e17055,color:#000
-```
-
-**Key Features:**
-
-1. **🎯 Asynchronous Episodes**: Each packet forms its own episode with variable length (until delivery or drop)
-2. **⚡ Event-Driven Execution**: All actions (routing decisions, transmissions, topology changes) are scheduled as timestamped events
-3. **🔗 Seamless RL Integration**: 
-   - `solver.route(obs, info)` → Policy makes routing decisions
-   - `on_action_over(packet)` → Store experience in replay buffer when transition completes
-   - `on_episode_over(packet)` → Episode termination when packet delivered/dropped
-   - `on_train_signal()` → Periodic training triggered by TRAIN_EVENT (every 100ms by default)
-4. **⏱️ Realistic Delays**: Queueing, transmission, and propagation delays naturally emerge from the simulation rather than 1ms artifical stepsize
+1. **Region traffic**: Flowlets are sampled from population/region weights and bind to the currently visible access satellite.
+2. **Flowlet batches**: A flowlet represents a batch of packets with common source/target regions.
+3. **Array network state**: Satellite positions, link endpoints, link delays, connectivity, queues, and flowlet state are stored in NumPy arrays.
+4. **SPF baseline**: Shortest-path next-hop rows are computed from sparse arrays and refreshed with topology updates.
+5. **RL status**: Legacy RL solver classes remain in the repository, but the new kernel needs a batched transition API before RL training is re-enabled.
 
 ### 📊 Key Results
 
 - **70% reduction** in queuing delay (i.e. network congestion) compared to risk-oblivious baselines
 - **12ms improvement** in end-to-end delay under loaded scenarios
 - **5.8% CVaR violation rate** vs 75.5% for traditional approaches
-- Successfully manages routing in a dense network of **1584 satellites** and **3 ground stations**
+- Simulates global region-to-region traffic over a dense network of **1584 satellites**
 
 ### Technical Development
 
 Our PRIMAL framework resolves the fundamental conflict between shortest-path routing and congestion avoidance through:
-- **Event-driven design**: Each satellite acts independently on its own timeline
+- **Data-oriented simulation**: Routing, queues, topology updates, and flowlet state are represented as arrays
 - **Primal-dual optimization**: Principled constraint handling without manual reward engineering to avoid reward-hacking
 - **Implicit Quantile Networks**: Capture full distribution of routing outcomes
 - **CVaR constraints**: Direct control over worst-case performance degradation
@@ -205,81 +114,38 @@ brew install proj geos
 ```
 risk_aware_marl/
 ├── sat_net/                    # Core simulation framework
-│   ├── routing_env.py          # Async routing environment
-│   ├── network.py              # Satellite network topology
-│   ├── node.py                 # Satellite/ground station nodes
-│   ├── link.py                 # Communication links
-│   ├── event.py                # Event-driven scheduler
+│   ├── routing_env.py          # Slot-array routing environment
+│   ├── network.py              # Array-oriented satellite network topology
+│   ├── traffic_region.py       # Region/population traffic model
 │   └── solver/                 # Routing algorithms
 │       ├── primal_cvar.py      # Our risk-aware algorithm
 │       ├── primal_avg.py       # Our risk-neutral algorithm
 │       ├── dqn.py              # DQN baseline
 │       └── spf.py              # Traditional routing
-├── satnet_viewer/              # 2D visualization tool
-│   ├── app.py                  # ImGui application
-│   └── renderer.py             # OpenGL rendering
 ├── configs/                    # Configuration files
 │   ├── starlink_dvbs2_*.json  # Network configurations
 │   └── *.json                  # Algorithm hyperparameters
 ├── saved_models/               # Pre-trained models
 ├── figs/                       # Figures and plots
 └── runs_*/                     # Experiment results
+```
 
 ## 🚀 Quick Start
 
-### Using Pre-trained Models
-
-We provide pre-trained models in the `saved_models/` directory for immediate evaluation:
+### SPF Baseline
 
 ```bash
-# Evaluate all algorithms with pre-trained models
-python run_eval.py
-
 # Generate SPF baseline results
 python run_spf.py
+
+# Evaluate configured solvers; unsupported legacy RL solvers are skipped
+python run_eval.py
 ```
 
-### Training from Scratch
+### RL Training Status
 
-#### Single Algorithm Training
-```bash
-# Train Primal-CVaR (our risk-aware algorithm)
-python run_train.py --solver=configs/primal_cvar.json
-
-# Train Primal-Avg (our risk-neutral algorithm)
-python run_train.py --solver=configs/primal_avg.json
-
-# Train baseline algorithms
-python run_train.py --solver=configs/dqn.json
-python run_train.py --solver=configs/iqn.json
-python run_train.py --solver=configs/sac.json
-```
-
-#### Distributed Training (SLURM)
-```bash
-# Submit training jobs to SLURM cluster
-sbatch train_primal_cvar.sh
-sbatch train_primal_avg.sh
-sbatch train_madqn.sh
-```
-
-#### Custom Configuration
-```json
-// Example: configs/primal_cvar.json
-{
-  "risk_level": 0.25,      // CVaR risk level (0.25 = worst 25% of outcomes)
-  "cost_limit": 10,        // Maximum queuing delay threshold (ms)
-  "discount_reward": 0.99, // Reward discount factor
-  "discount_cost": 0.97,   // Cost discount factor (lower = more myopic)
-  "hidden_dim": 512,       // Neural network hidden layer size
-  "num_quantiles": 64,     // Number of quantiles for IQN
-  "batch_size": 2048,      // Training batch size
-  "buffer_size": 300000,   // Experience replay buffer size
-  "learning_rate": 1e-4
-}
-```
+The legacy RL solver implementations are still present, but the slot-array simulator currently supports SPF only. RL training requires a batched transition API before `run_train.py` can be used for PRIMAL/MADQN/MaIQN/MaSAC again.
 
 ## 📄 License
 
 This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
-

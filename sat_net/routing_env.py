@@ -1,5 +1,5 @@
 from pathlib import Path
-from typing import Callable, Optional
+from typing import Optional
 
 import numpy as np
 import pandas as pd
@@ -22,7 +22,7 @@ FLOWLET_DELIVERED = 3
 FLOWLET_DROPPED = 4
 
 
-class RoutingEnvAsync:
+class RoutingEnv:
     """
     Fixed-step slot environment for data-oriented satellite routing simulation.
     """
@@ -42,7 +42,6 @@ class RoutingEnvAsync:
         self._set_seed(self.config.get("seed", default=None))
 
         self.network = self._create_network()
-        self.ground_stations = list(self.network.ground_stations.values())
         self.traffic_config: NamedDict = self.config.traffic
         self.traffic_model = TrafficRegionModel.from_config(self.traffic_config, PROJECT_ROOT)
         self.packet_rate_per_ms: float = self.traffic_config.get("packet_rate_per_ms", 1.0)
@@ -52,9 +51,7 @@ class RoutingEnvAsync:
             "eager_spf_region_threshold",
             64,
         )
-        self.access_data_rate: float = self.traffic_config.get(
-            "access_data_rate", self.network_config.gsl_data_rate
-        )
+        self.access_data_rate: float = self.traffic_config.get("access_data_rate", 1.0)
         self.prob_normal_packet: float = self.config.prob_normal_packet
         self.normal_packet_size = self.config.normal_packet_size
         self.small_packet_size = self.config.small_packet_size
@@ -74,7 +71,7 @@ class RoutingEnvAsync:
         self.verbose = self.config.verbose
         self.update_interval_ms = self.config.update_interval_ms
 
-        self.next_packet_id = 0
+        self.next_flowlet_id = 0
         self._region_positions = np.array(
             [region.position for region in self.traffic_model.regions],
             dtype=np.float64,
@@ -96,28 +93,19 @@ class RoutingEnvAsync:
     def _create_network(self):
         """Create the network based on the configuration."""
         return SatelliteNetwork(
-            ground_stations=self.network_config.ground_stations,
             altitude=self.network_config.altitude,
             inclination=self.network_config.inclination,
             num_orbits=self.network_config.num_orbits,
             num_sats_per_orbit=self.network_config.num_sats_per_orbit,
             phasing=self.network_config.phasing,
             min_elevation_angle_deg=self.network_config.min_elevation_angle_deg,
-            max_gsl_per_gs=self.network_config.max_gsl_per_gs,
-            max_gsl_per_sat=self.network_config.max_gsl_per_sat,
-            node_buffer_size=self.network_config.node_buffer_size,
             link_buffer_size=self.network_config.link_buffer_size,
-            gsl_data_rate=self.network_config.gsl_data_rate,
             isl_data_rate=self.network_config.isl_data_rate,
         )
 
     def _refresh_satellite_index_cache(self):
-        sat_ids = getattr(self.network, "_satellite_ids", None)
-        if sat_ids is None:
-            sat_ids = np.fromiter(self.network.satellites.keys(), dtype=np.int64)
-        self._sat_ids = np.asarray(sat_ids, dtype=np.int64)
-        max_node_id = max(self.network.nodes.keys(), default=-1)
-        self._sat_id_to_col_array = np.full(max_node_id + 1, -1, dtype=np.int64)
+        self._sat_ids = np.asarray(self.network.satellite_ids, dtype=np.int64)
+        self._sat_id_to_col_array = np.full(self.network.num_nodes, -1, dtype=np.int64)
         if len(self._sat_ids) > 0:
             self._sat_id_to_col_array[self._sat_ids] = np.arange(len(self._sat_ids), dtype=np.int64)
 
@@ -147,11 +135,9 @@ class RoutingEnvAsync:
 
         self.network = self._create_network()
 
-        self.ground_stations = list(self.network.ground_stations.values())
-
         self.topology_update_steps = 0
 
-        self.next_packet_id = 0
+        self.next_flowlet_id = 0
         self._array_metrics = None
         self._flowlet_arrays = {}
 
@@ -167,26 +153,18 @@ class RoutingEnvAsync:
     def run(
         self,
         solver: "BaseSolver",
-        debug_callback: Optional[Callable] = None,
-        callback_interval_ms: int = 0,
     ):
-        return self._run_slot_array_kernel(solver, debug_callback, callback_interval_ms)
+        return self._run_slot_array_kernel(solver)
 
     def _run_slot_array_kernel(
         self,
         solver: "BaseSolver",
-        debug_callback: Optional[Callable] = None,
-        callback_interval_ms: int = 0,
     ):
         if solver.name != "SPF":
             raise NotImplementedError(
                 "The slot array kernel currently supports SPF. "
                 "RL solvers need a batched transition API."
             )
-        if self.network.ground_stations:
-            raise NotImplementedError("The slot array kernel expects region traffic without ground stations.")
-        if debug_callback is not None or callback_interval_ms:
-            raise NotImplementedError("Debug callbacks are not supported by the slot array kernel.")
 
         self.current_solver = solver
         self._build_link_array_cache()
@@ -227,19 +205,19 @@ class RoutingEnvAsync:
         self._array_metrics = self._calc_array_metrics()
 
     def _build_link_array_cache(self):
-        self._link_list = list(self.network.links.values())
-        self._num_links = len(self._link_list)
-        self._link_source_ids = np.array([link.source.id for link in self._link_list], dtype=np.int64)
-        self._link_sink_ids = np.array([link.sink.id for link in self._link_list], dtype=np.int64)
-        self._link_data_rate = np.array([link.data_rate for link in self._link_list], dtype=np.float64)
-        self._link_capacity = np.array([link.capacity for link in self._link_list], dtype=np.float64)
+        self._link_source_ids = self.network._link_source_ids
+        self._link_sink_ids = self.network._link_sink_ids
+        self._link_data_rate = self.network._link_data_rate_array
+        self._link_capacity = self.network._link_capacity_array
+        self._num_links = len(self._link_source_ids)
         self._link_free_time = np.zeros(self._num_links, dtype=np.float64)
         self._link_queue_load = np.zeros(self._num_links, dtype=np.float64)
 
-        num_nodes = max(self.network.nodes.keys()) + 1
-        self._link_id_by_pair = np.full((num_nodes, num_nodes), -1, dtype=np.int32)
-        for link_id, link in enumerate(self._link_list):
-            self._link_id_by_pair[link.source.id, link.sink.id] = link_id
+        self._link_id_by_pair = np.full((self.network.num_nodes, self.network.num_nodes), -1, dtype=np.int32)
+        self._link_id_by_pair[self._link_source_ids, self._link_sink_ids] = np.arange(
+            self._num_links,
+            dtype=np.int32,
+        )
 
         self._refresh_link_state_arrays()
 
@@ -251,8 +229,8 @@ class RoutingEnvAsync:
             self._link_delay = delay
             return
 
-        self._link_connected = np.array([link.is_connected for link in self._link_list], dtype=bool)
-        self._link_delay = np.array([link.propagation_delay for link in self._link_list], dtype=np.float64)
+        self._link_connected = self.network._link_connected_array
+        self._link_delay = self.network._link_delay_array
 
     def _generate_flowlet_arrays(self):
         num_slots = int(np.ceil(self.time_limit / self.slot_ms))
@@ -266,7 +244,7 @@ class RoutingEnvAsync:
         np.cumsum(slot_counts, out=self._slot_flowlet_offsets[1:])
 
         self._flowlet_arrays = {}
-        self.next_packet_id = num_flowlets
+        self.next_flowlet_id = num_flowlets
 
         if num_flowlets == 0:
             self._init_empty_flowlet_arrays()
@@ -304,8 +282,8 @@ class RoutingEnvAsync:
             "transmission_delay": np.zeros(num_flowlets, dtype=np.float64),
             "propagation_delay": np.zeros(num_flowlets, dtype=np.float64),
             "total_queue_cost": np.zeros(num_flowlets, dtype=np.float64),
-            "first_gsl_delay": np.zeros(num_flowlets, dtype=np.float64),
-            "final_gsl_delay": np.zeros(num_flowlets, dtype=np.float64),
+            "first_access_delay": np.zeros(num_flowlets, dtype=np.float64),
+            "final_access_delay": np.zeros(num_flowlets, dtype=np.float64),
             "delivery_time": np.full(num_flowlets, np.nan, dtype=np.float64),
             "drop_time": np.full(num_flowlets, np.nan, dtype=np.float64),
             "drop_reason": np.full(num_flowlets, -1, dtype=np.int16),
@@ -393,7 +371,7 @@ class RoutingEnvAsync:
         source_sat_ids = self._nearest_region_sat_ids[source_regions]
         visible = source_sat_ids >= 0
         if (~visible).any():
-            self._drop_flowlet_ids(flowlet_ids[~visible], NetworkError.NO_AVAIABLE_SAT)
+            self._drop_flowlet_ids(flowlet_ids[~visible], NetworkError.NO_AVAILABLE_SAT)
 
         active_ids = flowlet_ids[visible]
         if len(active_ids) == 0:
@@ -407,7 +385,7 @@ class RoutingEnvAsync:
         self._flowlet_arrays["source_id"][active_ids] = source_sat_ids
         self._flowlet_arrays["current_sat"][active_ids] = source_sat_ids
         self._flowlet_arrays["status"][active_ids] = FLOWLET_AT_NODE
-        self._flowlet_arrays["first_gsl_delay"][active_ids] = source_prop_delay + source_tx_delay
+        self._flowlet_arrays["first_access_delay"][active_ids] = source_prop_delay + source_tx_delay
         self._flowlet_arrays["propagation_delay"][active_ids] += source_prop_delay
         self._flowlet_arrays["transmission_delay"][active_ids] += source_tx_delay
 
@@ -450,7 +428,7 @@ class RoutingEnvAsync:
         final_tx_delay = self._flowlet_arrays["size"][flowlet_ids] / self.access_data_rate
         final_delay = final_prop_delay + final_tx_delay
 
-        self._flowlet_arrays["final_gsl_delay"][flowlet_ids] = final_delay
+        self._flowlet_arrays["final_access_delay"][flowlet_ids] = final_delay
         self._flowlet_arrays["propagation_delay"][flowlet_ids] += final_prop_delay
         self._flowlet_arrays["transmission_delay"][flowlet_ids] += final_tx_delay
         self._flowlet_arrays["delivery_time"][flowlet_ids] = self.current_time + final_delay
@@ -463,7 +441,7 @@ class RoutingEnvAsync:
 
         no_access = target_access_sats < 0
         if no_access.any():
-            self._drop_flowlet_ids(flowlet_ids[no_access], NetworkError.NO_AVAIABLE_SAT)
+            self._drop_flowlet_ids(flowlet_ids[no_access], NetworkError.NO_AVAILABLE_SAT)
 
         candidate_ids = flowlet_ids[~no_access]
         if len(candidate_ids) == 0:
@@ -763,17 +741,10 @@ class RoutingEnvAsync:
             self._region_access_cache_time = self.current_time
             return
 
-        positions_by_id = getattr(self.network, "_satellite_positions_by_id", None)
-        if positions_by_id is not None:
-            sat_positions = positions_by_id[self._sat_ids]
-        else:
-            sat_positions = np.array(
-                [self.network.satellites[int(sat_id)].position for sat_id in self._sat_ids],
-                dtype=np.float64,
-            )
+        sat_positions = self.network._satellite_positions_by_id[self._sat_ids]
         delta = self._region_positions[:, None, :] - sat_positions[None, :, :]
         distance2 = np.einsum("ijk,ijk->ij", delta, delta)
-        visible = distance2 <= self.network.max_gsl_range * self.network.max_gsl_range
+        visible = distance2 <= self.network.max_access_range * self.network.max_access_range
         masked_distance2 = np.where(visible, distance2, np.inf)
         nearest_cols = np.argmin(masked_distance2, axis=1)
         nearest_distance2 = masked_distance2[np.arange(masked_distance2.shape[0]), nearest_cols]
@@ -836,10 +807,10 @@ class RoutingEnvAsync:
                 "drop_time": arrays.get("drop_time", np.full(len(status), np.nan)),
                 "drop_reason": arrays.get("drop_reason", np.full(len(status), -1)),
                 "total_queue_cost": arrays.get("total_queue_cost", np.zeros(len(status))),
-                "first_gsl_delay": arrays.get("first_gsl_delay", np.zeros(len(status))),
-                "final_gsl_delay": arrays.get("final_gsl_delay", np.zeros(len(status))),
+                "first_access_delay": arrays.get("first_access_delay", np.zeros(len(status))),
+                "final_access_delay": arrays.get("final_access_delay", np.zeros(len(status))),
             }
         )
 
-    def save_packets_to_csv(self, file_path: str):
+    def save_flowlets_to_csv(self, file_path: str):
         self.get_flowlet_dataframe().to_csv(file_path, index=False)

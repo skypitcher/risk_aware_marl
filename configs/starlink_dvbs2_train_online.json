@@ -25,12 +25,7 @@
         "num_sats_per_orbit": 22,
         "phasing": 3,
         "min_elevation_angle_deg": 15,
-        "max_gsl_per_gs": 4,
-        "max_gsl_per_sat": 4,
-        "node_buffer_size": 16.0,
         "link_buffer_size": 16.0,
-        "gsl_data_rate": 1.0,
-        "isl_data_rate": 0.05,
-        "ground_stations": []
+        "isl_data_rate": 0.05
     }
 }

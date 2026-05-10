@@ -2,7 +2,7 @@
 
 ## Project Structure & Module Organization
 
-`sat_net/` contains the core event-driven satellite routing simulator, including topology, nodes, links, traffic, metrics, and `sat_net/solver/` routing algorithms such as PRIMAL-CVaR, PRIMAL-Avg, DQN, IQN, SAC, and SPF. `satnet_viewer/` provides the OpenGL/ImGui visualization app. Root-level scripts are entry points: `run_train.py`, `run_eval.py`, `run_spf.py`, `run_satnet_viewer.py`, and plotting utilities named `plot_*.py`. JSON environment and solver settings live in `configs/`. Static map data is in `assets/`; generated figures, runs, and model checkpoints are in `figs/`, `runs_*`, and `saved_models/`.
+`sat_net/` contains the fixed-step, data-oriented satellite routing simulator. `sat_net/network.py` stores topology in NumPy arrays, `sat_net/routing_env.py` runs the slot-array flowlet kernel, `sat_net/traffic_region.py` builds region traffic, and `sat_net/solver/` contains PRIMAL-CVaR, PRIMAL-Avg, DQN, IQN, SAC, and SPF solvers. Root-level scripts are entry points: `run_train.py`, `run_eval.py`, `run_spf.py`, and plotting utilities named `plot_*.py`. JSON environment and solver settings live in `configs/`. Static map data is in `assets/`; generated figures, runs, and model checkpoints are in `figs/`, `runs_*`, and `saved_models/`.
 
 ## Build, Test, and Development Commands
 
@@ -20,11 +20,10 @@ Run core workflows from the repository root:
 python run_spf.py
 python run_eval.py
 python run_train.py --solver=configs/primal_cvar.json --num_epochs=10
-python run_satnet_viewer.py
 tensorboard --logdir=runs_train
 ```
 
-Use `python -m compileall sat_net satnet_viewer *.py` as a fast syntax check before longer simulations.
+Use `python -m compileall sat_net *.py` as a fast syntax check before longer simulations.
 
 ## Coding Style & Naming Conventions
 
