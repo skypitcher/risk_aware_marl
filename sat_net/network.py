@@ -142,6 +142,9 @@ class SatelliteNetwork:
             for idx, (source, sink) in enumerate(zip(self._link_source_ids, self._link_sink_ids))
         }
         self.num_links = len(self._link_source_ids)
+        self.neighbor_sat_ids = np.column_stack(
+            (self.isl_n, self.isl_e, self.isl_s, self.isl_w)
+        ).astype(np.int64, copy=False)
 
     def update_topology(self, timestamp: float, on_link_disconnected=None):
         if on_link_disconnected is not None:

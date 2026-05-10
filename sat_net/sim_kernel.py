@@ -58,11 +58,11 @@ class FlowletState:
         return len(self.status)
 
     @classmethod
-    def empty(cls) -> "FlowletState":
+    def empty(cls, slot_offsets: np.ndarray | None = None) -> "FlowletState":
         empty_i64 = np.empty(0, dtype=np.int64)
         empty_f64 = np.empty(0, dtype=np.float64)
         return cls(
-            slot_offsets=np.zeros(1, dtype=np.int64),
+            slot_offsets=np.zeros(1, dtype=np.int64) if slot_offsets is None else slot_offsets,
             status=np.empty(0, dtype=np.int8),
             creation_slot=empty_i64.copy(),
             creation_time=empty_f64.copy(),
@@ -98,6 +98,67 @@ class FlowletState:
         )
 
 
+def create_flowlet_state(
+    slot_counts: np.ndarray,
+    source_region_ids: np.ndarray,
+    target_region_ids: np.ndarray,
+    is_normal: np.ndarray,
+    packet_size: np.ndarray,
+    packet_count: np.ndarray,
+    default_ttl: int,
+    start_time: float,
+    slot_ms: float,
+) -> FlowletState:
+    num_slots = len(slot_counts)
+    num_flowlets = int(slot_counts.sum())
+    slot_offsets = np.empty(num_slots + 1, dtype=np.int64)
+    slot_offsets[0] = 0
+    np.cumsum(slot_counts, out=slot_offsets[1:])
+
+    if num_flowlets == 0:
+        return FlowletState.empty(slot_offsets=slot_offsets)
+
+    creation_slots = np.repeat(np.arange(num_slots, dtype=np.int64), slot_counts)
+    creation_times = start_time + creation_slots.astype(np.float64) * slot_ms
+    size = packet_size * packet_count
+
+    return FlowletState(
+        slot_offsets=slot_offsets,
+        status=np.full(num_flowlets, FLOWLET_NOT_STARTED, dtype=np.int8),
+        creation_slot=creation_slots,
+        creation_time=creation_times,
+        source_region_id=source_region_ids.astype(np.int64, copy=False),
+        target_region_id=target_region_ids.astype(np.int64, copy=False),
+        source_id=np.full(num_flowlets, -1, dtype=np.int64),
+        current_sat=np.full(num_flowlets, -1, dtype=np.int64),
+        next_sat=np.full(num_flowlets, -1, dtype=np.int64),
+        link_id=np.full(num_flowlets, -1, dtype=np.int32),
+        packet_count=packet_count.astype(np.int64, copy=False),
+        packet_size=packet_size.astype(np.float64, copy=False),
+        is_normal=is_normal.astype(bool, copy=False),
+        size=size.astype(np.float64, copy=False),
+        ttl=np.full(num_flowlets, default_ttl, dtype=np.int16),
+        hops=np.zeros(num_flowlets, dtype=np.int16),
+        queue_delay=np.zeros(num_flowlets, dtype=np.float64),
+        transmission_delay=np.zeros(num_flowlets, dtype=np.float64),
+        propagation_delay=np.zeros(num_flowlets, dtype=np.float64),
+        total_queue_cost=np.zeros(num_flowlets, dtype=np.float64),
+        first_access_delay=np.zeros(num_flowlets, dtype=np.float64),
+        final_access_delay=np.zeros(num_flowlets, dtype=np.float64),
+        delivery_time=np.full(num_flowlets, np.nan, dtype=np.float64),
+        drop_time=np.full(num_flowlets, np.nan, dtype=np.float64),
+        drop_reason=np.full(num_flowlets, -1, dtype=np.int16),
+        transmit_end_time=np.full(num_flowlets, np.inf, dtype=np.float64),
+        arrival_time=np.full(num_flowlets, np.inf, dtype=np.float64),
+        link_released=np.ones(num_flowlets, dtype=bool),
+        scheduled_prop_delay=np.zeros(num_flowlets, dtype=np.float64),
+        shortest_gcd=np.full(num_flowlets, np.inf, dtype=np.float64),
+        initial_gcd=np.ones(num_flowlets, dtype=np.float64),
+        last_node1=np.full(num_flowlets, -1, dtype=np.int64),
+        last_node2=np.full(num_flowlets, -1, dtype=np.int64),
+    )
+
+
 @dataclass(slots=True)
 class LinkState:
     """Runtime link arrays used by the slot scheduler."""
@@ -109,6 +170,7 @@ class LinkState:
     connected: np.ndarray
     delay: np.ndarray
     id_by_pair: np.ndarray
+    neighbor_link_ids: np.ndarray
     free_time: np.ndarray
     queue_load: np.ndarray
 
@@ -125,10 +187,21 @@ def create_link_state(
     connected: np.ndarray,
     delay: np.ndarray,
     num_nodes: int,
+    neighbor_sat_ids: np.ndarray,
 ) -> LinkState:
     num_links = len(source_ids)
     id_by_pair = np.full((num_nodes, num_nodes), -1, dtype=np.int32)
     id_by_pair[source_ids, sink_ids] = np.arange(num_links, dtype=np.int32)
+
+    neighbor_link_ids = np.full(neighbor_sat_ids.shape, -1, dtype=np.int32)
+    valid_neighbor = neighbor_sat_ids >= 0
+    if valid_neighbor.any():
+        source_cols = np.broadcast_to(np.arange(num_nodes, dtype=np.int64)[:, None], neighbor_sat_ids.shape)
+        neighbor_link_ids[valid_neighbor] = id_by_pair[
+            source_cols[valid_neighbor],
+            neighbor_sat_ids[valid_neighbor],
+        ]
+
     return LinkState(
         source_ids=source_ids,
         sink_ids=sink_ids,
@@ -137,6 +210,7 @@ def create_link_state(
         connected=connected,
         delay=delay,
         id_by_pair=id_by_pair,
+        neighbor_link_ids=neighbor_link_ids,
         free_time=np.zeros(num_links, dtype=np.float64),
         queue_load=np.zeros(num_links, dtype=np.float64),
     )
@@ -300,30 +374,12 @@ def build_routing_batch(
     current_sats: np.ndarray,
     target_regions: np.ndarray,
     target_access_sats: np.ndarray,
-    isl_n: np.ndarray,
-    isl_e: np.ndarray,
-    isl_s: np.ndarray,
-    isl_w: np.ndarray,
+    neighbor_sat_ids_by_node: np.ndarray,
     current_time: float,
     region_next_hop_table: np.ndarray | None,
 ) -> RoutingBatch:
-    neighbor_sat_ids = np.column_stack(
-        (
-            isl_n[current_sats],
-            isl_e[current_sats],
-            isl_s[current_sats],
-            isl_w[current_sats],
-        )
-    ).astype(np.int64, copy=False)
-
-    neighbor_link_ids = np.full(neighbor_sat_ids.shape, -1, dtype=np.int32)
-    valid_neighbor = neighbor_sat_ids >= 0
-    if valid_neighbor.any():
-        source_ids = np.broadcast_to(current_sats[:, None], neighbor_sat_ids.shape)
-        neighbor_link_ids[valid_neighbor] = links.id_by_pair[
-            source_ids[valid_neighbor],
-            neighbor_sat_ids[valid_neighbor],
-        ]
+    neighbor_sat_ids = neighbor_sat_ids_by_node[current_sats]
+    neighbor_link_ids = links.neighbor_link_ids[current_sats]
 
     valid_link = neighbor_link_ids >= 0
     safe_link_ids = np.where(valid_link, neighbor_link_ids, 0)

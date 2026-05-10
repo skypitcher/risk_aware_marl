@@ -14,6 +14,7 @@ from sat_net.sim_kernel import (
     LinkState,
     activate_flowlets_at_slot,
     build_routing_batch,
+    create_flowlet_state,
     create_link_state,
     deliver_flowlet_ids,
     drop_flowlet_ids,
@@ -218,6 +219,7 @@ class RoutingEnv:
             connected=self.network._link_connected_array,
             delay=self.network._link_delay_array,
             num_nodes=self.network.num_nodes,
+            neighbor_sat_ids=self.network.neighbor_sat_ids,
         )
 
         self._refresh_link_state_arrays()
@@ -242,18 +244,8 @@ class RoutingEnv:
         )
         slot_counts = self.np_random.poisson(lam=expected_flowlets_per_slot, size=num_slots)
         num_flowlets = int(slot_counts.sum())
-        slot_offsets = np.empty(num_slots + 1, dtype=np.int64)
-        slot_offsets[0] = 0
-        np.cumsum(slot_counts, out=slot_offsets[1:])
-
         self.next_flowlet_id = num_flowlets
 
-        if num_flowlets == 0:
-            self._flowlets = FlowletState.empty()
-            return
-
-        creation_slots = np.repeat(np.arange(num_slots, dtype=np.int64), slot_counts)
-        creation_times = self.start_time + creation_slots.astype(np.float64) * self.slot_ms
         source_region_ids = self.traffic_model.sample_source_ids(self.np_random, num_flowlets).astype(np.int64)
         target_region_ids = self.traffic_model.sample_target_ids(self.np_random, source_region_ids).astype(np.int64)
         is_normal = self.np_random.uniform(size=num_flowlets) < self.prob_normal_packet
@@ -262,42 +254,17 @@ class RoutingEnv:
             1,
             self.np_random.poisson(lam=self.mean_packets_per_flowlet, size=num_flowlets),
         ).astype(np.int64)
-        size = packet_size * packet_count
 
-        self._flowlets = FlowletState(
-            slot_offsets=slot_offsets,
-            status=np.full(num_flowlets, FLOWLET_NOT_STARTED, dtype=np.int8),
-            creation_slot=creation_slots,
-            creation_time=creation_times,
-            source_region_id=source_region_ids,
-            target_region_id=target_region_ids,
-            source_id=np.full(num_flowlets, -1, dtype=np.int64),
-            current_sat=np.full(num_flowlets, -1, dtype=np.int64),
-            next_sat=np.full(num_flowlets, -1, dtype=np.int64),
-            link_id=np.full(num_flowlets, -1, dtype=np.int32),
-            packet_count=packet_count,
-            packet_size=packet_size,
+        self._flowlets = create_flowlet_state(
+            slot_counts=slot_counts,
+            source_region_ids=source_region_ids,
+            target_region_ids=target_region_ids,
             is_normal=is_normal,
-            size=size,
-            ttl=np.full(num_flowlets, self.default_ttl, dtype=np.int16),
-            hops=np.zeros(num_flowlets, dtype=np.int16),
-            queue_delay=np.zeros(num_flowlets, dtype=np.float64),
-            transmission_delay=np.zeros(num_flowlets, dtype=np.float64),
-            propagation_delay=np.zeros(num_flowlets, dtype=np.float64),
-            total_queue_cost=np.zeros(num_flowlets, dtype=np.float64),
-            first_access_delay=np.zeros(num_flowlets, dtype=np.float64),
-            final_access_delay=np.zeros(num_flowlets, dtype=np.float64),
-            delivery_time=np.full(num_flowlets, np.nan, dtype=np.float64),
-            drop_time=np.full(num_flowlets, np.nan, dtype=np.float64),
-            drop_reason=np.full(num_flowlets, -1, dtype=np.int16),
-            transmit_end_time=np.full(num_flowlets, np.inf, dtype=np.float64),
-            arrival_time=np.full(num_flowlets, np.inf, dtype=np.float64),
-            link_released=np.ones(num_flowlets, dtype=bool),
-            scheduled_prop_delay=np.zeros(num_flowlets, dtype=np.float64),
-            shortest_gcd=np.full(num_flowlets, np.inf, dtype=np.float64),
-            initial_gcd=np.ones(num_flowlets, dtype=np.float64),
-            last_node1=np.full(num_flowlets, -1, dtype=np.int64),
-            last_node2=np.full(num_flowlets, -1, dtype=np.int64),
+            packet_size=packet_size,
+            packet_count=packet_count,
+            default_ttl=self.default_ttl,
+            start_time=self.start_time,
+            slot_ms=self.slot_ms,
         )
 
     def _release_transmitted_flowlets(self):
@@ -448,10 +415,7 @@ class RoutingEnv:
             current_sats=current_sats,
             target_regions=target_regions,
             target_access_sats=target_access_sats,
-            isl_n=self.network.isl_n,
-            isl_e=self.network.isl_e,
-            isl_s=self.network.isl_s,
-            isl_w=self.network.isl_w,
+            neighbor_sat_ids_by_node=self.network.neighbor_sat_ids,
             current_time=self.current_time,
             region_next_hop_table=self._region_next_hop_table if include_spf_table else None,
         )
