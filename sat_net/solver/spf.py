@@ -18,6 +18,9 @@ class SPF(BaseSolver):
     This is a simple solver that is used to compare the performance of the RL-based solvers.
     """
 
+    def __init__(self, tf_writer=None):
+        super().__init__(tf_writer=tf_writer)
+
     @property
     def name(self):
         return "SPF"
@@ -41,32 +44,30 @@ class SPF(BaseSolver):
             # The DataBlock is already at its destination
             return None, None
 
-        _path_weight, path = network.get_shortest_path(
+        next_hop = network.get_shortest_next_hop(
             current=current_node_id,
             sink=target_access_sat_id,
         )
-
-        # If a path exists and has more than one node (i.e., not just the source)
-        if path and len(path) > 1:
-            # The next hop is the second node in the path
-            next_hop = path[1]
-            for i, neighbor_id in enumerate(action_list):
-                if neighbor_id == next_hop:
-                    return i, None
-
-            raise ValueError(
-                f"Invalid next hop: {next_hop} for node {node.id} {node.name}, "
-                f"action_list: {action_list}"
-            )
-        else:
-            # No path found or path is just the source node
+        if next_hop is None:
             return None, None
+
+        for i, neighbor_id in enumerate(action_list):
+            if neighbor_id == next_hop:
+                return i, None
+
+        raise ValueError(
+            f"Invalid next hop: {next_hop} for node {node.id} {node.name}, "
+            f"action_list: {action_list}"
+        )
 
     def _resolve_target_access_satellite(
         self,
         network: "SatelliteNetwork",
         info: dict,
     ) -> int | None:
+        if "target_access_sat_id" in info:
+            return info["target_access_sat_id"]
+
         target_region: "TrafficRegion" = info["target_region"]
         target_sat, _distance = network.get_nearest_satellite_for_position(
             target_region.position

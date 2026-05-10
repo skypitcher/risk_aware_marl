@@ -3,9 +3,12 @@ from typing import Any, Callable, Optional
 
 import numpy as np
 import rustworkx as rx
+from scipy.sparse import csr_matrix
+from scipy.sparse.csgraph import dijkstra
 
 from sat_net.geometric import (
     EARTH_R_KM,
+    GM_EARTH,
     LIGHT_SPEED_MS,
     calculate_delay,
     calculate_maximum_inter_satellite_range,
@@ -17,6 +20,15 @@ from sat_net.link import Link
 from sat_net.node import GroundStation, Node, Satellite
 
 
+DISCONNECTED_LINK_WEIGHT = 9999.0
+
+
+def _default_link_weight(link: Link) -> float:
+    if link is not None and link.is_connected:
+        return link.propagation_delay
+    return DISCONNECTED_LINK_WEIGHT
+
+
 class Network(ABC):
     """Represents a dynamic network where the topology is updated periodically due to the movement of nodes."""
 
@@ -25,6 +37,10 @@ class Network(ABC):
         self.nodes: dict[int, Node] = {}  # {node_id: Node}
         self.links: dict[tuple[int, int], Link] = {}  # {(source, destination): Link}
         self.G: rx.PyDiGraph = rx.PyDiGraph()
+        self.topology_version = 0
+        self._shortest_next_hop_cache: dict[int, np.ndarray] = {}
+        self._shortest_reverse_csr: csr_matrix | None = None
+        self._shortest_reverse_csr_version = -1
 
     def _add_node(self, node: Node):
         """Add a node to the network."""
@@ -60,6 +76,10 @@ class Network(ABC):
             on_link_disconnected: Callback for handling link unavailability.
         """
         self._change_topology(timestamp, on_link_disconnected)
+        self.topology_version += 1
+        self._shortest_next_hop_cache.clear()
+        self._shortest_reverse_csr = None
+        self._shortest_reverse_csr_version = -1
         # self._update_routing_table()
 
     @abstractmethod
@@ -125,6 +145,27 @@ class Network(ABC):
             return 0
         return sum(1 for link in self.links.values() if link.is_connected and link.get_load_factor() >= threshold)
 
+    def _get_shortest_edge_arrays(self) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        link_items = list(self.links.items())
+        sources = np.fromiter((source for (source, _sink), _link in link_items), dtype=np.int64)
+        sinks = np.fromiter((sink for (_source, sink), _link in link_items), dtype=np.int64)
+        weights = np.fromiter(
+            (_default_link_weight(link) for _key, link in link_items),
+            dtype=np.float64,
+            count=len(link_items),
+        )
+        return sources, sinks, weights
+
+    def _get_shortest_reverse_csr(self) -> csr_matrix:
+        if self._shortest_reverse_csr_version != self.topology_version:
+            sources, sinks, weights = self._get_shortest_edge_arrays()
+            self._shortest_reverse_csr = csr_matrix(
+                (weights, (sinks, sources)),
+                shape=(self.num_nodes, self.num_nodes),
+            )
+            self._shortest_reverse_csr_version = self.topology_version
+        return self._shortest_reverse_csr
+
 
 class SatelliteNetwork(Network):
     """The integrated terrestrial-satellite network."""
@@ -183,6 +224,7 @@ class SatelliteNetwork(Network):
         self.num_satellites = self.num_orbits * self.num_sats_per_orbit
         self.num_ground_stations = len(self.ground_station_raw_data)
         self.num_nodes = self.num_ground_stations + self.num_satellites
+        self._sync_object_state = self.num_ground_stations > 0
         if self.num_satellites > 0:
             self.angular_shift = self.phasing * (360 / self.num_satellites)
         else:
@@ -208,6 +250,7 @@ class SatelliteNetwork(Network):
         self.S2G: dict[int, int] = {}  # {sat_id: num_gs_connected}
 
         self._initialize_network()
+        self._rebuild_vector_update_cache()
 
     def _initialize_network(self):
         """Initialize the network."""
@@ -397,6 +440,10 @@ class SatelliteNetwork(Network):
             timestamp: Current simulation time
             on_link_disconnected: Callback for handling link unavailability.
         """
+        if not self.ground_stations:
+            self._change_satellite_only_topology(timestamp, on_link_disconnected)
+            return
+
         # Update node positions
         for node in self.nodes.values():
             node.update(timestamp)
@@ -435,6 +482,130 @@ class SatelliteNetwork(Network):
         # Add new ground-satellite links as needed
         self._setup_GSLs()
 
+    def _rebuild_vector_update_cache(self):
+        self._satellite_update_list = list(self.satellites.values())
+        self._satellite_ids = np.array(
+            [sat.id for sat in self._satellite_update_list],
+            dtype=np.int64,
+        )
+        self._satellite_altitudes = np.array(
+            [sat.altitude for sat in self._satellite_update_list],
+            dtype=np.float64,
+        )
+        self._satellite_raan_rad = np.deg2rad(
+            [sat.raan for sat in self._satellite_update_list]
+        )
+        self._satellite_inc_rad = np.deg2rad(
+            [sat.inclination for sat in self._satellite_update_list]
+        )
+        self._satellite_true_anomaly = np.array(
+            [sat.true_anomaly for sat in self._satellite_update_list],
+            dtype=np.float64,
+        )
+        self._satellite_positions_by_id = np.empty((self.num_nodes, 3), dtype=np.float64)
+        self._satellite_positions_by_id[self._satellite_ids] = np.array(
+            [sat.position for sat in self._satellite_update_list],
+            dtype=np.float64,
+        )
+
+        self._link_update_list = list(self.links.values())
+        self._link_source_ids = np.array(
+            [link.source.id for link in self._link_update_list],
+            dtype=np.int64,
+        )
+        self._link_sink_ids = np.array(
+            [link.sink.id for link in self._link_update_list],
+            dtype=np.int64,
+        )
+        self._link_index_by_pair = {
+            (int(source), int(sink)): idx
+            for idx, (source, sink) in enumerate(zip(self._link_source_ids, self._link_sink_ids))
+        }
+        self._link_spf_weights = np.array(
+            [_default_link_weight(link) for link in self._link_update_list],
+            dtype=np.float64,
+        )
+        self._link_connected_array = np.array(
+            [link.is_connected for link in self._link_update_list],
+            dtype=bool,
+        )
+        self._link_delay_array = np.array(
+            [link.propagation_delay for link in self._link_update_list],
+            dtype=np.float64,
+        )
+
+    def _change_satellite_only_topology(
+        self,
+        timestamp: float,
+        on_link_disconnected: Callable[[Link], None],
+    ):
+        self._update_satellite_positions_vectorized(timestamp)
+
+        source_pos = self._satellite_positions_by_id[self._link_source_ids]
+        sink_pos = self._satellite_positions_by_id[self._link_sink_ids]
+        distances = np.linalg.norm(source_pos - sink_pos, axis=1)
+        connected = distances <= self.max_isl_range
+        delays = distances / LIGHT_SPEED_MS
+        self._link_connected_array = connected
+        self._link_delay_array = delays
+        self._link_spf_weights = np.where(connected, delays, DISCONNECTED_LINK_WEIGHT)
+
+        if on_link_disconnected is None and not self._sync_object_state:
+            return
+
+        links_unavailable: list[Link] = []
+        for link, is_connected, delay in zip(self._link_update_list, connected, delays):
+            link.is_connected = bool(is_connected)
+            link.propagation_delay = float(delay)
+            if not link.is_connected:
+                links_unavailable.append(link)
+
+        if on_link_disconnected is not None:
+            for link in links_unavailable:
+                on_link_disconnected(link)
+
+    def _update_satellite_positions_vectorized(self, timestamp: float):
+        semi_major_axis_m = (EARTH_R_KM + self._satellite_altitudes) * 1000.0
+        orbit_cycles = 2 * np.pi * np.sqrt(np.power(semi_major_axis_m, 3) / GM_EARTH)
+        theta = (
+            self._satellite_true_anomaly
+            + (360.0 / orbit_cycles) * timestamp / 1000.0
+        ) % 360.0
+        theta_rad = np.deg2rad(theta)
+
+        orbit_radius = EARTH_R_KM + self._satellite_altitudes
+        cos_raan = np.cos(self._satellite_raan_rad)
+        sin_raan = np.sin(self._satellite_raan_rad)
+        cos_theta = np.cos(theta_rad)
+        sin_theta = np.sin(theta_rad)
+        cos_inc = np.cos(self._satellite_inc_rad)
+        sin_inc = np.sin(self._satellite_inc_rad)
+
+        x_eci = orbit_radius * (cos_raan * cos_theta - sin_raan * sin_theta * cos_inc)
+        y_eci = orbit_radius * (sin_raan * cos_theta + cos_raan * sin_theta * cos_inc)
+        z_eci = orbit_radius * sin_theta * sin_inc
+
+        theta_earth = 7.2921150e-5 * timestamp / 1000.0
+        cos_earth = np.cos(theta_earth)
+        sin_earth = np.sin(theta_earth)
+        x_ecef = x_eci * cos_earth + y_eci * sin_earth
+        y_ecef = -x_eci * sin_earth + y_eci * cos_earth
+        positions = np.column_stack((x_ecef, y_ecef, z_eci))
+
+        self._satellite_positions_by_id[self._satellite_ids] = positions
+        if not self._sync_object_state:
+            return
+
+        for sat, position in zip(self._satellite_update_list, positions):
+            sat.position = position
+            sat._projected_pos = None
+            sat._great_circle_distances_cache.clear()
+
+    def _get_shortest_edge_arrays(self) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        if not self.ground_stations and hasattr(self, "_link_spf_weights"):
+            return self._link_source_ids, self._link_sink_ids, self._link_spf_weights
+        return super()._get_shortest_edge_arrays()
+
     def _update_link(self, link: Link):
         """Check if a link is valid."""
         if self.is_ISL(link):  # Inter-satellite link
@@ -459,6 +630,20 @@ class SatelliteNetwork(Network):
         max_count: int | None = None,
     ) -> list[tuple[Satellite, float]]:
         """Return visible satellites for an arbitrary terrestrial position."""
+        positions_by_id = getattr(self, "_satellite_positions_by_id", None)
+        sat_ids = getattr(self, "_satellite_ids", None)
+        if positions_by_id is not None and sat_ids is not None and len(sat_ids) > 0:
+            sat_positions = positions_by_id[sat_ids]
+            distances = np.linalg.norm(sat_positions - position, axis=1)
+            visible_idx = np.flatnonzero(distances <= self.max_gsl_range)
+            visible_idx = visible_idx[np.argsort(distances[visible_idx])]
+            if max_count is not None:
+                visible_idx = visible_idx[:max_count]
+            return [
+                (self.satellites[int(sat_ids[idx])], float(distances[idx]))
+                for idx in visible_idx
+            ]
+
         candidates = []
         for sat in self.satellites.values():
             distance = distance_between(position, sat.position)
@@ -478,10 +663,14 @@ class SatelliteNetwork(Network):
 
     def can_satellite_serve_position(self, sat_id: int, position: np.ndarray) -> bool:
         """Check whether a satellite can currently serve an arbitrary terrestrial position."""
-        sat = self.satellites.get(sat_id)
-        if sat is None:
+        if sat_id not in self.satellites:
             return False
-        return distance_between(position, sat.position) <= self.max_gsl_range
+
+        positions_by_id = getattr(self, "_satellite_positions_by_id", None)
+        if positions_by_id is not None and 0 <= sat_id < len(positions_by_id):
+            return distance_between(position, positions_by_id[sat_id]) <= self.max_gsl_range
+
+        return distance_between(position, self.satellites[sat_id].position) <= self.max_gsl_range
 
     def is_satellite(self, node_id: int) -> bool:
         """Check if a node is a satellite."""
@@ -502,15 +691,17 @@ class SatelliteNetwork(Network):
             return float('inf'), []
 
         if weight_fn is None:
-            def weight_fn(link: Link):
-                if link and link.is_connected:
-                    return link.propagation_delay
-                return 9999
+            weight_fn = _default_link_weight
+            if not self.ground_stations:
+                return self._get_shortest_path_from_next_hops(current=current, sink=sink)
 
-        G =  self.G.copy()
-        for gs in self.ground_stations.values():
-            if gs.id != sink:
-                G.remove_node(gs.id)
+        if self.ground_stations:
+            G = self.G.copy()
+            for gs in self.ground_stations.values():
+                if gs.id != sink:
+                    G.remove_node(gs.id)
+        else:
+            G = self.G
 
         paths_from_source = rx.dijkstra_shortest_paths(G, current, sink, weight_fn=weight_fn)
         if paths_from_source:
@@ -520,6 +711,90 @@ class SatelliteNetwork(Network):
                 return path_weight, path_data
 
         return float('inf'), []
+
+    def _get_shortest_path_from_next_hops(self, current: int, sink: int):
+        if current == sink:
+            return 0.0, [current]
+
+        path = [current]
+        path_weight = 0.0
+        visited = {current}
+        node = current
+        while node != sink and len(path) <= self.num_nodes:
+            next_hop = self.get_shortest_next_hop(node, sink)
+            if next_hop is None or next_hop in visited:
+                return float('inf'), []
+            link_idx = self._link_index_by_pair.get((node, next_hop))
+            if link_idx is None:
+                return float('inf'), []
+            path_weight += float(self._link_spf_weights[link_idx])
+            path.append(next_hop)
+            visited.add(next_hop)
+            node = next_hop
+
+        if node != sink:
+            return float('inf'), []
+        return path_weight, path
+
+    def get_shortest_next_hop(self, current: int, sink: int) -> int | None:
+        if current not in self.nodes or sink not in self.nodes or current == sink:
+            return None
+
+        if self.ground_stations:
+            _path_weight, path = self.get_shortest_path(current=current, sink=sink)
+            return path[1] if path and len(path) > 1 else None
+
+        self._ensure_shortest_next_hop_rows(np.array([sink], dtype=np.int64))
+        next_hops = self._shortest_next_hop_cache[sink]
+        next_hop = int(next_hops[current])
+        return next_hop if next_hop >= 0 else None
+
+    def get_shortest_next_hops(self, current: np.ndarray, sink: np.ndarray) -> np.ndarray:
+        next_hops = np.full(len(current), -1, dtype=np.int64)
+        if len(current) == 0:
+            return next_hops
+
+        target_sinks = np.unique(sink[sink >= 0])
+        self._ensure_shortest_next_hop_rows(target_sinks)
+        for target_sink in target_sinks:
+            target_sink = int(target_sink)
+            table = self._shortest_next_hop_cache[target_sink]
+            mask = sink == target_sink
+            next_hops[mask] = table[current[mask]]
+        return next_hops
+
+    def precompute_shortest_next_hops(self, sinks: np.ndarray):
+        if self.ground_stations:
+            return
+        self._ensure_shortest_next_hop_rows(np.asarray(sinks, dtype=np.int64))
+
+    def _ensure_shortest_next_hop_rows(self, sinks: np.ndarray):
+        sinks = np.unique(sinks[sinks >= 0])
+        if len(sinks) == 0:
+            return
+        missing_sinks = np.array(
+            [int(sink) for sink in sinks if int(sink) not in self._shortest_next_hop_cache],
+            dtype=np.int32,
+        )
+        if len(missing_sinks) == 0:
+            return
+
+        reverse_csr = self._get_shortest_reverse_csr()
+        _distances, predecessors = dijkstra(
+            csgraph=reverse_csr,
+            directed=True,
+            indices=missing_sinks,
+            return_predecessors=True,
+        )
+        if predecessors.ndim == 1:
+            predecessors = predecessors[np.newaxis, :]
+
+        next_hop_rows = predecessors.astype(np.int64, copy=False)
+        next_hop_rows[next_hop_rows < 0] = -1
+        next_hop_rows[np.arange(len(missing_sinks)), missing_sinks] = -1
+
+        for sink, row in zip(missing_sinks, next_hop_rows):
+            self._shortest_next_hop_cache[int(sink)] = row.copy()
 
     def _calculate_path_weight(self, path, weight_fn: Callable[[Link], float]) -> float:
         """

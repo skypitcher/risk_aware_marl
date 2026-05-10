@@ -1,4 +1,3 @@
-import random
 from pathlib import Path
 from typing import Callable, Optional
 
@@ -6,24 +5,26 @@ import numpy as np
 import pandas as pd
 from torch.utils.tensorboard import SummaryWriter
 
-from sat_net.datablock import DataBlock
-from sat_net.event import Event, EventScheduler, EventType
-from sat_net.geometric import LIGHT_SPEED_MS, great_circle_distance
-from sat_net.link import Link
+from sat_net.geometric import LIGHT_SPEED_MS
 from sat_net.network import SatelliteNetwork
-from sat_net.node import Node
 from sat_net.solver.base_solver import BaseSolver
-from sat_net.stats import Metrics, Stats
-from sat_net.traffic_region import TrafficRegion, TrafficRegionModel
+from sat_net.stats import Metrics
+from sat_net.traffic_region import TrafficRegionModel
 from sat_net.util import NamedDict, NetworkError, ms2str
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
+FLOWLET_NOT_STARTED = 0
+FLOWLET_AT_NODE = 1
+FLOWLET_ON_LINK = 2
+FLOWLET_DELIVERED = 3
+FLOWLET_DROPPED = 4
+
 
 class RoutingEnvAsync:
     """
-    Asynchronous Environment for Network Routing in Dynamic Networks.
+    Fixed-step slot environment for data-oriented satellite routing simulation.
     """
 
     def __init__(self, config: NamedDict, tf_writer: Optional[SummaryWriter] = None):
@@ -38,7 +39,6 @@ class RoutingEnvAsync:
         self.tf_writer = tf_writer
 
         self.np_random = None
-        self.py_random: Optional[random.Random] = None
         self._set_seed(self.config.get("seed", default=None))
 
         self.network = self._create_network()
@@ -46,8 +46,12 @@ class RoutingEnvAsync:
         self.traffic_config: NamedDict = self.config.traffic
         self.traffic_model = TrafficRegionModel.from_config(self.traffic_config, PROJECT_ROOT)
         self.packet_rate_per_ms: float = self.traffic_config.get("packet_rate_per_ms", 1.0)
-        self.flowlet_interval_ms: float = self.traffic_config.get("flowlet_interval_ms", 10.0)
+        self.slot_ms: float = self.traffic_config.get("slot_ms", 5.0)
         self.mean_packets_per_flowlet: float = self.traffic_config.get("mean_packets_per_flowlet", 16.0)
+        self.eager_spf_region_threshold: int = self.traffic_config.get(
+            "eager_spf_region_threshold",
+            64,
+        )
         self.access_data_rate: float = self.traffic_config.get(
             "access_data_rate", self.network_config.gsl_data_rate
         )
@@ -56,17 +60,11 @@ class RoutingEnvAsync:
         self.small_packet_size = self.config.small_packet_size
 
         self.default_ttl: int = self.config.default_ttl
-        self.small_packet_delay_limit: float = self.config.small_packet_delay_limit
-        self.normal_packet_delay_limit: float = self.config.normal_packet_delay_limit
 
-        self.delay_norm = 100.0
-
-        # Initialize time and scheduler first since they're needed for dimension calculation
         self.start_time = 0.0  # the start timestamp of the simulation. randomize this to init the topology
         self.current_time = 0.0  #  # the current time offset, in milliseconds
         self.topology_update_steps = 0
         self.time_limit = float(self.config.time_limit_seconds * 1000.0)
-        self.scheduler = EventScheduler()
 
         self.action_dim = 4  # N, E, S, W - fixed for satellite routing
         self.obs_dim = 94
@@ -74,14 +72,26 @@ class RoutingEnvAsync:
         self.current_solver: Optional["BaseSolver"] = None
 
         self.verbose = self.config.verbose
-        self.train_interval_ms = self.config.train_interval_ms
         self.update_interval_ms = self.config.update_interval_ms
 
-        self.stats = Stats()
         self.next_packet_id = 0
-        self.generated_packets: list[DataBlock] = []
-        self.delivered_packets: list[DataBlock] = []
-        self.dropped_packets: list[DataBlock] = []
+        self._region_positions = np.array(
+            [region.position for region in self.traffic_model.regions],
+            dtype=np.float64,
+        )
+        self._region_distance_matrix = self._build_region_distance_matrix()
+        self._sat_ids = np.empty(0, dtype=np.int64)
+        self._sat_id_to_col_array = np.empty(0, dtype=np.int64)
+        self._region_sat_distance2 = np.empty((len(self.traffic_model.regions), 0))
+        self._region_sat_visible = np.zeros((len(self.traffic_model.regions), 0), dtype=bool)
+        self._nearest_region_sat_ids = np.full(len(self.traffic_model.regions), -1, dtype=np.int64)
+        self._nearest_region_sat_distances = np.full(len(self.traffic_model.regions), np.inf)
+        self._region_next_hop_table = np.empty((len(self.traffic_model.regions), 0), dtype=np.int64)
+        self._region_next_hop_ready = np.zeros(len(self.traffic_model.regions), dtype=bool)
+        self._region_next_hop_eager_ready = False
+        self._region_access_cache_time: float | None = None
+        self._array_metrics: Metrics | None = None
+        self._flowlet_arrays: dict[str, np.ndarray] = {}
 
     def _create_network(self):
         """Create the network based on the configuration."""
@@ -101,13 +111,30 @@ class RoutingEnvAsync:
             isl_data_rate=self.network_config.isl_data_rate,
         )
 
+    def _refresh_satellite_index_cache(self):
+        sat_ids = getattr(self.network, "_satellite_ids", None)
+        if sat_ids is None:
+            sat_ids = np.fromiter(self.network.satellites.keys(), dtype=np.int64)
+        self._sat_ids = np.asarray(sat_ids, dtype=np.int64)
+        max_node_id = max(self.network.nodes.keys(), default=-1)
+        self._sat_id_to_col_array = np.full(max_node_id + 1, -1, dtype=np.int64)
+        if len(self._sat_ids) > 0:
+            self._sat_id_to_col_array[self._sat_ids] = np.arange(len(self._sat_ids), dtype=np.int64)
+
     def _set_seed(self, seed):
         if seed is not None:
             self.np_random = np.random.default_rng(seed=seed)
-            self.py_random = random.Random(seed)
         else:
             self.np_random = np.random.default_rng()
-            self.py_random = random.Random()
+
+    def _build_region_distance_matrix(self) -> np.ndarray:
+        regions = self.traffic_model.regions
+        distances = np.zeros((len(regions), len(regions)), dtype=np.float64)
+        for i, source in enumerate(regions):
+            for j, target in enumerate(regions):
+                if i != j:
+                    distances[i, j] = source.distance_to(target)
+        return distances
 
     def reset(self, seed=None, start_time=None):
         """
@@ -123,13 +150,10 @@ class RoutingEnvAsync:
         self.ground_stations = list(self.network.ground_stations.values())
 
         self.topology_update_steps = 0
-        self.scheduler.reset()
 
         self.next_packet_id = 0
-        self.stats.reset()
-        self.generated_packets.clear()
-        self.delivered_packets.clear()
-        self.dropped_packets.clear()
+        self._array_metrics = None
+        self._flowlet_arrays = {}
 
         if start_time is None:
             self.start_time = 0
@@ -137,6 +161,8 @@ class RoutingEnvAsync:
             self.start_time = start_time
         self.current_time = self.start_time
         self.network.update_topology(self.start_time, None)
+        self._refresh_satellite_index_cache()
+        self._update_region_access_cache()
 
     def run(
         self,
@@ -144,608 +170,578 @@ class RoutingEnvAsync:
         debug_callback: Optional[Callable] = None,
         callback_interval_ms: int = 0,
     ):
-        """
-        Run the simulation until the termination condition is met.
+        return self._run_slot_array_kernel(solver, debug_callback, callback_interval_ms)
 
-        Event flow in the simulation:
-        1. DATA_GENERATED: A new DataBlock is generated at a source node.
-        2. TRANSMIT_END: A DataBlock has been fully serialized onto the link.
-        3. DATA_FORWARDED: A DataBlock arrived at the receiver.
-        4. TOPOLOGY_CHANGE: The network topology changes due to satellite movement.
-        5. TIME_LIMIT_REACHED: The simulation ends due to time limit.
-        6. TRAIN_EVENT: A training event is triggered.
+    def _run_slot_array_kernel(
+        self,
+        solver: "BaseSolver",
+        debug_callback: Optional[Callable] = None,
+        callback_interval_ms: int = 0,
+    ):
+        if solver.name != "SPF":
+            raise NotImplementedError(
+                "The slot array kernel currently supports SPF. "
+                "RL solvers need a batched transition API."
+            )
+        if self.network.ground_stations:
+            raise NotImplementedError("The slot array kernel expects region traffic without ground stations.")
+        if debug_callback is not None or callback_interval_ms:
+            raise NotImplementedError("Debug callbacks are not supported by the slot array kernel.")
 
-        Args:
-            solver: The solver to use for the making routing decisions
-
-        Returns:
-            Statistics from the simulation
-        """
         self.current_solver = solver
+        self._build_link_array_cache()
+        self._generate_flowlet_arrays()
 
-        self.scheduler.push_event(
-            event_type=EventType.TIME_LIMIT_REACHED,
-            time=self.start_time + self.time_limit,
-        )
-        self.scheduler.push_event(
-            event_type=EventType.TOPOLOGY_CHANGE,
-            time=self.current_time + self.update_interval_ms,
-        )
-        
-        # train event is only pushed if the solver is in training mode
-        if self.current_solver is not None and self.current_solver.is_train():
-            self.scheduler.push_event(
-                event_type=EventType.TRAIN_EVENT,
-                time=self.current_time + self.train_interval_ms,
-            )
-        else:
-            print("Env is in evaluation mode")
-        
-        if debug_callback is not None:
-            self.scheduler.push_event(
-                event_type=EventType.DEBUG_CALLBACK_EVENT,
-                time=self.current_time + callback_interval_ms,
-            )
-        self._schedule_region_flowlet_traffic(interval_ms=self.time_limit)
+        num_steps = int(np.ceil(self.time_limit / self.slot_ms))
+        next_topology_time = self.start_time + self.update_interval_ms
+        end_time = self.start_time + self.time_limit
 
-        event_count = 0
-        while not self.scheduler.is_empty():
-            event = self.scheduler.pop_event()
-            if event.is_cancelled:
-                continue
+        if self.verbose:
+            print("Env is in slot-array evaluation mode")
 
-            delta_time = event.time - self.current_time
-            self.current_time = event.time
-            self.stats.time.update(delta_time)
-
-            if event.event_type == EventType.TIME_LIMIT_REACHED:
+        for step in range(num_steps):
+            self.current_time = self.start_time + step * self.slot_ms
+            if self.current_time >= end_time:
                 break
-            elif event.event_type == EventType.TOPOLOGY_CHANGE:
-                self._handle_topology_change(event)
-            elif event.event_type == EventType.DATA_GENERATED:
-                self._handle_data_generated(event)
-            elif event.event_type == EventType.TRANSMIT_END:
-                self._handle_transmit_end(event)
-            elif event.event_type == EventType.DATA_FORWARDED:
-                self._handle_data_fowarded(event)
-            elif event.event_type == EventType.TRAIN_EVENT:
-                if self.current_solver is not None and self.current_solver.is_train():
-                    self.current_solver.on_train_signal()
-                    self.scheduler.push_event(
-                        event_type=EventType.TRAIN_EVENT,
-                        time=self.current_time + self.train_interval_ms,
-                    )
-            elif event.event_type == EventType.DEBUG_CALLBACK_EVENT:
-                if debug_callback is not None:
-                    debug_callback(self)
-                    self.scheduler.push_event(
-                        event_type=EventType.DEBUG_CALLBACK_EVENT,
-                        time=self.current_time + callback_interval_ms,
-                    )
-            event_count += 1
 
-        if self.verbose:
-            self._print_current_metrics()
-            print("")
+            if self.current_time >= next_topology_time:
+                while self.current_time >= next_topology_time:
+                    next_topology_time += self.update_interval_ms
+                self.network.update_topology(self.current_time, None)
+                self.topology_update_steps += 1
+                self._update_region_access_cache()
+                self._refresh_link_state_arrays()
+                self._drop_flowlets_on_disconnected_links()
 
-    def _handle_topology_change(self, event: "Event"):
-        """
-        Handle a topology change event.
-        """
-        self.network.update_topology(
-            timestamp=event.time, on_link_disconnected=self._on_link_disconnected
+            self._release_transmitted_flowlets()
+            arrived_ids = self._handle_flowlet_arrivals()
+            activated_ids = self._activate_flowlets_at_current_slot()
+            if len(arrived_ids) > 0 and len(activated_ids) > 0:
+                self._route_flowlets_at_nodes(np.sort(np.concatenate((arrived_ids, activated_ids))))
+            elif len(arrived_ids) > 0:
+                self._route_flowlets_at_nodes(arrived_ids)
+            elif len(activated_ids) > 0:
+                self._route_flowlets_at_nodes(activated_ids)
+
+        self.current_time = end_time
+        self._array_metrics = self._calc_array_metrics()
+
+    def _build_link_array_cache(self):
+        self._link_list = list(self.network.links.values())
+        self._num_links = len(self._link_list)
+        self._link_source_ids = np.array([link.source.id for link in self._link_list], dtype=np.int64)
+        self._link_sink_ids = np.array([link.sink.id for link in self._link_list], dtype=np.int64)
+        self._link_data_rate = np.array([link.data_rate for link in self._link_list], dtype=np.float64)
+        self._link_capacity = np.array([link.capacity for link in self._link_list], dtype=np.float64)
+        self._link_free_time = np.zeros(self._num_links, dtype=np.float64)
+        self._link_queue_load = np.zeros(self._num_links, dtype=np.float64)
+
+        num_nodes = max(self.network.nodes.keys()) + 1
+        self._link_id_by_pair = np.full((num_nodes, num_nodes), -1, dtype=np.int32)
+        for link_id, link in enumerate(self._link_list):
+            self._link_id_by_pair[link.source.id, link.sink.id] = link_id
+
+        self._refresh_link_state_arrays()
+
+    def _refresh_link_state_arrays(self):
+        connected = getattr(self.network, "_link_connected_array", None)
+        delay = getattr(self.network, "_link_delay_array", None)
+        if connected is not None and delay is not None and len(connected) == self._num_links:
+            self._link_connected = connected
+            self._link_delay = delay
+            return
+
+        self._link_connected = np.array([link.is_connected for link in self._link_list], dtype=bool)
+        self._link_delay = np.array([link.propagation_delay for link in self._link_list], dtype=np.float64)
+
+    def _generate_flowlet_arrays(self):
+        num_slots = int(np.ceil(self.time_limit / self.slot_ms))
+        expected_flowlets_per_slot = (
+            self.packet_rate_per_ms * self.slot_ms / max(self.mean_packets_per_flowlet, 1.0)
         )
+        slot_counts = self.np_random.poisson(lam=expected_flowlets_per_slot, size=num_slots)
+        num_flowlets = int(slot_counts.sum())
+        self._slot_flowlet_offsets = np.empty(num_slots + 1, dtype=np.int64)
+        self._slot_flowlet_offsets[0] = 0
+        np.cumsum(slot_counts, out=self._slot_flowlet_offsets[1:])
 
-        self.scheduler.push_event(
-            event_type=EventType.TOPOLOGY_CHANGE,
-            time=self.current_time + self.update_interval_ms,
-            data=event.data,
-        )
-        self.topology_update_steps += 1
+        self._flowlet_arrays = {}
+        self.next_packet_id = num_flowlets
 
-        if self.verbose:
-            self._print_current_metrics()
-
-    def _on_link_disconnected(self, link: "Link"):
-        """
-        Callback when a link is disconnected due to topology change.
-        """
-        for packet in link.drop_all():
-            self._drop_data_block(
-                packet, error=NetworkError.LINK_DISCONNECTED, current_node=link.source
-            )
-
-    def _handle_data_generated(self, event: "Event"):
-        """
-        Handle a DataBlock arrival event.
-
-        This occurs when a new DataBlock enters the network at its source node.
-        """
-        packet: DataBlock = event.data
-        packet.last_event = None
-
-        if packet.source_id is None:
-            if not self._attach_flowlet_to_access_satellite(packet):
-                self._drop_data_block(packet, NetworkError.NO_AVAIABLE_SAT, current_node=None)
-                return
-
-        receiver = self.network.nodes[packet.source_id]
-
-        packet.current_location = packet.source_id
-        packet.path.append(receiver.id)
-
-        success, reason_if_failed = receiver.receive(packet)
-        if not success:
-            self._drop_data_block(packet, reason_if_failed, current_node=receiver)
+        if num_flowlets == 0:
+            self._init_empty_flowlet_arrays()
             return
 
-        self._process_data_block(receiver, packet)
+        creation_slots = np.repeat(np.arange(num_slots, dtype=np.int64), slot_counts)
+        creation_times = self.start_time + creation_slots.astype(np.float64) * self.slot_ms
+        source_region_ids = self.traffic_model.sample_source_ids(self.np_random, num_flowlets).astype(np.int64)
+        target_region_ids = self.traffic_model.sample_target_ids(self.np_random, source_region_ids).astype(np.int64)
+        is_normal = self.np_random.uniform(size=num_flowlets) < self.prob_normal_packet
+        packet_size = np.where(is_normal, self.normal_packet_size, self.small_packet_size).astype(np.float64)
+        packet_count = np.maximum(
+            1,
+            self.np_random.poisson(lam=self.mean_packets_per_flowlet, size=num_flowlets),
+        ).astype(np.int64)
+        size = packet_size * packet_count
 
-    def _handle_transmit_end(self, event: "Event"):
-        """
-        Handle a DataBlock transmission end event.
-        """
-        packet, sender, next_hop, (wait_time, transmit_time) = event.data
-
-        # update packet metadata
-        packet.last_event = None
-        packet.e2e_delay += wait_time + transmit_time
-        packet.queue_delay += wait_time
-        packet.transmission_delay += transmit_time
-
-        # record the cost of load-imbalancing
-        if packet.last_action is not None:
-            if "queue_delay" not in packet.last_action:
-                packet.last_action.queue_delay = wait_time
-            else:
-                packet.last_action.queue_delay += wait_time
-
-        link_used = sender.outgoing_links[next_hop]
-        link_used.start_propagate(packet_id=packet.id)
-
-        propagation_delay = link_used.propagation_delay
-        packet.last_event = self.scheduler.push_event(
-            event_type=EventType.DATA_FORWARDED,
-            time=self.current_time + propagation_delay,
-            data=(packet, link_used, propagation_delay),
-        )
-
-    def _handle_data_fowarded(self, event: "Event"):
-        """
-        Handle a DataBlock reception event.
-
-        This event occurs when a DataBlock arrives at a node after being transmitted over a link.
-        """
-        packet, link_used, propagation_delay = event.data
-
-        # update packet metadata
-        packet.last_event = None
-        packet.hops += 1
-        packet.ttl -= 1
-        packet.e2e_delay += propagation_delay
-        packet.propagation_delay += propagation_delay
-        packet.current_location = link_used.sink.id
-        packet.path.append(link_used.sink.id)
-
-        link_used.finish_propagate(packet_id=packet.id)
-
-        receiver = link_used.sink
-        success, reason_if_failed = receiver.receive(packet)
-        if not success:
-            self._drop_data_block(packet, error=reason_if_failed, current_node=receiver)
-            return
-
-        if packet.ttl <= 0:
-            self._drop_data_block(
-                packet, error=NetworkError.TTL_EXPIRED, current_node=receiver
-            )
-            return
-
-        self._process_data_block(receiver, packet)
-
-    def _process_data_block(self, current_node: "Node", packet: "DataBlock"):
-        """
-        Process a DataBlock in a node's receive buffer using the agent's routing decisions.
-        """
-        assert not packet.dropped
-        if not packet.delivered:
-            assert packet.id in current_node.recv_buffer
-
-        assert packet.current_location == current_node.id
-
-        assert (
-            current_node.id in self.network.satellites
-        ), f"Node {current_node.id} is not a satellite"
-
-        current_obs = self._get_observation(current_node, packet)
-        action_mask = self._get_action_mask(current_node, packet)
-        target_region = self._target_region(packet)
-
-        if self._can_satellite_deliver_to_target_region(current_node.id, packet):
-            packet.final_gsl_delay = self._region_access_delay(
-                current_node, target_region, packet
-            )
-            self._finalize_action(
-                packet=packet,
-                done=True,
-                truncated=False,
-                next_obs=current_obs,
-                next_action_mask=action_mask,
-                reached_goal=1,
-            )
-            self._deliver_data_block(current_node, packet)
-            return
-
-        # Finalize the pending transition, if any
-        self._finalize_action(
-            packet=packet,
-            done=False,
-            truncated=False,
-            next_obs=current_obs,
-            next_action_mask=action_mask,
-            reached_goal=0,
-        )
-
-        # If no action is available, reroute the packet
-        if action_mask.sum() == 0:
-            self._drop_data_block(
-                packet,
-                error=NetworkError.FAILED_TO_FIND_NEXT_HOP,
-                current_node=current_node,
-            )
-            return
-
-        action_list = self._get_action_list(current_node)
-
-        info = {
-            "packet": packet,
-            "node": current_node,
-            "network": self.network,
-            "action_mask": action_mask,
-            "action_list": action_list,
-            "target_region": target_region,
+        self._flowlet_arrays = {
+            "status": np.full(num_flowlets, FLOWLET_NOT_STARTED, dtype=np.int8),
+            "creation_slot": creation_slots,
+            "creation_time": creation_times,
+            "source_region_id": source_region_ids,
+            "target_region_id": target_region_ids,
+            "source_id": np.full(num_flowlets, -1, dtype=np.int64),
+            "current_sat": np.full(num_flowlets, -1, dtype=np.int64),
+            "next_sat": np.full(num_flowlets, -1, dtype=np.int64),
+            "link_id": np.full(num_flowlets, -1, dtype=np.int32),
+            "packet_count": packet_count,
+            "packet_size": packet_size,
+            "is_normal": is_normal,
+            "size": size,
+            "ttl": np.full(num_flowlets, self.default_ttl, dtype=np.int16),
+            "hops": np.zeros(num_flowlets, dtype=np.int16),
+            "queue_delay": np.zeros(num_flowlets, dtype=np.float64),
+            "transmission_delay": np.zeros(num_flowlets, dtype=np.float64),
+            "propagation_delay": np.zeros(num_flowlets, dtype=np.float64),
+            "total_queue_cost": np.zeros(num_flowlets, dtype=np.float64),
+            "first_gsl_delay": np.zeros(num_flowlets, dtype=np.float64),
+            "final_gsl_delay": np.zeros(num_flowlets, dtype=np.float64),
+            "delivery_time": np.full(num_flowlets, np.nan, dtype=np.float64),
+            "drop_time": np.full(num_flowlets, np.nan, dtype=np.float64),
+            "drop_reason": np.full(num_flowlets, -1, dtype=np.int16),
+            "transmit_end_time": np.full(num_flowlets, np.inf, dtype=np.float64),
+            "arrival_time": np.full(num_flowlets, np.inf, dtype=np.float64),
+            "link_released": np.ones(num_flowlets, dtype=bool),
+            "scheduled_prop_delay": np.zeros(num_flowlets, dtype=np.float64),
+            "shortest_gcd": np.full(num_flowlets, np.inf, dtype=np.float64),
+            "initial_gcd": np.ones(num_flowlets, dtype=np.float64),
+            "last_node1": np.full(num_flowlets, -1, dtype=np.int64),
+            "last_node2": np.full(num_flowlets, -1, dtype=np.int64),
         }
 
-        # Forward to the next hop, determined by the solver
-        chosen_action, solver_data = self.current_solver.route(
-            obs=current_obs, info=info
-        )
+    def _init_empty_flowlet_arrays(self):
+        self._slot_flowlet_offsets = np.zeros(1, dtype=np.int64)
+        self._flowlet_arrays = {
+            "status": np.empty(0, dtype=np.int8),
+            "packet_count": np.empty(0, dtype=np.int64),
+            "is_normal": np.empty(0, dtype=bool),
+            "size": np.empty(0, dtype=np.float64),
+        }
 
-        if chosen_action is None:
-            self._drop_data_block(
-                packet,
-                error=NetworkError.FAILED_TO_FIND_NEXT_HOP,
-                current_node=current_node,
-            )
+    def _release_transmitted_flowlets(self):
+        status = self._flowlet_arrays["status"]
+        if len(status) == 0:
+            return
+        release_mask = (
+            (status == FLOWLET_ON_LINK)
+            & (~self._flowlet_arrays["link_released"])
+            & (self._flowlet_arrays["transmit_end_time"] <= self.current_time)
+        )
+        release_ids = np.flatnonzero(release_mask)
+        if len(release_ids) == 0:
+            return
+        np.add.at(
+            self._link_queue_load,
+            self._flowlet_arrays["link_id"][release_ids],
+            -self._flowlet_arrays["size"][release_ids],
+        )
+        self._flowlet_arrays["link_released"][release_ids] = True
+        np.maximum(self._link_queue_load, 0.0, out=self._link_queue_load)
+
+    def _handle_flowlet_arrivals(self) -> np.ndarray:
+        status = self._flowlet_arrays["status"]
+        if len(status) == 0:
+            return np.empty(0, dtype=np.int64)
+        arrival_mask = (status == FLOWLET_ON_LINK) & (
+            self._flowlet_arrays["arrival_time"] <= self.current_time
+        )
+        flowlet_ids = np.flatnonzero(arrival_mask)
+        if len(flowlet_ids) == 0:
+            return flowlet_ids
+
+        self._flowlet_arrays["current_sat"][flowlet_ids] = self._flowlet_arrays["next_sat"][flowlet_ids]
+        self._flowlet_arrays["hops"][flowlet_ids] += 1
+        self._flowlet_arrays["ttl"][flowlet_ids] -= 1
+        self._flowlet_arrays["propagation_delay"][flowlet_ids] += self._flowlet_arrays["scheduled_prop_delay"][flowlet_ids]
+        self._flowlet_arrays["queue_delay"][flowlet_ids] += (
+            self.current_time - self._flowlet_arrays["arrival_time"][flowlet_ids]
+        )
+        self._flowlet_arrays["status"][flowlet_ids] = FLOWLET_AT_NODE
+        self._flowlet_arrays["link_id"][flowlet_ids] = -1
+
+        expired_mask = self._flowlet_arrays["ttl"][flowlet_ids] <= 0
+        if expired_mask.any():
+            expired = flowlet_ids[expired_mask]
+            self._drop_flowlet_ids(expired, NetworkError.TTL_EXPIRED)
+            return flowlet_ids[~expired_mask]
+        return flowlet_ids
+
+    def _activate_flowlets_at_current_slot(self) -> np.ndarray:
+        if not hasattr(self, "_slot_flowlet_offsets"):
+            return np.empty(0, dtype=np.int64)
+
+        slot_idx = int(round((self.current_time - self.start_time) / self.slot_ms))
+        if slot_idx < 0 or slot_idx + 1 >= len(self._slot_flowlet_offsets):
+            return np.empty(0, dtype=np.int64)
+        start = int(self._slot_flowlet_offsets[slot_idx])
+        end = int(self._slot_flowlet_offsets[slot_idx + 1])
+        if end <= start:
+            return np.empty(0, dtype=np.int64)
+        flowlet_ids = np.arange(start, end, dtype=np.int64)
+
+        source_regions = self._flowlet_arrays["source_region_id"][flowlet_ids]
+        source_sat_ids = self._nearest_region_sat_ids[source_regions]
+        visible = source_sat_ids >= 0
+        if (~visible).any():
+            self._drop_flowlet_ids(flowlet_ids[~visible], NetworkError.NO_AVAIABLE_SAT)
+
+        active_ids = flowlet_ids[visible]
+        if len(active_ids) == 0:
+            return active_ids
+
+        source_sat_ids = source_sat_ids[visible]
+        source_distances = self._nearest_region_sat_distances[source_regions[visible]]
+        source_prop_delay = source_distances / LIGHT_SPEED_MS
+        source_tx_delay = self._flowlet_arrays["size"][active_ids] / self.access_data_rate
+
+        self._flowlet_arrays["source_id"][active_ids] = source_sat_ids
+        self._flowlet_arrays["current_sat"][active_ids] = source_sat_ids
+        self._flowlet_arrays["status"][active_ids] = FLOWLET_AT_NODE
+        self._flowlet_arrays["first_gsl_delay"][active_ids] = source_prop_delay + source_tx_delay
+        self._flowlet_arrays["propagation_delay"][active_ids] += source_prop_delay
+        self._flowlet_arrays["transmission_delay"][active_ids] += source_tx_delay
+
+        initial_gcd = self._region_distance_matrix[
+            self._flowlet_arrays["source_region_id"][active_ids],
+            self._flowlet_arrays["target_region_id"][active_ids],
+        ].copy()
+        initial_gcd[initial_gcd <= 0] = 1e-6
+        self._flowlet_arrays["initial_gcd"][active_ids] = initial_gcd
+        self._flowlet_arrays["shortest_gcd"][active_ids] = initial_gcd
+        return active_ids
+
+    def _route_flowlets_at_nodes(self, at_node_ids: np.ndarray):
+        if len(at_node_ids) == 0:
             return
 
-        assert packet.last_action is None
-
-        packet.last_action_time = self.current_time
-        packet.last_action = NamedDict(
-            {
-                "node_id": current_node.id,
-                "state": current_obs,
-                "action": chosen_action,
-                "action_mask": action_mask,
-                "congestion_cost": 0.0,
-                "queue_delay": 0.0,
-            }
-        )
-
-        if solver_data is not None:
-            packet.last_action.update(solver_data)
-
-        next_hop = action_list[chosen_action]
-        self._forward_data_block(current_node, packet, next_hop)
-
-    def _forward_data_block(
-        self,
-        sender: "Node",
-        packet: "DataBlock",
-        next_hop: int,
-        drop_on_failure: bool = True,
-    ):
-        """
-        Forward a DataBlock to the next hop.
-        """
-        success, time_info, reason_if_failed = sender.send(
-            packet, next_hop, self.current_time
-        )
-        if success:
-            wait_time, transmit_time = time_info
-            packet.last_event = self.scheduler.push_event(
-                event_type=EventType.TRANSMIT_END,
-                time=self.current_time + wait_time + transmit_time,
-                data=(packet, sender, next_hop, (wait_time, transmit_time)),
-            )
-            if packet.last_action is not None:
-                packet.last_action.queue_delay += wait_time
-                packet.total_queue_cost += wait_time
-        else:
-            if drop_on_failure:
-                self._drop_data_block(
-                    packet, error=reason_if_failed, current_node=sender
-                )
-
-        return success
-
-    def _drop_data_block(
-        self,
-        packet: "DataBlock",
-        error: Optional[NetworkError],
-        current_node: Optional["Node"] = None,
-        current_obs: Optional[np.ndarray] = None,
-    ):
-        """
-        Process pending actions for a dropped DataBlock.
-        Assigns penalties to agents that handled this DataBlock.
-
-        Args:
-            packet: DataBlock to drop.
-            error: Reason for dropping.
-        """
-        packet.cancel_event()
-        packet.dropped = True
-        packet.drop_time = self.current_time
-        packet.drop_reason = error
-
-        if current_node is not None and packet.id in current_node.recv_buffer:
-            current_node.recv_buffer.remove(packet.id)
-
-        self.dropped_packets.append(packet)
-        self.stats.on_packet_finished(packet)
-
-        if packet.last_action is not None:
-            if current_obs is None:
-                if current_node is None:
-                    if packet.current_location is None:
-                        return
-                    current_node = self.network.satellites[packet.current_location]
-                current_obs = self._get_observation(current_node, packet)
-
-            action_mask = self._get_action_mask(current_node, packet)
-            self._finalize_action(
-                packet=packet,
-                done=True,
-                truncated=False,
-                next_obs=current_obs,
-                next_action_mask=action_mask,
-                reached_goal=-1,
-            )
-
-    def _finalize_action(
-        self,
-        packet: "DataBlock",
-        done: bool,
-        truncated: bool,
-        next_obs: np.ndarray,
-        next_action_mask: np.ndarray,
-        reached_goal: float,
-    ):
-        """
-        Finalize the pending transition for a DataBlock.
-
-        Args:
-            packet: DataBlock to finalize the transition for.
-            done: Whether the transition is done.
-            truncated: Whether the transition is truncated.
-            next_obs: The next observation after the transition.
-            next_action_mask: The next action mask after the transition.
-            reached_goal: Whether the target satelite is reached or not.
-        """
-        if packet.last_action is None:
+        delivered_ids, route_ids = self._partition_deliverable_flowlets(at_node_ids)
+        if len(delivered_ids) > 0:
+            self._deliver_flowlet_ids(delivered_ids)
+        if len(route_ids) == 0:
             return
 
-        current_node = self.network.nodes[packet.current_location]
-        target_region = self._target_region(packet)
+        self._route_flowlets_batch(route_ids)
 
-        current_gcd = self._great_circle_distance_to_region(current_node, target_region)
-        current_progress = current_gcd / packet.initial_gcd
-        progress_gain = max(0, packet.shortest_gcd - current_gcd)
-        # 0=no (normalized) progress gain, (0,1]=progress gain achieved by approaching the goal
-        progress_gain = progress_gain / packet.initial_gcd
-        if current_gcd < packet.shortest_gcd:
-            packet.shortest_gcd = current_gcd
+    def _partition_deliverable_flowlets(self, flowlet_ids: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        current_sats = self._flowlet_arrays["current_sat"][flowlet_ids]
+        target_regions = self._flowlet_arrays["target_region_id"][flowlet_ids]
+        sat_cols = self._sat_id_to_col_array[current_sats]
+        valid = sat_cols >= 0
+        deliverable = np.zeros(len(flowlet_ids), dtype=bool)
+        deliverable[valid] = self._region_sat_visible[target_regions[valid], sat_cols[valid]]
+        return flowlet_ids[deliverable], flowlet_ids[~deliverable]
 
-        # basic timing penalty
-        action_delay = (
-            self.current_time - packet.last_action_time + packet.final_gsl_delay
+    def _deliver_flowlet_ids(self, flowlet_ids: np.ndarray):
+        current_sats = self._flowlet_arrays["current_sat"][flowlet_ids]
+        target_regions = self._flowlet_arrays["target_region_id"][flowlet_ids]
+        sat_cols = self._sat_id_to_col_array[current_sats]
+        distance2 = self._region_sat_distance2[target_regions, sat_cols]
+        final_prop_delay = np.sqrt(distance2) / LIGHT_SPEED_MS
+        final_tx_delay = self._flowlet_arrays["size"][flowlet_ids] / self.access_data_rate
+        final_delay = final_prop_delay + final_tx_delay
+
+        self._flowlet_arrays["final_gsl_delay"][flowlet_ids] = final_delay
+        self._flowlet_arrays["propagation_delay"][flowlet_ids] += final_prop_delay
+        self._flowlet_arrays["transmission_delay"][flowlet_ids] += final_tx_delay
+        self._flowlet_arrays["delivery_time"][flowlet_ids] = self.current_time + final_delay
+        self._flowlet_arrays["status"][flowlet_ids] = FLOWLET_DELIVERED
+
+    def _route_flowlets_batch(self, flowlet_ids: np.ndarray):
+        current_sats = self._flowlet_arrays["current_sat"][flowlet_ids]
+        target_regions = self._flowlet_arrays["target_region_id"][flowlet_ids]
+        target_access_sats = self._nearest_region_sat_ids[target_regions]
+
+        no_access = target_access_sats < 0
+        if no_access.any():
+            self._drop_flowlet_ids(flowlet_ids[no_access], NetworkError.NO_AVAIABLE_SAT)
+
+        candidate_ids = flowlet_ids[~no_access]
+        if len(candidate_ids) == 0:
+            return
+
+        current_sats = current_sats[~no_access]
+        target_regions = target_regions[~no_access]
+        if not self._region_next_hop_eager_ready:
+            self._ensure_region_next_hops(target_regions)
+        next_hops = self._region_next_hop_table[target_regions, current_sats]
+
+        no_route = next_hops < 0
+        if no_route.any():
+            self._drop_flowlet_ids(candidate_ids[no_route], NetworkError.FAILED_TO_FIND_NEXT_HOP)
+
+        routable_ids = candidate_ids[~no_route]
+        if len(routable_ids) == 0:
+            return
+
+        current_sats = current_sats[~no_route]
+        next_hops = next_hops[~no_route]
+        link_ids = self._link_id_by_pair[current_sats, next_hops]
+
+        valid_link = link_ids >= 0
+        connected = np.zeros(len(link_ids), dtype=bool)
+        connected[valid_link] = self._link_connected[link_ids[valid_link]]
+        invalid = (~valid_link) | (~connected)
+        if invalid.any():
+            self._drop_flowlet_ids(routable_ids[invalid], NetworkError.INVALID_NEXT_HOP)
+
+        scheduled_ids = routable_ids[~invalid]
+        if len(scheduled_ids) == 0:
+            return
+
+        current_sats = current_sats[~invalid]
+        next_hops = next_hops[~invalid]
+        link_ids = link_ids[~invalid]
+
+        rejected_ids = self._schedule_flowlets_by_link(
+            flowlet_ids=scheduled_ids,
+            link_ids=link_ids,
+            next_hops=next_hops,
+        )
+        if len(rejected_ids) > 0:
+            self._drop_flowlet_ids(rejected_ids, NetworkError.LINK_FULL)
+
+    def _schedule_flowlets_by_link(
+        self,
+        flowlet_ids: np.ndarray,
+        link_ids: np.ndarray,
+        next_hops: np.ndarray,
+    ) -> np.ndarray:
+        if len(flowlet_ids) == 0:
+            return np.empty(0, dtype=np.int64)
+
+        order = np.argsort(link_ids, kind="stable")
+        sorted_link_ids = link_ids[order]
+        sorted_ids = flowlet_ids[order]
+        sorted_next_hops = next_hops[order]
+        split_points = np.flatnonzero(np.diff(sorted_link_ids)) + 1
+        starts = np.r_[0, split_points]
+        ends = np.r_[split_points, len(sorted_link_ids)]
+        group_link_ids = sorted_link_ids[starts]
+        group_lengths = ends - starts
+        group_ids = np.repeat(np.arange(len(starts)), group_lengths)
+
+        sizes = self._flowlet_arrays["size"][sorted_ids]
+        cumulative_size = np.cumsum(sizes)
+        size_offsets = np.zeros(len(starts), dtype=np.float64)
+        if len(starts) > 1:
+            size_offsets[1:] = cumulative_size[starts[1:] - 1]
+        group_cumulative_size = cumulative_size - size_offsets[group_ids]
+        remaining_capacity = self._link_capacity[group_link_ids] - self._link_queue_load[group_link_ids]
+        accepted = group_cumulative_size <= remaining_capacity[group_ids]
+
+        rejected_ids = sorted_ids[~accepted]
+        if not accepted.any():
+            return rejected_ids
+
+        accepted_ids = sorted_ids[accepted]
+        accepted_link_ids = sorted_link_ids[accepted]
+        accepted_next_hops = sorted_next_hops[accepted]
+        accepted_sizes = sizes[accepted]
+        accepted_group_ids = group_ids[accepted]
+
+        accepted_split_points = np.flatnonzero(np.diff(accepted_group_ids)) + 1
+        accepted_starts = np.r_[0, accepted_split_points]
+        accepted_ends = np.r_[accepted_split_points, len(accepted_ids)]
+        accepted_group_numbers = np.repeat(
+            np.arange(len(accepted_starts)),
+            accepted_ends - accepted_starts,
+        )
+        accepted_original_group_ids = accepted_group_ids[accepted_starts]
+
+        transmit_times = accepted_sizes / self._link_data_rate[accepted_link_ids]
+        cumulative_tx = np.cumsum(transmit_times)
+        tx_offsets = np.zeros(len(accepted_starts), dtype=np.float64)
+        if len(accepted_starts) > 1:
+            tx_offsets[1:] = cumulative_tx[accepted_starts[1:] - 1]
+        group_cumulative_tx = cumulative_tx - tx_offsets[accepted_group_numbers]
+
+        accepted_group_link_ids = group_link_ids[accepted_original_group_ids]
+        start_base_by_group = np.maximum(
+            self.current_time,
+            self._link_free_time[accepted_group_link_ids],
+        )
+        start_base = start_base_by_group[accepted_group_numbers]
+        transmit_end_times = start_base + group_cumulative_tx
+        wait_times = transmit_end_times - transmit_times - self.current_time
+        propagation_delays = self._link_delay[accepted_link_ids]
+
+        self._link_free_time[accepted_group_link_ids] = transmit_end_times[accepted_ends - 1]
+        self._link_queue_load[accepted_group_link_ids] += np.add.reduceat(
+            accepted_sizes,
+            accepted_starts,
         )
 
-        # consider adding a terminal bonus/penalty, depending on the event type
-        baseline_reward = progress_gain + reached_goal * (1 + packet.size)
-        baseline_reward -= action_delay / self.delay_norm
-        if reached_goal == -1:  # dropped penalties
-            baseline_reward = (
-                -current_progress
-            )  # all previous efforts made on approaching the target are lost
-            baseline_reward -= packet.ttl * 5 / self.delay_norm
+        self._flowlet_arrays["queue_delay"][accepted_ids] += wait_times
+        self._flowlet_arrays["transmission_delay"][accepted_ids] += transmit_times
+        self._flowlet_arrays["total_queue_cost"][accepted_ids] += wait_times
+        self._flowlet_arrays["link_id"][accepted_ids] = accepted_link_ids
+        self._flowlet_arrays["next_sat"][accepted_ids] = accepted_next_hops
+        self._flowlet_arrays["transmit_end_time"][accepted_ids] = transmit_end_times
+        self._flowlet_arrays["arrival_time"][accepted_ids] = transmit_end_times + propagation_delays
+        self._flowlet_arrays["scheduled_prop_delay"][accepted_ids] = propagation_delays
+        self._flowlet_arrays["link_released"][accepted_ids] = False
+        self._flowlet_arrays["status"][accepted_ids] = FLOWLET_ON_LINK
 
-        # hand-crafted reward baseline, which also minimizes the delay of all packets
-        packet.last_action.baseline_reward = baseline_reward
+        self._flowlet_arrays["last_node2"][accepted_ids] = self._flowlet_arrays["last_node1"][accepted_ids]
+        self._flowlet_arrays["last_node1"][accepted_ids] = self._flowlet_arrays["current_sat"][accepted_ids]
+        return rejected_ids
 
-        # basic transition information
-        packet.last_action.next_state = next_obs
-        packet.last_action.next_action_mask = next_action_mask
-        packet.last_action.done = done
-        packet.last_action.truncated = truncated
+    def _ensure_region_next_hops(self, target_regions: np.ndarray):
+        missing_mask = ~self._region_next_hop_ready[target_regions]
+        if not missing_mask.any():
+            return
 
-        # metadata for reward shaping
-        packet.last_action.current_progress = current_progress  # [0, 1]
-        packet.last_action.reached_goal = (
-            reached_goal  # 1=reached goal, 0=pending, -1=dropped
-        )
-        packet.last_action.progress_gain = progress_gain  # [0, 1]
-        packet.last_action.action_delay = action_delay  # in ms
-        packet.last_action.delay_norm = self.delay_norm  # in ms
+        missing_regions = np.unique(target_regions[missing_mask])
+        if len(missing_regions) == 0:
+            return
 
-        packet.trajectory.append(packet.last_action)
+        access_sat_ids = self._nearest_region_sat_ids[missing_regions]
+        valid = access_sat_ids >= 0
+        if not valid.any():
+            return
 
-        self.current_solver.on_action_over(packet)
-        if done or truncated:
-            self.current_solver.on_episode_over(packet)
+        missing_regions = missing_regions[valid]
+        access_sat_ids = access_sat_ids[valid]
+        self.network.precompute_shortest_next_hops(access_sat_ids)
+        for region_id, access_sat_id in zip(missing_regions, access_sat_ids):
+            self._region_next_hop_table[region_id] = self.network._shortest_next_hop_cache[int(access_sat_id)]
+        self._region_next_hop_ready[missing_regions] = True
 
-        packet.last_action = None
-        packet.last_action_time = None
+    def _drop_flowlets_on_disconnected_links(self):
+        status = self._flowlet_arrays["status"]
+        if len(status) == 0:
+            return
+        on_link = np.flatnonzero(status == FLOWLET_ON_LINK)
+        if len(on_link) == 0:
+            return
+        link_ids = self._flowlet_arrays["link_id"][on_link]
+        dropped = on_link[~self._link_connected[link_ids]]
+        if len(dropped) == 0:
+            return
+        unreleased = dropped[~self._flowlet_arrays["link_released"][dropped]]
+        if len(unreleased) > 0:
+            np.add.at(
+                self._link_queue_load,
+                self._flowlet_arrays["link_id"][unreleased],
+                -self._flowlet_arrays["size"][unreleased],
+            )
+            self._flowlet_arrays["link_released"][unreleased] = True
+        self._link_queue_load[~self._link_connected] = 0.0
+        self._link_free_time[~self._link_connected] = self.current_time
+        self._drop_flowlet_ids(dropped, NetworkError.LINK_DISCONNECTED)
 
-    def _get_action_mask(self, node: "Node", packet: "DataBlock"):
-        action_map = self._get_action_list(node)
+    def _drop_flowlet_ids(self, flowlet_ids: np.ndarray, reason: NetworkError):
+        if len(flowlet_ids) == 0:
+            return
+        self._flowlet_arrays["status"][flowlet_ids] = FLOWLET_DROPPED
+        self._flowlet_arrays["drop_time"][flowlet_ids] = self.current_time
+        self._flowlet_arrays["drop_reason"][flowlet_ids] = int(reason)
 
-        # action_mask is a list of 0s and 1s, 1s mean the action is enabled
-        action_mask = np.zeros(len(action_map), dtype=np.int8)
-        for idx in range(4):
-            sink_id = action_map[idx]
-            link = self.network.get_link(node.id, sink_id)
-            if link is None or not link.is_connected:
-                continue
+    def _calc_array_metrics(self) -> Metrics:
+        arrays = self._flowlet_arrays
+        if len(arrays["status"]) == 0:
+            return Metrics()
 
-            if not self._can_satellite_deliver_to_target_region(sink_id, packet):
-                if len(packet.path) >= 2 and packet.path[-2] == sink_id:
-                    continue  # avoid direct loop back unless it is the target
+        generated_mask = arrays["status"] != FLOWLET_NOT_STARTED
+        delivered_mask = arrays["status"] == FLOWLET_DELIVERED
+        dropped_mask = arrays["status"] == FLOWLET_DROPPED
+        normal_mask = arrays["is_normal"]
+        small_mask = ~normal_mask
+        weights = arrays["packet_count"]
 
-            action_mask[idx] = 1  # enable the action
-
-        return action_mask
-
-    def _get_action_list(self, node: "Node"):
-        assert node.id in self.network.satellites, f"Node {node.id} is not a satellite"
-        return [
-            self.network.ISL_N[node.id],
-            self.network.ISL_E[node.id],
-            self.network.ISL_S[node.id],
-            self.network.ISL_W[node.id],
-        ]
-
-    def _get_observation(self, current_node: "Node", packet: "DataBlock") -> np.ndarray:
-        assert current_node.id in self.network.satellites
-
-        target_region = self._target_region(packet)
-
-        current_pos = current_node.position / self.network.orbit_radius
-        target_pos = target_region.position / self.network.orbit_radius
-
-        relative_pos = current_pos - target_pos
-        relative_distance = float(np.linalg.norm(relative_pos))
-        current_delay = float(self.current_time - packet.creation_time)
-
-        orbit_cycle = int(self.network.orbit_cycle * 1000)
-        time_prog = (self.current_time % orbit_cycle) / orbit_cycle
-
-        current_gcd = self._great_circle_distance_to_region(current_node, target_region)
-        current_progress = current_gcd / packet.initial_gcd
-
-        # knowledge on the action history
-        last_action1 = -1
-        last_node1 = -1
-        last_action2 = -1
-        last_node2 = -1
-        if len(packet.trajectory) >= 1:
-            trans = packet.trajectory[-1]
-            last_action1 = trans.action
-            last_node1 = trans.node_id
-        if len(packet.trajectory) >= 2:
-            trans = packet.trajectory[-2]
-            last_action2 = trans.action
-            last_node2 = trans.node_id
-
-        obs = (
-            time_prog,
-            float(current_pos[0]),
-            float(current_pos[1]),
-            float(current_pos[2]),
-            float(target_pos[0]),
-            float(target_pos[1]),
-            float(target_pos[2]),
-            float(relative_pos[0]),
-            float(relative_pos[1]),
-            float(relative_pos[2]),
-            # 10
-            relative_distance,
-            current_progress,
-            current_node.get_load_factor(),
-            current_node.recv_buffer.get_remaining_capacity(),
-            current_delay / self.delay_norm,
-            float(packet.is_normal_packet),
-            packet.size,
-            packet.ttl,
-            self.default_ttl - packet.ttl,
-            packet.ttl / self.default_ttl,
-            # 20
-            packet.e2e_delay / self.delay_norm,
-            packet.queue_delay / self.delay_norm,
-            last_action1,
-            last_node1,
-            last_action2,
-            last_node2,
-            # 26
+        delivered_delay = (
+            arrays["queue_delay"] + arrays["transmission_delay"] + arrays["propagation_delay"]
         )
 
-        neighbors = [
-            self.network.ISL_N[current_node.id],
-            self.network.ISL_E[current_node.id],
-            self.network.ISL_S[current_node.id],
-            self.network.ISL_W[current_node.id],
-        ]
+        def weighted_sum(mask, values=None):
+            if values is None:
+                return int(weights[mask].sum())
+            return float((values[mask] * weights[mask]).sum())
 
-        for next_hop in neighbors:
-            link = current_node.outgoing_links[next_hop]
-            normalized_propagation_delay = link.propagation_delay / self.delay_norm
-            normalized_transmit_time = (packet.size / link.data_rate) / self.delay_norm
-            normalized_queue_delay = (
-                link.get_busy_time_remaining(self.current_time) / self.delay_norm
-            )
-            link_remaining_capacity = link.get_remaining_capacity()
-            sink_load_factor = link.sink.get_load_factor()
-            sink_remaining_capacity = link.sink.recv_buffer.get_remaining_capacity()
-            sink_pos = link.sink.position / self.network.orbit_radius
-            sink_relative_pos = sink_pos - target_pos
-            sink_relative_distance = float(np.linalg.norm(sink_relative_pos))
+        generated = weighted_sum(generated_mask)
+        delivered = weighted_sum(delivered_mask)
+        dropped = weighted_sum(dropped_mask)
+        delivered_normal = weighted_sum(delivered_mask & normal_mask)
+        delivered_small = weighted_sum(delivered_mask & small_mask)
+        generated_normal = weighted_sum(generated_mask & normal_mask)
+        generated_small = weighted_sum(generated_mask & small_mask)
+        dropped_normal = weighted_sum(dropped_mask & normal_mask)
+        dropped_small = weighted_sum(dropped_mask & small_mask)
+        ttl_dropped = weighted_sum(dropped_mask & (arrays["drop_reason"] == int(NetworkError.TTL_EXPIRED)))
 
-            sink_gcd = self._great_circle_distance_to_region(link.sink, target_region)
-            progress_sink = sink_gcd / packet.initial_gcd
+        total_delay = weighted_sum(delivered_mask, delivered_delay)
+        queue_delay = weighted_sum(delivered_mask, arrays["queue_delay"])
+        transmission_delay = weighted_sum(delivered_mask, arrays["transmission_delay"])
+        propagation_delay = weighted_sum(delivered_mask, arrays["propagation_delay"])
+        normal_delay = weighted_sum(delivered_mask & normal_mask, delivered_delay)
+        normal_queue = weighted_sum(delivered_mask & normal_mask, arrays["queue_delay"])
+        normal_tx = weighted_sum(delivered_mask & normal_mask, arrays["transmission_delay"])
+        normal_prop = weighted_sum(delivered_mask & normal_mask, arrays["propagation_delay"])
+        small_delay = weighted_sum(delivered_mask & small_mask, delivered_delay)
+        small_queue = weighted_sum(delivered_mask & small_mask, arrays["queue_delay"])
+        small_tx = weighted_sum(delivered_mask & small_mask, arrays["transmission_delay"])
+        small_prop = weighted_sum(delivered_mask & small_mask, arrays["propagation_delay"])
+        cost = weighted_sum(delivered_mask, arrays["total_queue_cost"])
+        normal_cost = weighted_sum(delivered_mask & normal_mask, arrays["total_queue_cost"])
+        small_cost = weighted_sum(delivered_mask & small_mask, arrays["total_queue_cost"])
 
-            has_enough_capacity = 0 if link_remaining_capacity < packet.size else 1
-            is_target_access_sat = (
-                1
-                if self._can_satellite_deliver_to_target_region(link.sink.id, packet)
-                else 0
-            )
-            possibly_looped = (
-                1 if next_hop == last_node1 or next_hop == last_node2 else 0
-            )
+        throughput = float(arrays["size"][delivered_mask].sum()) / max(self.time_limit / 1000.0, 1e-12)
 
-            obs += (
-                float(sink_pos[0]),
-                float(sink_pos[1]),
-                float(sink_pos[2]),
-                float(sink_relative_pos[0]),
-                float(sink_relative_pos[1]),
-                float(sink_relative_pos[2]),
-                sink_relative_distance,
-                progress_sink,
-                normalized_queue_delay,
-                normalized_transmit_time,
-                # 10
-                normalized_propagation_delay,
-                sink_load_factor,
-                sink_remaining_capacity,
-                link_remaining_capacity,
-                has_enough_capacity,
-                possibly_looped,
-                is_target_access_sat,
-                # 17
-            )  # 17*4=68
-
-        assert len(obs) == self.obs_dim
-
-        return np.array(obs)
+        return Metrics(
+            generated=generated,
+            generated_normal_packet=generated_normal,
+            generated_small_packet=generated_small,
+            delivered=delivered,
+            delivered_normal_packet=delivered_normal,
+            delivered_small_packet=delivered_small,
+            dropped=dropped,
+            dropped_by_ttl=ttl_dropped,
+            dropped_normal_packet=dropped_normal,
+            dropped_small_packet=dropped_small,
+            throughput=throughput,
+            service_rate=delivered / max(self.time_limit / 1000.0, 1e-12),
+            delivery_rate=delivered / generated if generated else 0.0,
+            drop_rate=dropped / generated if generated else 0.0,
+            normal_packet_delivery_rate=delivered_normal / generated_normal if generated_normal else 0.0,
+            normal_packet_drop_rate=dropped_normal / generated_normal if generated_normal else 0.0,
+            small_packet_delivery_rate=delivered_small / generated_small if generated_small else 0.0,
+            small_packet_drop_rate=dropped_small / generated_small if generated_small else 0.0,
+            e2e_delay_mean=total_delay / delivered if delivered else 0.0,
+            queue_delay_mean=queue_delay / delivered if delivered else 0.0,
+            transmission_delay_mean=transmission_delay / delivered if delivered else 0.0,
+            propagation_delay_mean=propagation_delay / delivered if delivered else 0.0,
+            normal_packet_e2e_delay_mean=normal_delay / delivered_normal if delivered_normal else 0.0,
+            normal_packet_queue_delay_mean=normal_queue / delivered_normal if delivered_normal else 0.0,
+            normal_packet_transmission_delay_mean=normal_tx / delivered_normal if delivered_normal else 0.0,
+            normal_packet_propagation_delay_mean=normal_prop / delivered_normal if delivered_normal else 0.0,
+            small_packet_e2e_delay_mean=small_delay / delivered_small if delivered_small else 0.0,
+            small_packet_queue_delay_mean=small_queue / delivered_small if delivered_small else 0.0,
+            small_packet_transmission_delay_mean=small_tx / delivered_small if delivered_small else 0.0,
+            small_packet_propagation_delay_mean=small_prop / delivered_small if delivered_small else 0.0,
+            cost_mean=cost / delivered if delivered else 0.0,
+            cost_small_packet_mean=small_cost / delivered_small if delivered_small else 0.0,
+            cost_normal_packet_mean=normal_cost / delivered_normal if delivered_normal else 0.0,
+        )
 
     def calc_metrics(self) -> Metrics:
-        return self.stats.calc_metrics()
+        if self._array_metrics is not None:
+            return self._array_metrics
+        if self._flowlet_arrays:
+            return self._calc_array_metrics()
+        return Metrics()
 
     def _print_current_metrics(self):
-        metrics = self.stats.calc_metrics()
+        metrics = self.calc_metrics()
         self._print(metrics.get_summary() + " " * 4, end="\r")
 
     def _print(self, line: str, end=None):
@@ -754,142 +750,96 @@ class RoutingEnvAsync:
             end=end,
         )
 
-    def _target_region(self, packet: "DataBlock") -> TrafficRegion:
-        return self.traffic_model.get(packet.target_region_id)
+    def _update_region_access_cache(self):
+        if len(self._sat_ids) == 0:
+            num_regions = len(self.traffic_model.regions)
+            self._region_sat_distance2 = np.empty((num_regions, 0))
+            self._region_sat_visible = np.zeros((num_regions, 0), dtype=bool)
+            self._nearest_region_sat_ids = np.full(num_regions, -1, dtype=np.int64)
+            self._nearest_region_sat_distances = np.full(num_regions, np.inf)
+            self._region_next_hop_table = np.empty((num_regions, 0), dtype=np.int64)
+            self._region_next_hop_ready = np.zeros(num_regions, dtype=bool)
+            self._region_next_hop_eager_ready = False
+            self._region_access_cache_time = self.current_time
+            return
 
-    def _source_region(self, packet: "DataBlock") -> TrafficRegion:
-        return self.traffic_model.get(packet.source_region_id)
-
-    def _great_circle_distance_to_region(self, node: "Node", region: TrafficRegion) -> float:
-        lon1, lat1 = node.get_projected_position()
-        return great_circle_distance(lon1, lat1, region.longitude, region.latitude)
-
-    def _region_to_region_distance(self, source: TrafficRegion, target: TrafficRegion) -> float:
-        return great_circle_distance(source.longitude, source.latitude, target.longitude, target.latitude)
-
-    def _can_satellite_deliver_to_target_region(self, sat_id: int, packet: "DataBlock") -> bool:
-        return self.network.can_satellite_serve_position(sat_id, self._target_region(packet).position)
-
-    def _region_access_delay(self, sat: "Node", region: TrafficRegion, packet: "DataBlock") -> float:
-        propagation_delay, transmit_delay = self._region_access_delay_components(sat, region, packet)
-        return propagation_delay + transmit_delay
-
-    def _region_access_delay_components(
-        self, sat: "Node", region: TrafficRegion, packet: "DataBlock"
-    ) -> tuple[float, float]:
-        distance = float(np.linalg.norm(sat.position - region.position))
-        propagation_delay = distance / LIGHT_SPEED_MS
-        transmit_delay = packet.size / self.access_data_rate if self.access_data_rate > 0 else 0.0
-        return propagation_delay, transmit_delay
-
-    def _attach_flowlet_to_access_satellite(self, packet: "DataBlock") -> bool:
-        source_region = self._source_region(packet)
-        source_sat, _source_distance = self.network.get_nearest_satellite_for_position(source_region.position)
-        if source_sat is None:
-            return False
-
-        target_region = self._target_region(packet)
-
-        packet.source_id = source_sat.id
-        source_prop_delay = (_source_distance / LIGHT_SPEED_MS) if _source_distance else 0.0
-        source_tx_delay = packet.size / self.access_data_rate if self.access_data_rate > 0 else 0.0
-        packet.first_gsl_delay = source_prop_delay + source_tx_delay
-        packet.e2e_delay += packet.first_gsl_delay
-        packet.propagation_delay += source_prop_delay
-        packet.transmission_delay += source_tx_delay
-        packet.initial_gcd = self._region_to_region_distance(source_region, target_region)
-        if packet.initial_gcd <= 0:
-            packet.initial_gcd = 1e-6
-        packet.shortest_gcd = packet.initial_gcd
-        return True
-
-    def _deliver_data_block(self, receiver: "Node", packet: "DataBlock"):
-        assert receiver.recv_buffer.remove(packet.id)
-        final_prop_delay, final_tx_delay = self._region_access_delay_components(
-            receiver, self._target_region(packet), packet
-        )
-        packet.final_gsl_delay = final_prop_delay + final_tx_delay
-        packet.delivered = True
-        packet.delivery_time = self.current_time + packet.final_gsl_delay
-        packet.e2e_delay += packet.final_gsl_delay
-        packet.propagation_delay += final_prop_delay
-        packet.transmission_delay += final_tx_delay
-
-        self.delivered_packets.append(packet)
-        self.stats.on_packet_finished(packet)
-
-    def _schedule_region_flowlet_traffic(self, interval_ms: float):
-        """
-        Schedule population-driven flowlets over the full simulation window.
-
-        Each DataBlock represents a batch of packets with the same source region,
-        destination region, traffic class, and generation time bin.
-        """
-        num_flowlets_generated = 0
-        num_bins = int(np.ceil(interval_ms / self.flowlet_interval_ms))
-        expected_flowlets_per_bin = (
-            self.packet_rate_per_ms
-            * self.flowlet_interval_ms
-            / max(self.mean_packets_per_flowlet, 1.0)
-        )
-
-        for bin_idx in range(num_bins):
-            bin_start = self.current_time + bin_idx * self.flowlet_interval_ms
-            bin_end = min(
-                self.current_time + interval_ms,
-                bin_start + self.flowlet_interval_ms,
+        positions_by_id = getattr(self.network, "_satellite_positions_by_id", None)
+        if positions_by_id is not None:
+            sat_positions = positions_by_id[self._sat_ids]
+        else:
+            sat_positions = np.array(
+                [self.network.satellites[int(sat_id)].position for sat_id in self._sat_ids],
+                dtype=np.float64,
             )
-            if bin_end <= bin_start:
-                continue
+        delta = self._region_positions[:, None, :] - sat_positions[None, :, :]
+        distance2 = np.einsum("ijk,ijk->ij", delta, delta)
+        visible = distance2 <= self.network.max_gsl_range * self.network.max_gsl_range
+        masked_distance2 = np.where(visible, distance2, np.inf)
+        nearest_cols = np.argmin(masked_distance2, axis=1)
+        nearest_distance2 = masked_distance2[np.arange(masked_distance2.shape[0]), nearest_cols]
+        nearest_distances = np.sqrt(nearest_distance2)
+        nearest_sat_ids = self._sat_ids[nearest_cols].copy()
+        nearest_sat_ids[~np.isfinite(nearest_distances)] = -1
 
-            num_flowlets = int(self.np_random.poisson(lam=expected_flowlets_per_bin))
-            if num_flowlets <= 0:
-                continue
+        self._region_sat_distance2 = distance2
+        self._region_sat_visible = visible
+        self._nearest_region_sat_ids = nearest_sat_ids
+        self._nearest_region_sat_distances = nearest_distances
+        self._region_access_cache_time = self.current_time
 
-            source_region_ids = self.traffic_model.sample_source_ids(self.np_random, num_flowlets)
-            target_region_ids = self.traffic_model.sample_target_ids(self.np_random, source_region_ids)
-            is_normal_array = self.np_random.uniform(size=num_flowlets) < self.prob_normal_packet
-            creation_times = self.np_random.uniform(low=bin_start, high=bin_end, size=num_flowlets)
-            packet_counts = np.maximum(
-                1,
-                self.np_random.poisson(lam=self.mean_packets_per_flowlet, size=num_flowlets),
-            )
+        table_shape = (len(self.traffic_model.regions), len(self._sat_id_to_col_array))
+        if self._region_next_hop_table.shape != table_shape:
+            self._region_next_hop_table = np.empty(table_shape, dtype=np.int64)
+        self._region_next_hop_table.fill(-1)
+        if len(self._region_next_hop_ready) != len(self.traffic_model.regions):
+            self._region_next_hop_ready = np.zeros(len(self.traffic_model.regions), dtype=bool)
+        else:
+            self._region_next_hop_ready.fill(False)
+        self._region_next_hop_eager_ready = False
+        if len(self.traffic_model.regions) <= self.eager_spf_region_threshold:
+            valid_region_ids = np.flatnonzero(nearest_sat_ids >= 0)
+            if len(valid_region_ids) > 0:
+                self._ensure_region_next_hops(valid_region_ids)
+            self._region_next_hop_eager_ready = True
 
-            for i in range(num_flowlets):
-                is_normal = bool(is_normal_array[i])
-                packet_size = self.normal_packet_size if is_normal else self.small_packet_size
-                delay_tolerance = self.normal_packet_delay_limit if is_normal else self.small_packet_delay_limit
-                packet_count = int(packet_counts[i])
+    def get_flowlet_dataframe(self) -> pd.DataFrame:
+        if not self._flowlet_arrays:
+            return pd.DataFrame()
 
-                packet = DataBlock(
-                    block_id=self.next_packet_id,
-                    source=None,
-                    source_region_id=int(source_region_ids[i]),
-                    target_region_id=int(target_region_ids[i]),
-                    packet_count=packet_count,
-                    packet_size=packet_size,
-                    is_normal=is_normal,
-                    size=packet_size * packet_count,
-                    delay_limit=delay_tolerance,
-                    creation_time=float(creation_times[i]),
-                    ttl=self.default_ttl,
-                )
-
-                packet.last_event = self.scheduler.push_event(
-                    event_type=EventType.DATA_GENERATED,
-                    time=packet.creation_time,
-                    data=packet,
-                )
-                self.generated_packets.append(packet)
-                self.next_packet_id += 1
-                self.stats.on_packet_generated(packet)
-                num_flowlets_generated += 1
-
-        return num_flowlets_generated
+        arrays = self._flowlet_arrays
+        status = arrays["status"]
+        queue_delay = arrays.get("queue_delay", np.zeros(len(status)))
+        transmission_delay = arrays.get("transmission_delay", np.zeros(len(status)))
+        propagation_delay = arrays.get("propagation_delay", np.zeros(len(status)))
+        total_delay = queue_delay + transmission_delay + propagation_delay
+        return pd.DataFrame(
+            {
+                "flowlet_id": np.arange(len(status)),
+                "source_id": arrays.get("source_id", np.full(len(status), -1)),
+                "source_region_id": arrays.get("source_region_id", np.full(len(status), -1)),
+                "target_region_id": arrays.get("target_region_id", np.full(len(status), -1)),
+                "packet_count": arrays.get("packet_count", np.zeros(len(status), dtype=np.int64)),
+                "packet_size": arrays.get("packet_size", np.zeros(len(status))),
+                "is_normal_packet": arrays.get("is_normal", np.zeros(len(status), dtype=bool)),
+                "size": arrays.get("size", np.zeros(len(status))),
+                "creation_time": arrays.get("creation_time", np.zeros(len(status))),
+                "delivery_time": arrays.get("delivery_time", np.full(len(status), np.nan)),
+                "total_delay": np.where(status == FLOWLET_DELIVERED, total_delay, np.nan),
+                "queue_delay": queue_delay,
+                "transmission_delay": transmission_delay,
+                "propagation_delay": propagation_delay,
+                "hops": arrays.get("hops", np.zeros(len(status), dtype=np.int16)),
+                "ttl": arrays.get("ttl", np.zeros(len(status), dtype=np.int16)),
+                "ttl_max": self.default_ttl,
+                "delivered": status == FLOWLET_DELIVERED,
+                "dropped": status == FLOWLET_DROPPED,
+                "drop_time": arrays.get("drop_time", np.full(len(status), np.nan)),
+                "drop_reason": arrays.get("drop_reason", np.full(len(status), -1)),
+                "total_queue_cost": arrays.get("total_queue_cost", np.zeros(len(status))),
+                "first_gsl_delay": arrays.get("first_gsl_delay", np.zeros(len(status))),
+                "final_gsl_delay": arrays.get("final_gsl_delay", np.zeros(len(status))),
+            }
+        )
 
     def save_packets_to_csv(self, file_path: str):
-        generated_data = []
-        for block in self.generated_packets:
-            generated_data.append(block.to_dict())
-        generated_df = pd.DataFrame(generated_data)
-        generated_df.to_csv(file_path, index=False)
+        self.get_flowlet_dataframe().to_csv(file_path, index=False)

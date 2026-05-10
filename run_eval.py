@@ -57,25 +57,33 @@ def evaluate_multi_seed(env: RoutingEnvAsync, solvers: List[BaseSolver], base_se
     for solver in solvers:
         solver.set_eval()
 
-        all_packets = []
+        all_flowlet_frames = []
         for seed_idx in range(num_seeds):
             eval_seed = base_seed + seed_idx * 1000  # Ensure seeds are well separated
             logging.info("Solver: %s  Seed %d/%d (seed=%d)", solver.name, seed_idx + 1, num_seeds, eval_seed)
             start_time = time.time()
             env.reset(seed=eval_seed, start_time=0)
-            env.run(solver)
+            try:
+                env.run(solver)
+            except NotImplementedError as exc:
+                logging.warning("Skipping solver %s: %s", solver.name, exc)
+                break
             eval_time = time.time() - start_time
             logging.info("Evaluation finished in %.2fs", eval_time)
             metrics = env.calc_metrics()
             logging.info("Test metrics: %s", metrics.to_json())
-            all_packets.extend(env.generated_packets)
+            flowlet_df = env.get_flowlet_dataframe()
+            if not flowlet_df.empty:
+                flowlet_df.insert(0, "seed", eval_seed)
+                flowlet_df.insert(0, "solver", solver.name)
+                all_flowlet_frames.append(flowlet_df)
 
         logging.info("Solver: %s evaluated", solver.name)
 
-        generated_df = pd.DataFrame([packet.to_dict() for packet in all_packets])
+        generated_df = pd.concat(all_flowlet_frames, ignore_index=True) if all_flowlet_frames else pd.DataFrame()
         generated_path = os.path.join(LOG_DIR, f"{solver.name}_packets.csv")
         generated_df.to_csv(generated_path, index=False)
-        logging.info("%d packets saved to %s", len(all_packets), generated_path)
+        logging.info("%d flowlets saved to %s", len(generated_df), generated_path)
         print("")
 
 

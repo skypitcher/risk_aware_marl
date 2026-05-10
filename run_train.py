@@ -139,17 +139,23 @@ def train(env: RoutingEnvAsync, solver: BaseSolver, start_epoch: int, max_epoch:
         tf_writer.add_scalar("epoch/delivery_rate", metrics.delivery_rate, global_step=epoch)
         tf_writer.add_scalar("epoch/drop_rate", metrics.drop_rate, global_step=epoch)
 
-        if len(env.delivered_packets) > 0:
-            queue_costs = np.array([p.total_queue_cost for p in env.delivered_packets])
+        flowlet_df = env.get_flowlet_dataframe()
+        delivered_flowlets = flowlet_df[flowlet_df["delivered"]] if not flowlet_df.empty else flowlet_df
+        if not delivered_flowlets.empty:
+            queue_costs = delivered_flowlets["total_queue_cost"].to_numpy()
             if len(queue_costs) > 0:
                 tf_writer.add_histogram("epoch/queue_costs", queue_costs, global_step=epoch)
                 tf_writer.add_scalar("epoch/cost", np.mean(queue_costs), global_step=epoch)
                 tf_writer.add_scalar("epoch/cost_std", np.std(queue_costs), global_step=epoch)
 
-            first_gsl_delays = np.array([p.first_gsl_delay for p in env.delivered_packets])
-            packet_delays = np.array([p.e2e_delay for p in env.delivered_packets])
-            small_packet_delays = np.array([p.e2e_delay for p in env.delivered_packets if not p.is_normal_packet])
-            normal_packet_delays = np.array([p.e2e_delay for p in env.delivered_packets if p.is_normal_packet])
+            first_gsl_delays = delivered_flowlets["first_gsl_delay"].to_numpy()
+            packet_delays = delivered_flowlets["total_delay"].to_numpy()
+            small_packet_delays = delivered_flowlets.loc[
+                ~delivered_flowlets["is_normal_packet"], "total_delay"
+            ].to_numpy()
+            normal_packet_delays = delivered_flowlets.loc[
+                delivered_flowlets["is_normal_packet"], "total_delay"
+            ].to_numpy()
             if len(packet_delays) > 0:
                 tf_writer.add_histogram("epoch/all_delays", packet_delays, global_step=epoch)
                 tf_writer.add_scalar("epoch/e2e_delay_mean", packet_delays.mean(), global_step=epoch)

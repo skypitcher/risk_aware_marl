@@ -68,7 +68,7 @@ class DataBlock:
         self.drop_reason: NetworkError | None = None  # Reason for dropping the DataBlock
 
 
-        # Great-circle distance to the target region in kilometers.
+        # Great-circle distance to the target region in angular degrees.
         self.initial_gcd: float = 0.0
         self.shortest_gcd: float = 0.0
 
