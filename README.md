@@ -81,7 +81,7 @@ brew install proj geos
 
 ## 🧠 Routing Policies
 
-- **SPF**: Dijkstra shortest-path first, backed by dense satellite next-hop rows and region-to-next-hop tables.
+- **SPF**: Dijkstra shortest-path first, backed by dense satellite next-hop rows and region-to-next-hop tables. `configs/spf.json` enables the JAX/JIT next-hop kernel; set `use_jax` to `false` for the NumPy path.
 - **Batched policy contract**: `sat_net/solver/base_solver.py` defines `RoutingBatch` and `RoutingDecision`, the interface future JAX/PRIMAL policies should implement.
 - **RL status**: Legacy PyTorch callback solvers have been removed. PRIMAL/MADQN/MaIQN/MaSAC need to be reimplemented against the batched policy API.
 

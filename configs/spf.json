@@ -1,3 +1,4 @@
 {
-    "name": "SPF"
+    "name": "SPF",
+    "use_jax": true
 }

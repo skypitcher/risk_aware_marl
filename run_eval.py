@@ -12,7 +12,7 @@ from typing import List
 import pandas as pd
 
 from sat_net.routing_env import RoutingEnv
-from sat_net.solver import SPF, BaseSolver, create_solver
+from sat_net.solver import BaseSolver, create_solver
 from sat_net.util import NamedDict
 
 TEST_RUN_ID = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
@@ -115,7 +115,7 @@ def run_evaluation(model_path_list: list[str], eval_seed: int, num_eval_seeds: i
 
     # Initialize solvers
     solvers = [load_solver_from(env, model_path) for model_path in model_path_list]
-    solvers.append(SPF())
+    solvers.append(create_solver(NamedDict.load("configs/spf.json")))
 
     if not solvers:
         logging.error("No solvers available for evaluation")

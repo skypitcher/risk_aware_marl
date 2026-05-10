@@ -458,6 +458,7 @@ def build_routing_batch(
     neighbor_sat_ids_by_node: np.ndarray,
     current_time: float,
     region_next_hop_table: np.ndarray | None,
+    region_next_hop_version: int = 0,
 ) -> RoutingBatch:
     neighbor_sat_ids = neighbor_sat_ids_by_node[current_sats]
     neighbor_link_ids = links.neighbor_link_ids[current_sats]
@@ -485,6 +486,7 @@ def build_routing_batch(
         ttl=flowlets.ttl[flowlet_ids],
         current_time=current_time,
         region_next_hop_table=region_next_hop_table,
+        region_next_hop_version=region_next_hop_version,
     )
 
 

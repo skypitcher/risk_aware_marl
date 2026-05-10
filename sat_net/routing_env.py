@@ -100,6 +100,7 @@ class RoutingEnv:
         self._region_next_hop_table = np.empty((len(self.traffic_model.regions), 0), dtype=np.int64)
         self._region_next_hop_ready = np.zeros(len(self.traffic_model.regions), dtype=bool)
         self._region_next_hop_eager_ready = False
+        self._region_next_hop_version = 0
         self._region_access_cache_time: float | None = None
         self._array_metrics: Metrics | None = None
         self._flowlets: FlowletState | None = None
@@ -433,6 +434,7 @@ class RoutingEnv:
             neighbor_sat_ids_by_node=self.network.neighbor_sat_ids,
             current_time=self.current_time,
             region_next_hop_table=self._region_next_hop_table if include_spf_table else None,
+            region_next_hop_version=self._region_next_hop_version if include_spf_table else 0,
         )
 
     def _schedule_flowlets_by_link(
@@ -469,6 +471,7 @@ class RoutingEnv:
         self.network.precompute_shortest_next_hops(access_sat_ids)
         self._region_next_hop_table[missing_regions] = self.network.shortest_next_hop_rows(access_sat_ids)
         self._region_next_hop_ready[missing_regions] = True
+        self._region_next_hop_version += 1
 
     def _drop_flowlets_on_disconnected_links(self):
         if self._flowlets is None or self._links is None:
@@ -605,6 +608,7 @@ class RoutingEnv:
             self._region_next_hop_table = np.empty((num_regions, 0), dtype=np.int64)
             self._region_next_hop_ready = np.zeros(num_regions, dtype=bool)
             self._region_next_hop_eager_ready = False
+            self._region_next_hop_version += 1
             self._region_access_cache_time = self.current_time
             return
 
@@ -629,6 +633,7 @@ class RoutingEnv:
         if self._region_next_hop_table.shape != table_shape:
             self._region_next_hop_table = np.empty(table_shape, dtype=np.int64)
         self._region_next_hop_table.fill(-1)
+        self._region_next_hop_version += 1
         if len(self._region_next_hop_ready) != len(self.traffic_model.regions):
             self._region_next_hop_ready = np.zeros(len(self.traffic_model.regions), dtype=bool)
         else:

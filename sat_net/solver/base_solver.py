@@ -32,6 +32,7 @@ class RoutingBatch:
     ttl: np.ndarray
     current_time: float
     region_next_hop_table: np.ndarray | None = None
+    region_next_hop_version: int = 0
 
 
 @dataclass(slots=True)

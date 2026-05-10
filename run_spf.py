@@ -1,13 +1,15 @@
 import time
 
-from sat_net import RoutingEnv, SPF
+from sat_net import RoutingEnv
+from sat_net.solver import create_solver
 from sat_net.util import NamedDict
 
 if __name__ == "__main__":
     start_time = time.time()
     env_config = NamedDict.load("configs/starlink_dvbs2_train.json")
+    solver_config = NamedDict.load("configs/spf.json")
     env = RoutingEnv(env_config)
-    solver = SPF()
+    solver = create_solver(solver_config)
     env.reset(seed=3333)
     env.run(solver)
     metrics = env.calc_metrics()
