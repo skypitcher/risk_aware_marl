@@ -567,21 +567,23 @@ def schedule_flowlets_by_link(
     sorted_link_ids = link_ids[order]
     sorted_ids = flowlet_ids[order]
     sorted_next_hops = next_hops[order]
-    split_points = np.flatnonzero(np.diff(sorted_link_ids)) + 1
-    starts = np.r_[0, split_points]
-    ends = np.r_[split_points, len(sorted_link_ids)]
-    group_link_ids = sorted_link_ids[starts]
-    group_lengths = ends - starts
-    group_ids = np.repeat(np.arange(len(starts)), group_lengths)
 
     sizes = flowlets.size[sorted_ids]
     cumulative_size = np.cumsum(sizes)
-    size_offsets = np.zeros(len(starts), dtype=np.float64)
-    if len(starts) > 1:
-        size_offsets[1:] = cumulative_size[starts[1:] - 1]
-    group_cumulative_size = cumulative_size - size_offsets[group_ids]
-    remaining_capacity = links.capacity[group_link_ids] - links.queue_load[group_link_ids]
-    accepted = group_cumulative_size <= remaining_capacity[group_ids]
+    group_start_mask = np.empty(len(sorted_link_ids), dtype=bool)
+    group_start_mask[0] = True
+    group_start_mask[1:] = sorted_link_ids[1:] != sorted_link_ids[:-1]
+    group_start_indices = np.maximum.accumulate(
+        np.where(group_start_mask, np.arange(len(sorted_link_ids)), 0)
+    )
+    size_offsets = np.where(
+        group_start_indices == 0,
+        0.0,
+        cumulative_size[group_start_indices - 1],
+    )
+    group_cumulative_size = cumulative_size - size_offsets
+    remaining_capacity = links.capacity[sorted_link_ids] - links.queue_load[sorted_link_ids]
+    accepted = group_cumulative_size <= remaining_capacity
 
     rejected_ids = sorted_ids[~accepted]
     if not accepted.any():
@@ -591,33 +593,39 @@ def schedule_flowlets_by_link(
     accepted_link_ids = sorted_link_ids[accepted]
     accepted_next_hops = sorted_next_hops[accepted]
     accepted_sizes = sizes[accepted]
-    accepted_group_ids = group_ids[accepted]
-
-    accepted_split_points = np.flatnonzero(np.diff(accepted_group_ids)) + 1
-    accepted_starts = np.r_[0, accepted_split_points]
-    accepted_ends = np.r_[accepted_split_points, len(accepted_ids)]
-    accepted_group_numbers = np.repeat(
-        np.arange(len(accepted_starts)),
-        accepted_ends - accepted_starts,
-    )
-    accepted_original_group_ids = accepted_group_ids[accepted_starts]
 
     transmit_times = accepted_sizes / links.data_rate[accepted_link_ids]
     cumulative_tx = np.cumsum(transmit_times)
-    tx_offsets = np.zeros(len(accepted_starts), dtype=np.float64)
-    if len(accepted_starts) > 1:
-        tx_offsets[1:] = cumulative_tx[accepted_starts[1:] - 1]
-    group_cumulative_tx = cumulative_tx - tx_offsets[accepted_group_numbers]
+    tx_group_start_mask = np.empty(len(accepted_link_ids), dtype=bool)
+    tx_group_start_mask[0] = True
+    tx_group_start_mask[1:] = accepted_link_ids[1:] != accepted_link_ids[:-1]
+    tx_group_start_indices = np.maximum.accumulate(
+        np.where(tx_group_start_mask, np.arange(len(accepted_link_ids)), 0)
+    )
+    tx_offsets = np.where(
+        tx_group_start_indices == 0,
+        0.0,
+        cumulative_tx[tx_group_start_indices - 1],
+    )
+    group_cumulative_tx = cumulative_tx - tx_offsets
 
-    accepted_group_link_ids = group_link_ids[accepted_original_group_ids]
-    start_base_by_group = np.maximum(current_time, links.free_time[accepted_group_link_ids])
-    start_base = start_base_by_group[accepted_group_numbers]
+    start_base = np.maximum(current_time, links.free_time[accepted_link_ids])
     transmit_end_times = start_base + group_cumulative_tx
     wait_times = transmit_end_times - transmit_times - current_time
     propagation_delays = links.delay[accepted_link_ids]
 
-    links.free_time[accepted_group_link_ids] = transmit_end_times[accepted_ends - 1]
-    links.queue_load[accepted_group_link_ids] += np.add.reduceat(accepted_sizes, accepted_starts)
+    accepted_group_starts = np.flatnonzero(tx_group_start_mask)
+    accepted_group_link_ids = accepted_link_ids[accepted_group_starts]
+    # Preserve the old segment summation order; tiny FP drift changes later capacity decisions.
+    links.queue_load[accepted_group_link_ids] += np.add.reduceat(
+        accepted_sizes,
+        accepted_group_starts,
+    )
+
+    free_time_updates = np.full(links.count, -np.inf, dtype=np.float64)
+    np.maximum.at(free_time_updates, accepted_link_ids, transmit_end_times)
+    updated_links = np.isfinite(free_time_updates)
+    links.free_time[updated_links] = free_time_updates[updated_links]
 
     flowlets.queue_delay[accepted_ids] += wait_times
     flowlets.transmission_delay[accepted_ids] += transmit_times
