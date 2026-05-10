@@ -22,6 +22,9 @@ from sat_net.sim_kernel import (
     flowlet_mask_to_ids,
     handle_flowlet_arrivals_mask,
     partition_deliverable_flowlet_mask,
+    apply_no_route_mask,
+    prepare_link_schedule_inputs,
+    prepare_route_candidate_mask,
     release_transmitted_flowlets,
     schedule_flowlets_by_link,
 )
@@ -347,18 +350,20 @@ class RoutingEnv:
     def _route_flowlets_batch(self, flowlet_ids: np.ndarray):
         current_sats = self._flowlets.current_sat[flowlet_ids]
         target_regions = self._flowlets.target_region_id[flowlet_ids]
-        target_access_sats = self._nearest_region_sat_ids[target_regions]
+        candidate_local_mask, target_access_sats = prepare_route_candidate_mask(
+            flowlets=self._flowlets,
+            route_flowlet_ids=flowlet_ids,
+            nearest_region_sat_ids=self._nearest_region_sat_ids,
+            current_time=self.current_time,
+            no_available_sat_reason=int(NetworkError.NO_AVAILABLE_SAT),
+        )
 
-        no_access = target_access_sats < 0
-        if no_access.any():
-            self._drop_flowlet_ids(flowlet_ids[no_access], NetworkError.NO_AVAILABLE_SAT)
-
-        candidate_ids = flowlet_ids[~no_access]
+        candidate_ids = flowlet_ids[candidate_local_mask]
         if len(candidate_ids) == 0:
             return
 
-        current_sats = current_sats[~no_access]
-        target_regions = target_regions[~no_access]
+        current_sats = current_sats[candidate_local_mask]
+        target_regions = target_regions[candidate_local_mask]
         if solver_requires_spf := self.current_solver.requires_shortest_path_table:
             if not self._region_next_hop_eager_ready:
                 self._ensure_region_next_hops(target_regions)
@@ -367,7 +372,7 @@ class RoutingEnv:
             flowlet_ids=candidate_ids,
             current_sats=current_sats,
             target_regions=target_regions,
-            target_access_sats=target_access_sats[~no_access],
+            target_access_sats=target_access_sats[candidate_local_mask],
             include_spf_table=solver_requires_spf,
         )
         decision = self.current_solver.next_hops(batch)
@@ -378,37 +383,34 @@ class RoutingEnv:
                 f"for {len(candidate_ids)} flowlets."
             )
 
-        no_route = next_hops < 0
-        if no_route.any():
-            self._drop_flowlet_ids(candidate_ids[no_route], NetworkError.FAILED_TO_FIND_NEXT_HOP)
-
-        routable_ids = candidate_ids[~no_route]
+        routable_local_mask = apply_no_route_mask(
+            flowlets=self._flowlets,
+            candidate_ids=candidate_ids,
+            next_hops=next_hops,
+            current_time=self.current_time,
+            failed_to_find_next_hop_reason=int(NetworkError.FAILED_TO_FIND_NEXT_HOP),
+        )
+        routable_ids = candidate_ids[routable_local_mask]
         if len(routable_ids) == 0:
             return
 
-        current_sats = current_sats[~no_route]
-        next_hops = next_hops[~no_route]
-        link_ids = self._links.id_by_pair[current_sats, next_hops]
-
-        valid_link = link_ids >= 0
-        connected = np.zeros(len(link_ids), dtype=bool)
-        connected[valid_link] = self._links.connected[link_ids[valid_link]]
-        invalid = (~valid_link) | (~connected)
-        if invalid.any():
-            self._drop_flowlet_ids(routable_ids[invalid], NetworkError.INVALID_NEXT_HOP)
-
-        scheduled_ids = routable_ids[~invalid]
+        scheduled_ids, link_ids, scheduled_next_hops = prepare_link_schedule_inputs(
+            flowlets=self._flowlets,
+            links=self._links,
+            routable_ids=routable_ids,
+            current_sats=current_sats[routable_local_mask],
+            next_hops=next_hops[routable_local_mask],
+            neighbor_sat_ids_by_node=self.network.neighbor_sat_ids,
+            current_time=self.current_time,
+            invalid_next_hop_reason=int(NetworkError.INVALID_NEXT_HOP),
+        )
         if len(scheduled_ids) == 0:
             return
-
-        current_sats = current_sats[~invalid]
-        next_hops = next_hops[~invalid]
-        link_ids = link_ids[~invalid]
 
         rejected_ids = self._schedule_flowlets_by_link(
             flowlet_ids=scheduled_ids,
             link_ids=link_ids,
-            next_hops=next_hops,
+            next_hops=scheduled_next_hops,
         )
         if len(rejected_ids) > 0:
             self._drop_flowlet_ids(rejected_ids, NetworkError.LINK_FULL)

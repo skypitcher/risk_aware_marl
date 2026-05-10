@@ -488,6 +488,70 @@ def build_routing_batch(
     )
 
 
+def prepare_route_candidate_mask(
+    flowlets: FlowletState,
+    route_flowlet_ids: np.ndarray,
+    nearest_region_sat_ids: np.ndarray,
+    current_time: float,
+    no_available_sat_reason: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    target_regions = flowlets.target_region_id[route_flowlet_ids]
+    target_access_sats = nearest_region_sat_ids[target_regions]
+    candidate_local_mask = target_access_sats >= 0
+    if (~candidate_local_mask).any():
+        drop_flowlet_ids(
+            flowlets=flowlets,
+            flowlet_ids=route_flowlet_ids[~candidate_local_mask],
+            current_time=current_time,
+            reason=no_available_sat_reason,
+        )
+    return candidate_local_mask, target_access_sats
+
+
+def apply_no_route_mask(
+    flowlets: FlowletState,
+    candidate_ids: np.ndarray,
+    next_hops: np.ndarray,
+    current_time: float,
+    failed_to_find_next_hop_reason: int,
+) -> np.ndarray:
+    routable_local_mask = next_hops >= 0
+    if (~routable_local_mask).any():
+        drop_flowlet_ids(
+            flowlets=flowlets,
+            flowlet_ids=candidate_ids[~routable_local_mask],
+            current_time=current_time,
+            reason=failed_to_find_next_hop_reason,
+        )
+    return routable_local_mask
+
+
+def prepare_link_schedule_inputs(
+    flowlets: FlowletState,
+    links: LinkState,
+    routable_ids: np.ndarray,
+    current_sats: np.ndarray,
+    next_hops: np.ndarray,
+    neighbor_sat_ids_by_node: np.ndarray,
+    current_time: float,
+    invalid_next_hop_reason: int,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    neighbor_matches = neighbor_sat_ids_by_node[current_sats] == next_hops[:, None]
+    direction_ids = np.argmax(neighbor_matches, axis=1)
+    valid_neighbor = neighbor_matches.any(axis=1)
+    link_ids = links.neighbor_link_ids[current_sats, direction_ids]
+    schedulable_mask = valid_neighbor & (link_ids >= 0)
+    schedulable_mask[schedulable_mask] &= links.connected[link_ids[schedulable_mask]]
+    if (~schedulable_mask).any():
+        drop_flowlet_ids(
+            flowlets=flowlets,
+            flowlet_ids=routable_ids[~schedulable_mask],
+            current_time=current_time,
+            reason=invalid_next_hop_reason,
+        )
+    return routable_ids[schedulable_mask], link_ids[schedulable_mask], next_hops[schedulable_mask]
+
+
 def schedule_flowlets_by_link(
     flowlets: FlowletState,
     links: LinkState,
