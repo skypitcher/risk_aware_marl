@@ -3,7 +3,6 @@
 [![Python 3.11](https://img.shields.io/badge/python-3.11-blue.svg)](https://www.python.org/downloads/release/python-3110/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![arXiv](https://img.shields.io/badge/arXiv-2510.27506-b31b1b.svg)](https://[arxiv.org/abs/2510.27506](https://arxiv.org/abs/2510.27506))
-[![PyTorch](https://img.shields.io/badge/PyTorch-2.0+-red.svg)](https://pytorch.org/)
 
 > **Official implementation** of the preprint paper: "Asynchronous Risk-Aware Multi-Agent Packet Routing for Ultra-Dense LEO Satellite Networks"
 >
@@ -24,8 +23,8 @@ The simulator has been refactored from an event-queue packet model into a data-o
 1. **Region traffic**: Flowlets are sampled from population/region weights and bind to the currently visible access satellite.
 2. **Flowlet batches**: A flowlet represents a batch of packets with common source/target regions.
 3. **Array network state**: Satellite positions, link endpoints, link delays, connectivity, queues, and flowlet state are stored in NumPy arrays.
-4. **SPF baseline**: Shortest-path next-hop rows are computed from sparse arrays and refreshed with topology updates.
-5. **RL status**: Legacy RL solver classes remain in the repository, but the new kernel needs a batched transition API before RL training is re-enabled.
+4. **Batched policy API**: Solvers receive `RoutingBatch` arrays and return vectorized `RoutingDecision` next hops.
+5. **SPF baseline**: Shortest-path next-hop rows are computed from sparse arrays, cached in a dense matrix, and refreshed with topology updates.
 
 ### 📊 Key Results
 
@@ -46,8 +45,7 @@ Our PRIMAL framework resolves the fundamental conflict between shortest-path rou
 
 ### System Requirements
 - Python 3.11+
-- CUDA 11.8+ (for GPU acceleration)
-- 32GB RAM (recommended for training)
+- 32GB RAM recommended for large Starlink-scale runs
 - Ubuntu 20.04+ / Windows 10+ / macOS 12+
 
 ### Installation
@@ -68,19 +66,6 @@ pip install -r requirements.txt
 #### Troubleshooting
 
 <details>
-<summary>CUDA/PyTorch issues</summary>
-
-If you encounter CUDA compatibility issues:
-```bash
-# For CUDA 11.8
-pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu118
-
-# For CUDA 12.1
-pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
-```
-</details>
-
-<details>
 <summary>Cartopy installation issues</summary>
 
 On some systems, Cartopy may require additional dependencies:
@@ -93,21 +78,11 @@ brew install proj geos
 ```
 </details>
 
-## 🧠 Implemented Algorithms
+## 🧠 Routing Policies
 
-### Our Contributions (PRIMAL Framework)
-- **PRIMAL-CVaR** 🎯: Risk-aware routing with CVaR constraints at configurable risk levels (e.g., ε=0.25)
-  - Learns full cost distribution via Implicit Quantile Networks
-  - Directly constrains tail-end risks for robust performance
-- **PRIMAL-Avg** 📊: Risk-neutral variant with expectation-based constraints
-  - Optimizes average performance with primal-dual learning
-  - Serves as ablation study for risk-awareness benefits
-
-### Baseline Methods
-- **SPF**: Dijkstra's Shortest Path First - Precomputed routing based on predictable orbital movements
-- **MADQN**: Multi-agent asynchronous DQN with heuristic reward shaping [Lozano-Cuadra et al., 2025]
-- **MaIQN**: Multi-agent Implicit Quantile Network (distributional but risk-oblivious)
-- **MaSAC**: Multi-agent Soft Actor-Critic with maximum entropy
+- **SPF**: Dijkstra shortest-path first, backed by dense satellite next-hop rows and region-to-next-hop tables.
+- **Batched policy contract**: `sat_net/solver/base_solver.py` defines `RoutingBatch` and `RoutingDecision`, the interface future JAX/PRIMAL policies should implement.
+- **RL status**: Legacy PyTorch callback solvers have been removed. PRIMAL/MADQN/MaIQN/MaSAC need to be reimplemented against the batched policy API.
 
 ## 📁 Project Structure
 
@@ -117,15 +92,12 @@ risk_aware_marl/
 │   ├── routing_env.py          # Slot-array routing environment
 │   ├── network.py              # Array-oriented satellite network topology
 │   ├── traffic_region.py       # Region/population traffic model
-│   └── solver/                 # Routing algorithms
-│       ├── primal_cvar.py      # Our risk-aware algorithm
-│       ├── primal_avg.py       # Our risk-neutral algorithm
-│       ├── dqn.py              # DQN baseline
-│       └── spf.py              # Traditional routing
+│   └── solver/                 # Batched routing policy API
+│       ├── base_solver.py      # RoutingBatch/RoutingDecision contract
+│       └── spf.py              # Shortest-path baseline
 ├── configs/                    # Configuration files
 │   ├── starlink_dvbs2_*.json  # Network configurations
-│   └── *.json                  # Algorithm hyperparameters
-├── saved_models/               # Pre-trained models
+│   └── spf.json                # Solver configuration
 ├── figs/                       # Figures and plots
 └── runs_*/                     # Experiment results
 ```
@@ -138,13 +110,13 @@ risk_aware_marl/
 # Generate SPF baseline results
 python run_spf.py
 
-# Evaluate configured solvers; unsupported legacy RL solvers are skipped
+# Evaluate SPF across seeds
 python run_eval.py
 ```
 
 ### RL Training Status
 
-The legacy RL solver implementations are still present, but the slot-array simulator currently supports SPF only. RL training requires a batched transition API before `run_train.py` can be used for PRIMAL/MADQN/MaIQN/MaSAC again.
+`run_train.py` currently executes policy rollouts through the same batched interface. Learning is intentionally not implemented until PRIMAL-style policies are rebuilt on `RoutingBatch` arrays, which is the intended entry point for a future JAX/JIT implementation.
 
 ## 📄 License
 

@@ -92,7 +92,7 @@ def load_solver_from(env, saved_path: str):
     Loads a trained solver from a specified path.
     """
     solver_config = NamedDict.load(f"{saved_path}/solver_config.json")
-    solver = create_solver(obs_dim=env.obs_dim, action_dim=env.action_dim, solver_config=solver_config, tf_writer=None)
+    solver = create_solver(solver_config)
     solver.load_models(f"{saved_path}/models/best_model")
     solver.set_eval()
     return solver
@@ -128,11 +128,7 @@ def run_evaluation(model_path_list: list[str], eval_seed: int, num_eval_seeds: i
 
 if __name__ == "__main__":
     run_evaluation(
-        model_path_list=[
-            "saved_models/madqn",
-            "saved_models/primal_avg",
-            "saved_models/primal_cvar",
-        ],
+        model_path_list=[],
         eval_seed=3333,
         num_eval_seeds=5,
     )

@@ -12,8 +12,6 @@ import time
 from datetime import datetime
 
 import numpy as np
-import torch
-from torch.utils.tensorboard import SummaryWriter
 
 from sat_net.routing_env import RoutingEnv
 from sat_net.solver import BaseSolver, create_solver
@@ -22,6 +20,17 @@ from sat_net.util import NamedDict, ms2str
 PROJECT_ROOT = str(os.path.dirname(os.path.abspath(__file__)))
 print(f"PROJECT_ROOT: {PROJECT_ROOT}")
 sys.path.append(PROJECT_ROOT)
+
+
+class NullMetricWriter:
+    def add_scalar(self, *_args, **_kwargs):
+        pass
+
+    def add_histogram(self, *_args, **_kwargs):
+        pass
+
+    def close(self):
+        pass
 
 
 def setup_logging(log_dir: str):
@@ -44,7 +53,6 @@ def set_seeds(seed):
     if seed is not None:
         random.seed(seed)
         np.random.seed(seed)
-        torch.manual_seed(seed)
 
 
 def eval_performace(env: RoutingEnv, solver: BaseSolver):
@@ -100,7 +108,7 @@ def train(env: RoutingEnv, solver: BaseSolver, start_epoch: int, max_epoch: int,
     Main training loop.
     """
     logging.info("Training started")
-    logging.info("You can run ``tensorboard --logdir=runs`` to see the training progress.")
+    logging.info("Batched RL training is not implemented yet; current policy runs are deterministic rollouts.")
 
     best_throughput = None
     for epoch in range(start_epoch, max_epoch + 1):
@@ -209,8 +217,8 @@ def main():
     parser.add_argument("--recover_runid", type=str, default=None)
     parser.add_argument("--recover_epoch", type=int, default=1)
     parser.add_argument("--env", type=str, default="configs/starlink_dvbs2_train.json")
-    parser.add_argument("--solver", type=str, default="configs/dqn.json")
-    parser.add_argument("--num_epochs", type=int, default=500)
+    parser.add_argument("--solver", type=str, default="configs/spf.json")
+    parser.add_argument("--num_epochs", type=int, default=1)
     parser.add_argument("--seed", type=int, default=33333)
 
     args = parser.parse_args()
@@ -235,7 +243,7 @@ def main():
         set_seeds(args.seed)
         logging.info("Using seed: %d", args.seed)
 
-        tf_writer = SummaryWriter(log_dir=log_dir)
+        tf_writer = NullMetricWriter()
 
         # Load from existing run
         env_config = NamedDict.load(f"{log_dir}/env_config.json")
@@ -245,7 +253,7 @@ def main():
         logging.info("solver_config: %s", solver_config.to_string())
 
         env = RoutingEnv(env_config, tf_writer=tf_writer)
-        solver = create_solver(env.obs_dim, env.action_dim, solver_config, tf_writer)
+        solver = create_solver(solver_config)
         solver.load_models(f"{log_dir}/models/last_model")
     else:
         env_config = NamedDict.load(args.env)
@@ -260,7 +268,7 @@ def main():
         print(f"LOG_DIR: {log_dir}")
         setup_logging(log_dir)
 
-        tf_writer = SummaryWriter(log_dir=log_dir)
+        tf_writer = NullMetricWriter()
 
         logging.info("args: %s", args.to_string())
         set_seeds(args.seed)
@@ -268,7 +276,7 @@ def main():
 
         # create env and solver
         env = RoutingEnv(env_config, tf_writer=tf_writer)
-        solver = create_solver(env.obs_dim, env.action_dim, solver_config, tf_writer)
+        solver = create_solver(solver_config)
 
         logging.info("env_config: %s", env_config.to_string())
         logging.info("solver_config: %s", solver_config.to_string())

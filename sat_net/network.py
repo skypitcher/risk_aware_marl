@@ -51,7 +51,8 @@ class SatelliteNetwork:
         self.orbit_cycle = calculate_orbital_period(self.altitude)
 
         self.topology_version = 0
-        self._shortest_next_hop_cache: dict[int, np.ndarray] = {}
+        self._shortest_next_hops = np.full((self.num_nodes, self.num_nodes), -1, dtype=np.int64)
+        self._shortest_next_hop_ready = np.zeros(self.num_nodes, dtype=bool)
         self._shortest_reverse_csr: csr_matrix | None = None
         self._shortest_reverse_csr_version = -1
 
@@ -149,9 +150,13 @@ class SatelliteNetwork:
         self._update_satellite_positions_vectorized(timestamp)
         self._refresh_link_geometry()
         self.topology_version += 1
-        self._shortest_next_hop_cache.clear()
+        self._reset_shortest_next_hop_cache()
         self._shortest_reverse_csr = None
         self._shortest_reverse_csr_version = -1
+
+    def _reset_shortest_next_hop_cache(self):
+        self._shortest_next_hops.fill(-1)
+        self._shortest_next_hop_ready.fill(False)
 
     def _update_satellite_positions_vectorized(self, timestamp: float):
         semi_major_axis_m = (EARTH_R_KM + self._satellite_altitudes) * 1000.0
@@ -274,7 +279,7 @@ class SatelliteNetwork:
         if current < 0 or current >= self.num_nodes or sink < 0 or sink >= self.num_nodes or current == sink:
             return None
         self._ensure_shortest_next_hop_rows(np.array([sink], dtype=np.int64))
-        next_hop = int(self._shortest_next_hop_cache[sink][current])
+        next_hop = int(self._shortest_next_hops[sink, current])
         return next_hop if next_hop >= 0 else None
 
     def get_shortest_next_hops(self, current: np.ndarray, sink: np.ndarray) -> np.ndarray:
@@ -282,26 +287,38 @@ class SatelliteNetwork:
         if len(current) == 0:
             return next_hops
 
-        target_sinks = np.unique(sink[sink >= 0])
+        valid = (
+            (current >= 0)
+            & (current < self.num_nodes)
+            & (sink >= 0)
+            & (sink < self.num_nodes)
+            & (current != sink)
+        )
+        if not valid.any():
+            return next_hops
+
+        target_sinks = np.unique(sink[valid])
         self._ensure_shortest_next_hop_rows(target_sinks)
-        for target_sink in target_sinks:
-            target_sink = int(target_sink)
-            table = self._shortest_next_hop_cache[target_sink]
-            mask = sink == target_sink
-            next_hops[mask] = table[current[mask]]
+        next_hops[valid] = self._shortest_next_hops[sink[valid], current[valid]]
         return next_hops
 
     def precompute_shortest_next_hops(self, sinks: np.ndarray):
         self._ensure_shortest_next_hop_rows(np.asarray(sinks, dtype=np.int64))
 
+    def shortest_next_hop_rows(self, sinks: np.ndarray) -> np.ndarray:
+        sinks = np.asarray(sinks, dtype=np.int64)
+        valid_sinks = sinks[(sinks >= 0) & (sinks < self.num_nodes)]
+        self._ensure_shortest_next_hop_rows(valid_sinks)
+        rows = np.full((len(sinks), self.num_nodes), -1, dtype=np.int64)
+        valid = (sinks >= 0) & (sinks < self.num_nodes)
+        rows[valid] = self._shortest_next_hops[sinks[valid]]
+        return rows
+
     def _ensure_shortest_next_hop_rows(self, sinks: np.ndarray):
-        sinks = np.unique(sinks[sinks >= 0])
+        sinks = np.unique(sinks[(sinks >= 0) & (sinks < self.num_nodes)])
         if len(sinks) == 0:
             return
-        missing_sinks = np.array(
-            [int(sink) for sink in sinks if int(sink) not in self._shortest_next_hop_cache],
-            dtype=np.int32,
-        )
+        missing_sinks = sinks[~self._shortest_next_hop_ready[sinks]].astype(np.int32, copy=False)
         if len(missing_sinks) == 0:
             return
 
@@ -318,5 +335,5 @@ class SatelliteNetwork:
         next_hop_rows[next_hop_rows < 0] = -1
         next_hop_rows[np.arange(len(missing_sinks)), missing_sinks] = -1
 
-        for sink, row in zip(missing_sinks, next_hop_rows):
-            self._shortest_next_hop_cache[int(sink)] = row.copy()
+        self._shortest_next_hops[missing_sinks] = next_hop_rows
+        self._shortest_next_hop_ready[missing_sinks] = True

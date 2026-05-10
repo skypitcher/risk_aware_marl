@@ -1,89 +1,77 @@
+from __future__ import annotations
+
 from abc import ABC, abstractmethod
-from typing import Optional
+from dataclasses import dataclass
 
 import numpy as np
-from torch.utils.tensorboard import SummaryWriter
+
+
+ACTION_N = 0
+ACTION_E = 1
+ACTION_S = 2
+ACTION_W = 3
+ACTION_COUNT = 4
+
+
+@dataclass(slots=True)
+class RoutingBatch:
+    """Batched routing inputs for flowlets currently resident at satellites."""
+
+    flowlet_ids: np.ndarray
+    current_sat_ids: np.ndarray
+    target_region_ids: np.ndarray
+    target_access_sat_ids: np.ndarray
+    neighbor_sat_ids: np.ndarray
+    neighbor_link_ids: np.ndarray
+    action_mask: np.ndarray
+    neighbor_queue_load: np.ndarray
+    neighbor_link_capacity: np.ndarray
+    neighbor_link_delay: np.ndarray
+    neighbor_link_free_time: np.ndarray
+    flowlet_size: np.ndarray
+    ttl: np.ndarray
+    current_time: float
+    region_next_hop_table: np.ndarray | None = None
+
+
+@dataclass(slots=True)
+class RoutingDecision:
+    """Next-hop satellite ids selected by a batched routing policy."""
+
+    next_hop_sat_ids: np.ndarray
 
 
 class BaseSolver(ABC):
-    """Base class for all solvers."""
+    """Batched routing policy interface used by the slot-array simulator."""
 
-    def __init__(self, tf_writer: Optional[SummaryWriter] = None):
-        self._tf_writer = tf_writer
-        self._is_eval = False
-        # Online learning support
-        self.online_mode = False
+    requires_shortest_path_table = False
 
     @property
     @abstractmethod
-    def name(self):
-        pass
-
-    @staticmethod
-    def class_name(cls):
-        return cls.__class__.__name__
-
-    def switch_mode(self, online: bool):
-        """Switch the solver to online mode where each agent has its own model and buffer."""
-        self.online_mode = online
-        print("Switched to online mode. Agents will now learn independently." if online else "Switched to offline mode.")
+    def name(self) -> str:
+        raise NotImplementedError
 
     @abstractmethod
-    def route(self, obs: np.ndarray, info: dict) -> tuple[Optional[int], Optional[dict]]:
-        """
-        Determine the next hop for the current flowlet/action context.
-
-        Args:
-            obs: The observation.
-            info: The info provided by the environment.
-
-        Returns:
-            next_hop: The index of the next_hop, or None if no route is found or if the agent decides to drop.
-            info: The info dict provided by the agent.
-        """
-        raise NotImplementedError("Subclasses must implement this method")
-
-    def on_action_over(self, packet):
-        """
-        Callback when a delayed action is over.
-        """
-        pass
-
-    def on_episode_over(self, packet):
-        """
-        Callback when an action episode finishes.
-        """
-        pass
-
-    def on_train_signal(self):
-        """
-        Callback when a periodical training event is triggered by the environment.
-        """
-        pass
+    def next_hops(self, batch: RoutingBatch) -> RoutingDecision:
+        raise NotImplementedError
 
     def set_train(self):
-        """Set the solver to training mode (e.g., enable exploration, learning)."""
-        self._is_eval = False
+        pass
 
     def set_eval(self):
-        """Set the solver to evaluation mode (e.g., disable exploration, use greedy policy)."""
-        self._is_eval = True
+        pass
 
-    def is_train(self):
-        """Check if the solver is in training mode."""
-        return not self._is_eval
+    def is_train(self) -> bool:
+        return False
 
-    def is_eval(self):
-        """Check if the solver is in evaluation mode."""
-        return self._is_eval
+    def is_eval(self) -> bool:
+        return True
 
     def save_models(self, model_dir_path: str):
-        """save the model to the given path. Used by RL-based solvers."""
         pass
 
     def load_models(self, model_dir_path: str):
-        """load the model from the given path. Used by RL-based solvers."""
         pass
 
-    def get_stats(self) -> str:
-        pass
+    def get_stats(self) -> str | None:
+        return None
