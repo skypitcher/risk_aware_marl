@@ -55,10 +55,11 @@ class DelayStats:
         if total_delay is None:
             return
 
-        self.total += total_delay
-        self.queue += packet.queue_delay
-        self.transmission += packet.transmission_delay
-        self.propagation += packet.propagation_delay
+        weight = getattr(packet, "packet_count", 1)
+        self.total += total_delay * weight
+        self.queue += packet.queue_delay * weight
+        self.transmission += packet.transmission_delay * weight
+        self.propagation += packet.propagation_delay * weight
 
 
 @dataclass
@@ -171,11 +172,12 @@ class Stats:
 
     def on_packet_generated(self, packet: "DataBlock"):
         """Updates the statistics when a packet is generated."""
-        self.num_packets_generated += 1
+        weight = getattr(packet, "packet_count", 1)
+        self.num_packets_generated += weight
         if packet.is_normal_packet:
-            self.num_packets_generated_normal_packet += 1
+            self.num_packets_generated_normal_packet += weight
         else:
-            self.num_packets_generated_small_packet += 1
+            self.num_packets_generated_small_packet += weight
 
     def on_packet_finished(self, packet: "DataBlock"):
         """Updates the statistics when a packet is finished (delivered or dropped)."""
@@ -186,11 +188,12 @@ class Stats:
 
     def _on_packet_delivered(self, packet: "DataBlock"):
         """Update stats for a delivered packet."""
-        self.num_packets_delivered += 1
+        weight = getattr(packet, "packet_count", 1)
+        self.num_packets_delivered += weight
         if packet.is_normal_packet:
-            self.num_normal_packet_packets_delivered += 1
+            self.num_normal_packet_packets_delivered += weight
         else:
-            self.num_small_packet_packets_delivered += 1
+            self.num_small_packet_packets_delivered += weight
 
         self.total_throughput += packet.size
 
@@ -201,22 +204,23 @@ class Stats:
         else:
             self.small_packet_packet_delay.update(packet)
 
-        self.total_cost += packet.total_queue_cost
+        self.total_cost += packet.total_queue_cost * weight
         if packet.is_normal_packet:
-            self.total_cost_normal_packet += packet.total_queue_cost
+            self.total_cost_normal_packet += packet.total_queue_cost * weight
         else:
-            self.total_cost_small_packet += packet.total_queue_cost
+            self.total_cost_small_packet += packet.total_queue_cost * weight
 
     def _on_packet_dropped(self, packet: "DataBlock"):
         """Update stats for a dropped packet."""
-        self.num_packets_dropped += 1
+        weight = getattr(packet, "packet_count", 1)
+        self.num_packets_dropped += weight
         if packet.is_normal_packet:
-            self.num_normal_packet_packets_dropped += 1
+            self.num_normal_packet_packets_dropped += weight
         else:
-            self.num_small_packet_packets_dropped += 1
+            self.num_small_packet_packets_dropped += weight
 
         if packet.drop_reason == NetworkError.TTL_EXPIRED:
-            self.num_packets_dropped_by_ttl += 1
+            self.num_packets_dropped_by_ttl += weight
 
     def calc_metrics(self) -> Metrics:
         """Calculates and returns a dictionary of performance metrics."""

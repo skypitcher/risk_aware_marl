@@ -51,9 +51,9 @@ class Link:
         self.max_load_factor = 0.0
         self.max_queueing_delay = 0
 
-    def get_queue_length_to_destination(self, destination: int) -> float:
-        """Get the total size of packets in queue destined for a specific destination."""
-        return sum(p.size for t, p in self.queue if p.target_id == destination)
+    def get_queue_length_to_region(self, target_region_id: int) -> float:
+        """Get the total size of queued flowlets destined for a target region."""
+        return sum(p.size for _t, p in self.queue if p.target_region_id == target_region_id)
 
     def get_busy_time_remaining(self, current_time: float) -> float:
         if self.link_free_time < current_time:

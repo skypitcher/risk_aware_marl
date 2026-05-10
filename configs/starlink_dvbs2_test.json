@@ -1,7 +1,17 @@
 {
     "time_limit_seconds": 30,
-    "traffic_type": "poisson",
-    "poisson_traffic_rate": 10,
+    "traffic": {
+        "region_file": "configs/traffic_regions_world.json",
+        "population_map_path": null,
+        "grid_lat_bins": 36,
+        "grid_lon_bins": 72,
+        "max_regions": 512,
+        "population_channel": "luma",
+        "packet_rate_per_ms": 10,
+        "flowlet_interval_ms": 10,
+        "mean_packets_per_flowlet": 32,
+        "access_data_rate": 1.0
+    },
     "prob_normal_packet": 0.8,
     "small_packet_size": 0.016,
     "normal_packet_size": 0.064,
@@ -25,25 +35,6 @@
         "link_buffer_size": 16.0,
         "gsl_data_rate": 1.0,
         "isl_data_rate": 0.05,
-        "ground_stations": [
-            {
-                "name": "Beijing",
-                "latitude": 39.9087,
-                "longitude": 116.3975,
-                "population": 10
-            },
-            {
-                "name": "Luxembourg",
-                "latitude": 49.6116,
-                "longitude": 6.1319,
-                "population": 10
-            },
-            {
-                "name": "Dubai",
-                "latitude": 25.2769,
-                "longitude": 55.2962,
-                "population": 10
-            }
-        ]
+        "ground_stations": []
     }
 }

@@ -4,6 +4,7 @@ from sat_net.network import SatelliteNetwork
 from sat_net.node import GroundStation, Node, Satellite
 from sat_net.routing_env import RoutingEnvAsync
 from sat_net.solver import SPF, MaDQN, MaIQN, MaSAC, PrimalAvg, PrimalCVaR
+from sat_net.traffic_region import TrafficRegion, TrafficRegionModel
 from sat_net.util import ms2str
 
 __all__ = [
@@ -21,4 +22,6 @@ __all__ = [
     "PrimalAvg",
     "PrimalCVaR",
     "RoutingEnvAsync",
+    "TrafficRegion",
+    "TrafficRegionModel",
 ]

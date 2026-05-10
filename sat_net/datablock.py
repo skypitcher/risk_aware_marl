@@ -8,39 +8,48 @@ from sat_net.util import NamedDict, NetworkError
 
 class DataBlock:
     """
-    Represents a data block, the collection of packets with the same source and destination.
+    Represents a traffic flowlet with the same source region and target region.
     """
 
     def __init__(
         self,
         block_id: int,
-        source: int,
-        target: int,
+        source: int | None,
         is_normal: bool,
         size: float,
         delay_limit: float,
         creation_time: float,
         ttl: int = 64,
+        source_region_id: int | None = None,
+        target_region_id: int | None = None,
+        packet_count: int = 1,
+        packet_size: float | None = None,
     ):
         """
         Initialize a new DataBlock.
 
         Args:
             block_id: Unique identifier for the DataBlock.
-            source: Node ID where the DataBlock originates.
-            target: Node ID where the DataBlock is heading.
+            source: Current access satellite ID, if the flowlet has entered the network.
             is_normal: Whether the DataBlock is an normal sized one.
             size: Size of the DataBlock, in Megabits.
             creation_time: Time when the DataBlock was created.
-            ttl: Time to live (max hop count before DataBlock is dropped).
             delay_limit: QoS delay requirement in milliseconds.
             ttl: Time to live (max hop count before DataBlock is dropped).
         """
-        assert source != target, "Source and target cannot be the same"
+        if source_region_id is not None and target_region_id is not None:
+            assert (
+                source_region_id != target_region_id
+            ), "Source and target regions cannot be the same"
 
         self.id = block_id
         self.source_id = source
-        self.target_id = target
+        self.source_region_id = source_region_id
+        self.target_region_id = target_region_id
+        self.packet_count = max(1, int(packet_count))
+        self.packet_size = (
+            float(packet_size) if packet_size is not None else float(size) / self.packet_count
+        )
         self.is_normal_packet = is_normal
         self.size = size #Mbits
         self.creation_time = creation_time  # Timestamp in milliseconds
@@ -59,7 +68,7 @@ class DataBlock:
         self.drop_reason: NetworkError | None = None  # Reason for dropping the DataBlock
 
 
-        # great circle distance to the target ground station in degrees
+        # Great-circle distance to the target region in kilometers.
         self.initial_gcd: float = 0.0
         self.shortest_gcd: float = 0.0
 
@@ -134,7 +143,10 @@ class DataBlock:
         return {
             "packet_id": self.id,
             "source_id": self.source_id,
-            "target_id": self.target_id,
+            "source_region_id": self.source_region_id,
+            "target_region_id": self.target_region_id,
+            "packet_count": self.packet_count,
+            "packet_size": self.packet_size,
             "is_normal_packet": self.is_normal_packet,
             "size": self.size,
             "creation_time": self.creation_time,
@@ -156,7 +168,11 @@ class DataBlock:
         }
 
     def __repr__(self) -> str:
-        return f"DataBlock(id={self.id}, src={self.source_id}, dst={self.target_id}, cur_loc={self.current_location}, size={self.size}, ttl={self.ttl})"
+        return (
+            f"DataBlock(id={self.id}, src={self.source_id}, "
+            f"src_region={self.source_region_id}, dst_region={self.target_region_id}, "
+            f"cur_loc={self.current_location}, size={self.size}, ttl={self.ttl})"
+        )
 
     def __eq__(self, other: "DataBlock") -> bool:
         """

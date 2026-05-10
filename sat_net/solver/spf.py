@@ -6,6 +6,7 @@ if TYPE_CHECKING:
     from sat_net.datablock import DataBlock
     from sat_net.network import SatelliteNetwork
     from sat_net.node import Node
+    from sat_net.traffic_region import TrafficRegion
 
 from sat_net.solver.base_solver import BaseSolver
 
@@ -29,13 +30,21 @@ class SPF(BaseSolver):
         _action_mask: np.ndarray = info["action_mask"]
 
         current_node_id = packet.current_location
-        target_id = packet.target_id
+        target_access_sat_id = self._resolve_target_access_satellite(
+            network=network,
+            info=info,
+        )
+        if target_access_sat_id is None:
+            return None, None
 
-        if current_node_id == target_id:
+        if current_node_id == target_access_sat_id:
             # The DataBlock is already at its destination
-            return None
+            return None, None
 
-        path_weight, path = network.get_shortest_path(current=current_node_id, sink=target_id)
+        _path_weight, path = network.get_shortest_path(
+            current=current_node_id,
+            sink=target_access_sat_id,
+        )
 
         # If a path exists and has more than one node (i.e., not just the source)
         if path and len(path) > 1:
@@ -45,11 +54,25 @@ class SPF(BaseSolver):
                 if neighbor_id == next_hop:
                     return i, None
 
-            raise ValueError(f"Invalid next hop: {next_hop} for node {node.id} {node.name}, action_list: {action_list}")
+            raise ValueError(
+                f"Invalid next hop: {next_hop} for node {node.id} {node.name}, "
+                f"action_list: {action_list}"
+            )
         else:
             # No path found or path is just the source node
             return None, None
-    
+
+    def _resolve_target_access_satellite(
+        self,
+        network: "SatelliteNetwork",
+        info: dict,
+    ) -> int | None:
+        target_region: "TrafficRegion" = info["target_region"]
+        target_sat, _distance = network.get_nearest_satellite_for_position(
+            target_region.position
+        )
+        return target_sat.id if target_sat is not None else None
+
     def is_train(self):
         """Check if the solver is in training mode."""
         return False

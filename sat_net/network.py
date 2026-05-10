@@ -453,6 +453,36 @@ class SatelliteNetwork(Network):
         slant_range = distance_between(gs.position, sat.position)
         return slant_range <= self.max_gsl_range
 
+    def get_visible_satellites_for_position(
+        self,
+        position: np.ndarray,
+        max_count: int | None = None,
+    ) -> list[tuple[Satellite, float]]:
+        """Return visible satellites for an arbitrary terrestrial position."""
+        candidates = []
+        for sat in self.satellites.values():
+            distance = distance_between(position, sat.position)
+            if distance <= self.max_gsl_range:
+                candidates.append((sat, distance))
+        candidates.sort(key=lambda item: item[1])
+        if max_count is not None:
+            return candidates[:max_count]
+        return candidates
+
+    def get_nearest_satellite_for_position(
+        self, position: np.ndarray
+    ) -> tuple[Satellite, float] | tuple[None, None]:
+        """Return the nearest currently visible satellite for an arbitrary terrestrial position."""
+        candidates = self.get_visible_satellites_for_position(position, max_count=1)
+        return candidates[0] if candidates else (None, None)
+
+    def can_satellite_serve_position(self, sat_id: int, position: np.ndarray) -> bool:
+        """Check whether a satellite can currently serve an arbitrary terrestrial position."""
+        sat = self.satellites.get(sat_id)
+        if sat is None:
+            return False
+        return distance_between(position, sat.position) <= self.max_gsl_range
+
     def is_satellite(self, node_id: int) -> bool:
         """Check if a node is a satellite."""
         return node_id in self.satellites

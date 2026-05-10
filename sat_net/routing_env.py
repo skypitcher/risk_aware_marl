@@ -1,4 +1,5 @@
 import random
+from pathlib import Path
 from typing import Callable, Optional
 
 import numpy as np
@@ -7,23 +8,17 @@ from torch.utils.tensorboard import SummaryWriter
 
 from sat_net.datablock import DataBlock
 from sat_net.event import Event, EventScheduler, EventType
+from sat_net.geometric import LIGHT_SPEED_MS, great_circle_distance
 from sat_net.link import Link
 from sat_net.network import SatelliteNetwork
-from sat_net.node import GroundStation, Node
+from sat_net.node import Node
 from sat_net.solver.base_solver import BaseSolver
 from sat_net.stats import Metrics, Stats
+from sat_net.traffic_region import TrafficRegion, TrafficRegionModel
 from sat_net.util import NamedDict, NetworkError, ms2str
 
 
-def _calculate_gs_population_weights(
-    ground_stations: list["GroundStation"],
-) -> list[float]:
-    """Calculate and store population-based weights for ground station selection."""
-    if not ground_stations:
-        return []
-
-    total_population = sum([max(gs.population, 0.001) for gs in ground_stations])
-    return [max(gs.population, 0.001) / total_population for gs in ground_stations]
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
 
 class RoutingEnvAsync:
@@ -48,18 +43,14 @@ class RoutingEnvAsync:
 
         self.network = self._create_network()
         self.ground_stations = list(self.network.ground_stations.values())
-        self.target_ground_station_list: dict[int, list[GroundStation]] = {}
-        for s in self.ground_stations:
-            target_list = []
-            for t in self.ground_stations:
-                if t.id != s.id:
-                    target_list.append(t)
-            self.target_ground_station_list[s.id] = target_list
-
-        self.traffic_type: str = self.config.traffic_type
-        assert self.traffic_type in ["poisson", "concurrent"]
-
-        self.poisson_traffic_rate: float = self.config.poisson_traffic_rate
+        self.traffic_config: NamedDict = self.config.traffic
+        self.traffic_model = TrafficRegionModel.from_config(self.traffic_config, PROJECT_ROOT)
+        self.packet_rate_per_ms: float = self.traffic_config.get("packet_rate_per_ms", 1.0)
+        self.flowlet_interval_ms: float = self.traffic_config.get("flowlet_interval_ms", 10.0)
+        self.mean_packets_per_flowlet: float = self.traffic_config.get("mean_packets_per_flowlet", 16.0)
+        self.access_data_rate: float = self.traffic_config.get(
+            "access_data_rate", self.network_config.gsl_data_rate
+        )
         self.prob_normal_packet: float = self.config.prob_normal_packet
         self.normal_packet_size = self.config.normal_packet_size
         self.small_packet_size = self.config.small_packet_size
@@ -91,10 +82,6 @@ class RoutingEnvAsync:
         self.generated_packets: list[DataBlock] = []
         self.delivered_packets: list[DataBlock] = []
         self.dropped_packets: list[DataBlock] = []
-        self.gs_population_weights: list[float] = []
-        self.gs_population_weights = _calculate_gs_population_weights(
-            self.ground_stations
-        )
 
     def _create_network(self):
         """Create the network based on the configuration."""
@@ -134,16 +121,6 @@ class RoutingEnvAsync:
         self.network = self._create_network()
 
         self.ground_stations = list(self.network.ground_stations.values())
-        self.target_ground_station_list = {}
-        for s in self.ground_stations:
-            target_list = []
-            for t in self.ground_stations:
-                if t.id != s.id:
-                    target_list.append(t)
-            self.target_ground_station_list[s.id] = target_list
-        self.gs_population_weights = _calculate_gs_population_weights(
-            self.ground_stations
-        )
 
         self.topology_update_steps = 0
         self.scheduler.reset()
@@ -161,7 +138,12 @@ class RoutingEnvAsync:
         self.current_time = self.start_time
         self.network.update_topology(self.start_time, None)
 
-    def run(self, solver: "BaseSolver", debug_callback: Optional[Callable] = None, callback_interval_ms: int = 0):
+    def run(
+        self,
+        solver: "BaseSolver",
+        debug_callback: Optional[Callable] = None,
+        callback_interval_ms: int = 0,
+    ):
         """
         Run the simulation until the termination condition is met.
 
@@ -204,12 +186,7 @@ class RoutingEnvAsync:
                 event_type=EventType.DEBUG_CALLBACK_EVENT,
                 time=self.current_time + callback_interval_ms,
             )
-        if self.traffic_type == "poisson":
-            self._inject_poisson_traffic(
-                lam=self.poisson_traffic_rate, interval_ms=self.time_limit
-            )
-        else:
-            raise ValueError(f"Unsupported traffic type: {self.traffic_type}")
+        self._schedule_region_flowlet_traffic(interval_ms=self.time_limit)
 
         event_count = 0
         while not self.scheduler.is_empty():
@@ -287,6 +264,11 @@ class RoutingEnvAsync:
         packet: DataBlock = event.data
         packet.last_event = None
 
+        if packet.source_id is None:
+            if not self._attach_flowlet_to_access_satellite(packet):
+                self._drop_data_block(packet, NetworkError.NO_AVAIABLE_SAT, current_node=None)
+                return
+
         receiver = self.network.nodes[packet.source_id]
 
         packet.current_location = packet.source_id
@@ -353,17 +335,6 @@ class RoutingEnvAsync:
             self._drop_data_block(packet, error=reason_if_failed, current_node=receiver)
             return
 
-        # Packet is delivered
-        if receiver.id == packet.target_id:
-            assert receiver.recv_buffer.remove(packet.id)
-            packet.delivered = True
-            packet.delivery_time = self.current_time
-
-            self.delivered_packets.append(packet)
-            self.stats.on_packet_finished(packet)
-
-            return
-
         if packet.ttl <= 0:
             self._drop_data_block(
                 packet, error=NetworkError.TTL_EXPIRED, current_node=receiver
@@ -382,59 +353,27 @@ class RoutingEnvAsync:
 
         assert packet.current_location == current_node.id
 
-        source_gs = self.network.ground_stations[packet.source_id]
-        target_gs = self.network.ground_stations[packet.target_id]
-
-        # we are still on the source ground station
-        if current_node.id == source_gs.id:
-            is_handled = False
-            
-            for l_g2s in source_gs.outgoing_links.values():
-                if l_g2s.get_remaining_capacity() >= packet.size:
-                    current_gcd = current_node.get_great_circle_distance_to(target_gs)
-                    if current_gcd < packet.shortest_gcd:
-                        packet.shortest_gcd = current_gcd
-                    self._forward_data_block(current_node, packet, l_g2s.sink.id)
-                    is_handled = True
-                    break
-            
-            if not is_handled:
-                self._drop_data_block(
-                    packet,
-                    error=NetworkError.NO_AVAIABLE_SAT,
-                    current_node=current_node,
-                )
-            return
-
         assert (
             current_node.id in self.network.satellites
         ), f"Node {current_node.id} is not a satellite"
 
-        if packet.first_gsl_delay <= 0:
-            # record the time used to reach the first satellite (propagation delay + queueing delay)
-            time_used = self.current_time - packet.creation_time
-            assert (
-                time_used > 0
-            ), f"Time used to reach the first satellite is {time_used}"
-            packet.first_gsl_delay = time_used
-
         current_obs = self._get_observation(current_node, packet)
         action_mask = self._get_action_mask(current_node, packet)
+        target_region = self._target_region(packet)
 
-        # we are now on a satellite which has direct link to the target ground station
-        if target_gs.id in current_node.outgoing_links:
-            l_s2g = current_node.outgoing_links[target_gs.id]
-            if l_s2g.get_remaining_capacity() >= packet.size:
-                # Finalize the pending transition, if any
-                self._finalize_action(
-                    packet=packet,
-                    done=True,
-                    truncated=False,
-                    next_obs=current_obs,
-                    next_action_mask=action_mask,
-                    reached_goal=1,
-                )
-            self._forward_data_block(current_node, packet, l_s2g.sink.id)
+        if self._can_satellite_deliver_to_target_region(current_node.id, packet):
+            packet.final_gsl_delay = self._region_access_delay(
+                current_node, target_region, packet
+            )
+            self._finalize_action(
+                packet=packet,
+                done=True,
+                truncated=False,
+                next_obs=current_obs,
+                next_action_mask=action_mask,
+                reached_goal=1,
+            )
+            self._deliver_data_block(current_node, packet)
             return
 
         # Finalize the pending transition, if any
@@ -464,6 +403,7 @@ class RoutingEnvAsync:
             "network": self.network,
             "action_mask": action_mask,
             "action_list": action_list,
+            "target_region": target_region,
         }
 
         # Forward to the next hop, determined by the solver
@@ -471,7 +411,14 @@ class RoutingEnvAsync:
             obs=current_obs, info=info
         )
 
-        assert chosen_action is not None
+        if chosen_action is None:
+            self._drop_data_block(
+                packet,
+                error=NetworkError.FAILED_TO_FIND_NEXT_HOP,
+                current_node=current_node,
+            )
+            return
+
         assert packet.last_action is None
 
         packet.last_action_time = self.current_time
@@ -543,11 +490,17 @@ class RoutingEnvAsync:
         packet.drop_time = self.current_time
         packet.drop_reason = error
 
+        if current_node is not None and packet.id in current_node.recv_buffer:
+            current_node.recv_buffer.remove(packet.id)
+
+        self.dropped_packets.append(packet)
         self.stats.on_packet_finished(packet)
 
         if packet.last_action is not None:
             if current_obs is None:
                 if current_node is None:
+                    if packet.current_location is None:
+                        return
                     current_node = self.network.satellites[packet.current_location]
                 current_obs = self._get_observation(current_node, packet)
 
@@ -585,9 +538,9 @@ class RoutingEnvAsync:
             return
 
         current_node = self.network.nodes[packet.current_location]
-        target_gs = self.network.ground_stations[packet.target_id]
+        target_region = self._target_region(packet)
 
-        current_gcd = current_node.get_great_circle_distance_to(target_gs)
+        current_gcd = self._great_circle_distance_to_region(current_node, target_region)
         current_progress = current_gcd / packet.initial_gcd
         progress_gain = max(0, packet.shortest_gcd - current_gcd)
         # 0=no (normalized) progress gain, (0,1]=progress gain achieved by approaching the goal
@@ -637,12 +590,7 @@ class RoutingEnvAsync:
         packet.last_action_time = None
 
     def _get_action_mask(self, node: "Node", packet: "DataBlock"):
-        if node.id in self.network.ground_stations:
-            return np.ones(self.action_dim), [-1] * 4
-
         action_map = self._get_action_list(node)
-
-        target_gs = self.network.ground_stations[packet.target_id]
 
         # action_mask is a list of 0s and 1s, 1s mean the action is enabled
         action_mask = np.zeros(len(action_map), dtype=np.int8)
@@ -652,8 +600,8 @@ class RoutingEnvAsync:
             if link is None or not link.is_connected:
                 continue
 
-            if sink_id not in target_gs.outgoing_links:
-                if len(packet.path) > 0 and packet.path[-1] == sink_id:
+            if not self._can_satellite_deliver_to_target_region(sink_id, packet):
+                if len(packet.path) >= 2 and packet.path[-2] == sink_id:
                     continue  # avoid direct loop back unless it is the target
 
             action_mask[idx] = 1  # enable the action
@@ -672,10 +620,10 @@ class RoutingEnvAsync:
     def _get_observation(self, current_node: "Node", packet: "DataBlock") -> np.ndarray:
         assert current_node.id in self.network.satellites
 
-        target_gs = self.network.ground_stations[packet.target_id]
+        target_region = self._target_region(packet)
 
         current_pos = current_node.position / self.network.orbit_radius
-        target_pos = target_gs.position / self.network.orbit_radius
+        target_pos = target_region.position / self.network.orbit_radius
 
         relative_pos = current_pos - target_pos
         relative_distance = float(np.linalg.norm(relative_pos))
@@ -684,7 +632,7 @@ class RoutingEnvAsync:
         orbit_cycle = int(self.network.orbit_cycle * 1000)
         time_prog = (self.current_time % orbit_cycle) / orbit_cycle
 
-        current_gcd = current_node.get_great_circle_distance_to(target_gs)
+        current_gcd = self._great_circle_distance_to_region(current_node, target_region)
         current_progress = current_gcd / packet.initial_gcd
 
         # knowledge on the action history
@@ -754,11 +702,15 @@ class RoutingEnvAsync:
             sink_relative_pos = sink_pos - target_pos
             sink_relative_distance = float(np.linalg.norm(sink_relative_pos))
 
-            sink_gcd = link.sink.get_great_circle_distance_to(target_gs)
+            sink_gcd = self._great_circle_distance_to_region(link.sink, target_region)
             progress_sink = sink_gcd / packet.initial_gcd
 
             has_enough_capacity = 0 if link_remaining_capacity < packet.size else 1
-            is_target_access_sat = 1 if link.sink.id in target_gs.outgoing_links else 0
+            is_target_access_sat = (
+                1
+                if self._can_satellite_deliver_to_target_region(link.sink.id, packet)
+                else 0
+            )
             possibly_looped = (
                 1 if next_hop == last_node1 or next_hop == last_node2 else 0
             )
@@ -802,79 +754,138 @@ class RoutingEnvAsync:
             end=end,
         )
 
-    def _inject_poisson_traffic(self, lam: float, interval_ms: float):
+    def _target_region(self, packet: "DataBlock") -> TrafficRegion:
+        return self.traffic_model.get(packet.target_region_id)
+
+    def _source_region(self, packet: "DataBlock") -> TrafficRegion:
+        return self.traffic_model.get(packet.source_region_id)
+
+    def _great_circle_distance_to_region(self, node: "Node", region: TrafficRegion) -> float:
+        lon1, lat1 = node.get_projected_position()
+        return great_circle_distance(lon1, lat1, region.longitude, region.latitude)
+
+    def _region_to_region_distance(self, source: TrafficRegion, target: TrafficRegion) -> float:
+        return great_circle_distance(source.longitude, source.latitude, target.longitude, target.latitude)
+
+    def _can_satellite_deliver_to_target_region(self, sat_id: int, packet: "DataBlock") -> bool:
+        return self.network.can_satellite_serve_position(sat_id, self._target_region(packet).position)
+
+    def _region_access_delay(self, sat: "Node", region: TrafficRegion, packet: "DataBlock") -> float:
+        propagation_delay, transmit_delay = self._region_access_delay_components(sat, region, packet)
+        return propagation_delay + transmit_delay
+
+    def _region_access_delay_components(
+        self, sat: "Node", region: TrafficRegion, packet: "DataBlock"
+    ) -> tuple[float, float]:
+        distance = float(np.linalg.norm(sat.position - region.position))
+        propagation_delay = distance / LIGHT_SPEED_MS
+        transmit_delay = packet.size / self.access_data_rate if self.access_data_rate > 0 else 0.0
+        return propagation_delay, transmit_delay
+
+    def _attach_flowlet_to_access_satellite(self, packet: "DataBlock") -> bool:
+        source_region = self._source_region(packet)
+        source_sat, _source_distance = self.network.get_nearest_satellite_for_position(source_region.position)
+        if source_sat is None:
+            return False
+
+        target_region = self._target_region(packet)
+
+        packet.source_id = source_sat.id
+        source_prop_delay = (_source_distance / LIGHT_SPEED_MS) if _source_distance else 0.0
+        source_tx_delay = packet.size / self.access_data_rate if self.access_data_rate > 0 else 0.0
+        packet.first_gsl_delay = source_prop_delay + source_tx_delay
+        packet.e2e_delay += packet.first_gsl_delay
+        packet.propagation_delay += source_prop_delay
+        packet.transmission_delay += source_tx_delay
+        packet.initial_gcd = self._region_to_region_distance(source_region, target_region)
+        if packet.initial_gcd <= 0:
+            packet.initial_gcd = 1e-6
+        packet.shortest_gcd = packet.initial_gcd
+        return True
+
+    def _deliver_data_block(self, receiver: "Node", packet: "DataBlock"):
+        assert receiver.recv_buffer.remove(packet.id)
+        final_prop_delay, final_tx_delay = self._region_access_delay_components(
+            receiver, self._target_region(packet), packet
+        )
+        packet.final_gsl_delay = final_prop_delay + final_tx_delay
+        packet.delivered = True
+        packet.delivery_time = self.current_time + packet.final_gsl_delay
+        packet.e2e_delay += packet.final_gsl_delay
+        packet.propagation_delay += final_prop_delay
+        packet.transmission_delay += final_tx_delay
+
+        self.delivered_packets.append(packet)
+        self.stats.on_packet_finished(packet)
+
+    def _schedule_region_flowlet_traffic(self, interval_ms: float):
         """
-        Generate Poisson traffic with the given lambda for the incoming topology update interval.
+        Schedule population-driven flowlets over the full simulation window.
 
-        Args:
-            lam: Lambda parameter for the Poisson distribution (number of packets per millisecond)
-            interval_ms: Interval in milliseconds for the traffic generation
-
-        Returns:
-            Number of packets generated
+        Each DataBlock represents a batch of packets with the same source region,
+        destination region, traffic class, and generation time bin.
         """
-        if not self.ground_stations or len(self.ground_stations) < 2:
-            raise RuntimeError(
-                "Cannot generate data block - insufficient ground stations or weights."
-            )
-
-        num_packets_generated = 0
-        expected_num_packets = lam * interval_ms
-        num_packets = int(self.np_random.poisson(lam=expected_num_packets))
-        time_offsets = self.np_random.uniform(low=0, high=interval_ms, size=num_packets)
-        source_idx_array = self.np_random.integers(
-            low=0, high=len(self.ground_stations), size=num_packets
-        )
-        target_idx_array = self.np_random.integers(
-            low=0, high=len(self.ground_stations) - 1, size=num_packets
-        )
-        is_normal_array = (
-            self.np_random.uniform(size=num_packets) < self.prob_normal_packet
+        num_flowlets_generated = 0
+        num_bins = int(np.ceil(interval_ms / self.flowlet_interval_ms))
+        expected_flowlets_per_bin = (
+            self.packet_rate_per_ms
+            * self.flowlet_interval_ms
+            / max(self.mean_packets_per_flowlet, 1.0)
         )
 
-        for i in range(num_packets):
-            packet_creation_time = self.current_time + float(time_offsets[i])
-            source_idx = int(source_idx_array[i])
-            target_idx = int(target_idx_array[i])
-            source_gs = self.ground_stations[source_idx]
-            target_gs = self.target_ground_station_list[source_gs.id][target_idx]
-
-            assert target_gs.id != source_gs.id
-            is_normal = is_normal_array[i]
-            delay_tolerance = (
-                self.normal_packet_delay_limit
-                if is_normal
-                else self.small_packet_delay_limit
+        for bin_idx in range(num_bins):
+            bin_start = self.current_time + bin_idx * self.flowlet_interval_ms
+            bin_end = min(
+                self.current_time + interval_ms,
+                bin_start + self.flowlet_interval_ms,
             )
-            if is_normal:
-                size = self.normal_packet_size
-            else:
-                size = self.small_packet_size
+            if bin_end <= bin_start:
+                continue
 
-            packet = DataBlock(
-                block_id=self.next_packet_id,
-                source=source_gs.id,
-                target=target_gs.id,
-                is_normal=is_normal,
-                size=size,
-                delay_limit=delay_tolerance,
-                creation_time=packet_creation_time,
-                ttl=self.default_ttl,
+            num_flowlets = int(self.np_random.poisson(lam=expected_flowlets_per_bin))
+            if num_flowlets <= 0:
+                continue
+
+            source_region_ids = self.traffic_model.sample_source_ids(self.np_random, num_flowlets)
+            target_region_ids = self.traffic_model.sample_target_ids(self.np_random, source_region_ids)
+            is_normal_array = self.np_random.uniform(size=num_flowlets) < self.prob_normal_packet
+            creation_times = self.np_random.uniform(low=bin_start, high=bin_end, size=num_flowlets)
+            packet_counts = np.maximum(
+                1,
+                self.np_random.poisson(lam=self.mean_packets_per_flowlet, size=num_flowlets),
             )
-            packet.initial_gcd = source_gs.get_great_circle_distance_to(target_gs)
-            packet.shortest_gcd = packet.initial_gcd
 
-            packet.last_event = self.scheduler.push_event(
-                event_type=EventType.DATA_GENERATED,
-                time=packet.creation_time,
-                data=packet,
-            )
-            self.generated_packets.append(packet)
-            self.next_packet_id += 1
-            self.stats.on_packet_generated(packet)
+            for i in range(num_flowlets):
+                is_normal = bool(is_normal_array[i])
+                packet_size = self.normal_packet_size if is_normal else self.small_packet_size
+                delay_tolerance = self.normal_packet_delay_limit if is_normal else self.small_packet_delay_limit
+                packet_count = int(packet_counts[i])
 
-            num_packets_generated += 1
-        return num_packets_generated
+                packet = DataBlock(
+                    block_id=self.next_packet_id,
+                    source=None,
+                    source_region_id=int(source_region_ids[i]),
+                    target_region_id=int(target_region_ids[i]),
+                    packet_count=packet_count,
+                    packet_size=packet_size,
+                    is_normal=is_normal,
+                    size=packet_size * packet_count,
+                    delay_limit=delay_tolerance,
+                    creation_time=float(creation_times[i]),
+                    ttl=self.default_ttl,
+                )
+
+                packet.last_event = self.scheduler.push_event(
+                    event_type=EventType.DATA_GENERATED,
+                    time=packet.creation_time,
+                    data=packet,
+                )
+                self.generated_packets.append(packet)
+                self.next_packet_id += 1
+                self.stats.on_packet_generated(packet)
+                num_flowlets_generated += 1
+
+        return num_flowlets_generated
 
     def save_packets_to_csv(self, file_path: str):
         generated_data = []
