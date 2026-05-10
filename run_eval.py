@@ -11,6 +11,7 @@ from datetime import datetime
 import pandas as pd
 
 from sat_net.agent import BaseAgent, create_agent
+from sat_net.config import DEFAULT_MAIN_CONFIG, eval_agent_paths, load_config, load_env_config, merge_section
 from sat_net.pipeline import run_marl_episode
 from sat_net.routing_env import RoutingEnv
 from sat_net.util import NamedDict
@@ -75,14 +76,26 @@ def load_agent_from(env: RoutingEnv, saved_path: str):
 
 
 def main():
+    eval_defaults = {
+        "config": DEFAULT_MAIN_CONFIG,
+        "env": None,
+        "agent": None,
+        "model": [],
+        "eval_seed": 3333,
+        "num_eval_seeds": 5,
+        "runs_dir": "runs_eval",
+    }
     parser = argparse.ArgumentParser()
-    parser.add_argument("--env", type=str, default="configs/starlink_dvbs2_test.json")
+    parser.add_argument("--config", type=str, default=DEFAULT_MAIN_CONFIG)
+    parser.add_argument("--env", type=str, default=None)
     parser.add_argument("--agent", action="append", default=None)
     parser.add_argument("--model", action="append", default=[])
-    parser.add_argument("--eval_seed", type=int, default=3333)
-    parser.add_argument("--num_eval_seeds", type=int, default=5)
-    parser.add_argument("--runs_dir", type=str, default="runs_eval")
-    args = parser.parse_args()
+    parser.add_argument("--eval_seed", type=int, default=None)
+    parser.add_argument("--num_eval_seeds", type=int, default=None)
+    parser.add_argument("--runs_dir", type=str, default=None)
+    parsed_args = parser.parse_args()
+    main_config = load_config(parsed_args.config)
+    args = merge_section(eval_defaults, main_config, "eval", vars(parsed_args))
 
     run_id = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
     runs_dir = os.path.join(PROJECT_ROOT, args.runs_dir)
@@ -91,11 +104,13 @@ def main():
     print(f"LOG_DIR: {log_dir}")
     setup_logging(log_dir)
 
-    env_config = NamedDict.load(args.env)
+    env_config = load_env_config(main_config, split="eval", override_path=args.env)
+    main_config.save(os.path.join(log_dir, "main_config.json"))
+    env_config.save(os.path.join(log_dir, "env_config.json"))
     logging.info("env_config: %s", env_config.to_string())
     env = RoutingEnv(env_config, tf_writer=None)
 
-    agent_config_paths = args.agent if args.agent else ["configs/spf.json"]
+    agent_config_paths = eval_agent_paths(main_config, overrides=args.agent)
     agents = [
         create_agent(
             NamedDict.load(agent_config_path),

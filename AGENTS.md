@@ -19,14 +19,14 @@ Run core workflows from the repository root:
 ```bash
 python run_spf.py
 python run_eval.py
-python run_train.py --agent=configs/dqn.json --num_epochs=1 --eval_interval=0
+python run_train.py --config=configs/main.json --agent=configs/agents/madqn.json --num_epochs=1 --eval_interval=0
 ```
 
 Use `python -m compileall sat_net *.py` as a fast syntax check before longer simulations.
 
 ## Coding Style & Naming Conventions
 
-Use Python with 4-space indentation and type hints where they clarify simulator contracts. Keep modules focused around existing boundaries: environment logic in `routing_env.py`, graph/topology logic in `network.py`, and batched agent code under `sat_net/agent/`. Follow existing naming patterns: classes use `PascalCase`, functions and variables use `snake_case`, and config files use descriptive lowercase names such as `spf.json`. `.pylintrc` allows 120-character lines and disables docstring and strict naming warnings; run `pylint sat_net run_train.py run_eval.py` when changing shared code.
+Use Python with 4-space indentation and type hints where they clarify simulator contracts. Keep modules focused around existing boundaries: environment logic in `routing_env.py`, graph/topology logic in `network.py`, and batched agent code under `sat_net/agent/`. Follow existing naming patterns: classes use `PascalCase`, functions and variables use `snake_case`, and config files use descriptive lowercase names such as `configs/agents/spf.json`. `.pylintrc` allows 120-character lines and disables docstring and strict naming warnings; run `pylint sat_net run_train.py run_eval.py` when changing shared code.
 
 ## Testing Guidelines
 

@@ -1,7 +1,7 @@
 {
-    "time_limit_seconds": 30,
+    "time_limit_seconds": 60,
     "traffic": {
-        "region_file": "configs/traffic_regions_world.json",
+        "region_file": "configs/traffic/world_regions.json",
         "population_map_path": "assets/population/worldpop_total_population_2020_1440x720.npy",
         "grid_lat_bins": 36,
         "grid_lon_bins": 72,

@@ -16,6 +16,7 @@ import numpy as np
 from sat_net.routing_env import RoutingEnv
 from sat_net.pipeline import evaluate_agent, run_marl_episode
 from sat_net.agent import BaseAgent, create_agent
+from sat_net.config import DEFAULT_MAIN_CONFIG, load_agent_config, load_config, load_env_config, merge_section
 from sat_net.experiment import ExperimentLogger, episode_record
 from sat_net.util import NamedDict, ms2str
 
@@ -299,32 +300,54 @@ def main():
     """
     Parses arguments, sets up the environment and agent, and starts the training process.
     """
+    train_defaults = {
+        "config": DEFAULT_MAIN_CONFIG,
+        "recover_runid": None,
+        "recover_epoch": 1,
+        "env": None,
+        "agent": None,
+        "runs_dir": "runs_train",
+        "num_epochs": 1,
+        "seed": 33333,
+        "run_id": None,
+        "eval_interval": 10,
+        "eval_after_epoch": 1,
+        "eval_seeds": "6666,7777,8888",
+        "save_interval": 1,
+        "flowlet_dump_interval": 0,
+        "selection_metric": "risk_adjusted",
+        "notes": "",
+        "archive_source": True,
+    }
     parser = argparse.ArgumentParser()
+    parser.add_argument("--config", type=str, default=DEFAULT_MAIN_CONFIG)
     parser.add_argument("--recover_runid", type=str, default=None)
     parser.add_argument("--recover_epoch", type=int, default=1)
-    parser.add_argument("--env", type=str, default="configs/starlink_dvbs2_train.json")
-    parser.add_argument("--agent", type=str, default="configs/dqn.json")
-    parser.add_argument("--num_epochs", type=int, default=1)
-    parser.add_argument("--seed", type=int, default=33333)
+    parser.add_argument("--env", type=str, default=None)
+    parser.add_argument("--agent", type=str, default=None)
+    parser.add_argument("--num_epochs", type=int, default=None)
+    parser.add_argument("--seed", type=int, default=None)
     parser.add_argument("--run_id", type=str, default=None)
-    parser.add_argument("--eval_interval", type=int, default=10)
-    parser.add_argument("--eval_after_epoch", type=int, default=1)
-    parser.add_argument("--eval_seeds", type=str, default="6666,7777,8888")
-    parser.add_argument("--save_interval", type=int, default=1)
-    parser.add_argument("--flowlet_dump_interval", type=int, default=0)
+    parser.add_argument("--runs_dir", type=str, default=None)
+    parser.add_argument("--eval_interval", type=int, default=None)
+    parser.add_argument("--eval_after_epoch", type=int, default=None)
+    parser.add_argument("--eval_seeds", type=str, default=None)
+    parser.add_argument("--save_interval", type=int, default=None)
+    parser.add_argument("--flowlet_dump_interval", type=int, default=None)
     parser.add_argument(
         "--selection_metric",
         type=str,
-        default="risk_adjusted",
+        default=None,
         choices=["throughput", "drop_rate", "e2e_delay", "cost", "risk_adjusted"],
     )
-    parser.add_argument("--notes", type=str, default="")
-    parser.add_argument("--archive_source", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--notes", type=str, default=None)
+    parser.add_argument("--archive_source", action=argparse.BooleanOptionalAction, default=None)
 
     parsed_args = parser.parse_args()
-    args = NamedDict(parsed_args)
+    main_config = load_config(parsed_args.config)
+    args = merge_section(train_defaults, main_config, "train", vars(parsed_args))
 
-    runs_dir = os.path.join(PROJECT_ROOT, "runs_train")
+    runs_dir = os.path.join(PROJECT_ROOT, args.runs_dir)
     os.makedirs(runs_dir, exist_ok=True)
 
     if args.recover_runid is not None:
@@ -341,6 +364,7 @@ def main():
         saved_args = NamedDict.load(f"{log_dir}/args.json")
         for key, value in saved_args.items():
             if key not in {
+                "config",
                 "recover_runid",
                 "recover_epoch",
                 "num_epochs",
@@ -377,8 +401,8 @@ def main():
         )
         agent.load_models(f"{log_dir}/models/last_model")
     else:
-        env_config = NamedDict.load(args.env)
-        agent_config = NamedDict.load(args.agent)
+        env_config = load_env_config(main_config, split="train", override_path=args.env)
+        agent_config = load_agent_config(main_config, override_path=args.agent)
 
         date_str = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
         run_id = args.run_id or f"{agent_config.name}_{date_str}"
@@ -393,6 +417,7 @@ def main():
         tf_writer = NullMetricWriter()
 
         logging.info("args: %s", args.to_string())
+        logging.info("main_config: %s", main_config.to_string())
         set_seeds(args.seed)
         logging.info("Using seed: %d", args.seed)
 
@@ -410,6 +435,7 @@ def main():
 
         env_config.save(os.path.join(log_dir, "env_config.json"))
         agent_config.save(os.path.join(log_dir, "agent_config.json"))
+        main_config.save(os.path.join(log_dir, "main_config.json"))
         args.save(os.path.join(log_dir, "args.json"))
         experiment.save_manifest(
             args=args,

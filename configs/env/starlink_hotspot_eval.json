@@ -1,0 +1,4 @@
+{
+    "extends": "starlink_hotspot_train.json",
+    "time_limit_seconds": 300
+}

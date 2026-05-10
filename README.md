@@ -106,8 +106,10 @@ risk_aware_marl/
 │       ├── base_agent.py       # RoutingBatch/RoutingDecision/BaseAgent contract
 │       └── spf.py              # Shortest-path baseline
 ├── configs/                    # Configuration files
-│   ├── starlink_dvbs2_*.json  # Network configurations
-│   └── spf.json                # Agent configuration
+│   ├── main.json               # Active experiment entry point
+│   ├── env/                    # Scenario and traffic configurations
+│   ├── agents/                 # SPF, MaDQN, and PRIMAL configs
+│   └── traffic/                # Fallback hand-written traffic regions
 ├── assets/population/          # Downsampled WorldPop population grid
 ├── figs/                       # Figures and plots
 └── runs_*/                     # Experiment results
@@ -127,10 +129,10 @@ python run_eval.py
 
 ### RL Training Status
 
-`run_train.py` executes agent episodes through `sat_net/pipeline.py`. Use `configs/dqn.json`, `configs/primal_avg.json`, or `configs/primal_cvar.json` to train the rebuilt MaDQN/PRIMAL baselines.
+`run_train.py` executes agent episodes through `sat_net/pipeline.py`. `configs/main.json` selects the scenario, while `configs/agents/*.json` selects the algorithm. Use `configs/agents/madqn.json`, `configs/agents/primal_avg.json`, or `configs/agents/primal_cvar.json` to train the rebuilt MaDQN/PRIMAL baselines.
 
 ```bash
-python run_train.py --agent configs/dqn.json --num_epochs 10 --eval_interval 5
+python run_train.py --config configs/main.json --agent configs/agents/madqn.json --num_epochs 10 --eval_interval 5
 ```
 
 Each run writes `manifest.json`, `summary.json`, checkpoint state, and CSV/JSONL metrics under `runs_train/<run_id>/`.

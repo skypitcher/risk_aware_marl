@@ -1,6 +1,60 @@
 import argparse
 import json
 from enum import IntEnum
+from pathlib import Path
+
+
+def deep_merge(base: dict, override: dict) -> dict:
+    """Recursively merge two JSON-like dictionaries."""
+    merged = dict(base)
+    for key, value in override.items():
+        if key == "extends":
+            continue
+        if isinstance(value, dict) and isinstance(merged.get(key), dict):
+            merged[key] = deep_merge(merged[key], value)
+        else:
+            merged[key] = value
+    return merged
+
+
+def _resolve_config_path(file_path: str | Path, parent_dir: Path | None = None) -> Path:
+    path = Path(file_path)
+    if path.is_absolute():
+        return path
+
+    if parent_dir is not None:
+        candidate = parent_dir / path
+        if candidate.exists():
+            return candidate
+
+    return Path.cwd() / path
+
+
+def load_json_config(file_path: str | Path, seen: set[Path] | None = None) -> dict:
+    """Load a JSON config, resolving optional recursive `extends` references."""
+    path = _resolve_config_path(file_path).resolve()
+    branch = set() if seen is None else set(seen)
+    if path in branch:
+        raise ValueError(f"Circular config extends detected at {path}")
+    branch.add(path)
+
+    with path.open("r", encoding="utf-8") as f:
+        data = json.load(f)
+
+    parents = data.get("extends")
+    if parents is None:
+        return data
+
+    if isinstance(parents, str):
+        parents = [parents]
+    if not isinstance(parents, list):
+        raise TypeError(f"Config extends must be a string or list: {path}")
+
+    merged: dict = {}
+    for parent in parents:
+        parent_path = _resolve_config_path(parent, parent_dir=path.parent)
+        merged = deep_merge(merged, load_json_config(parent_path, seen=branch))
+    return deep_merge(merged, data)
 
 
 def ms2str(ms: float) -> str:
@@ -83,9 +137,7 @@ class NamedDict:
     @classmethod
     def load(cls, file_path):
         """Loads configuration from a JSON file."""
-        with open(file_path, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        return cls(data)
+        return cls(load_json_config(file_path))
 
     def save(self, file_path):
         """Saves configuration to a JSON file."""

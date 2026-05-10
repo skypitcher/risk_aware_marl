@@ -271,6 +271,27 @@ def release_transmitted_flowlets(
     np.maximum(links.queue_load, 0.0, out=links.queue_load)
 
 
+def release_transmitted_flowlet_ids(
+    flowlets: FlowletState,
+    links: LinkState,
+    flowlet_ids: np.ndarray,
+    current_time: float,
+) -> None:
+    if len(flowlet_ids) == 0:
+        return
+    release_mask = (
+        (flowlets.status[flowlet_ids] == FLOWLET_ON_LINK)
+        & (~flowlets.link_released[flowlet_ids])
+        & (flowlets.transmit_end_time[flowlet_ids] <= current_time)
+    )
+    release_ids = flowlet_ids[release_mask]
+    if len(release_ids) == 0:
+        return
+    np.add.at(links.queue_load, flowlets.link_id[release_ids], -flowlets.size[release_ids])
+    flowlets.link_released[release_ids] = True
+    np.maximum(links.queue_load, 0.0, out=links.queue_load)
+
+
 def handle_flowlet_arrivals(
     flowlets: FlowletState,
     current_time: float,
@@ -311,6 +332,36 @@ def handle_flowlet_arrivals_mask(
     return arrival_mask & (~expired_mask)
 
 
+def handle_flowlet_arrival_ids(
+    flowlets: FlowletState,
+    flowlet_ids: np.ndarray,
+    current_time: float,
+    ttl_expired_reason: int,
+) -> np.ndarray:
+    if len(flowlet_ids) == 0:
+        return np.empty(0, dtype=np.int64)
+    arrival_mask = (
+        (flowlets.status[flowlet_ids] == FLOWLET_ON_LINK)
+        & (flowlets.arrival_time[flowlet_ids] <= current_time)
+    )
+    arrival_ids = flowlet_ids[arrival_mask]
+    if len(arrival_ids) == 0:
+        return arrival_ids
+
+    flowlets.current_sat[arrival_ids] = flowlets.next_sat[arrival_ids]
+    flowlets.hops[arrival_ids] += 1
+    flowlets.ttl[arrival_ids] -= 1
+    flowlets.propagation_delay[arrival_ids] += flowlets.scheduled_prop_delay[arrival_ids]
+    flowlets.queue_delay[arrival_ids] += current_time - flowlets.arrival_time[arrival_ids]
+    flowlets.status[arrival_ids] = FLOWLET_AT_NODE
+    flowlets.link_id[arrival_ids] = -1
+
+    expired_mask = flowlets.ttl[arrival_ids] <= 0
+    if expired_mask.any():
+        drop_flowlet_ids(flowlets, arrival_ids[expired_mask], current_time, ttl_expired_reason)
+    return arrival_ids[~expired_mask]
+
+
 def activate_flowlets_at_slot(
     flowlets: FlowletState,
     slot_idx: int,
@@ -333,6 +384,56 @@ def activate_flowlets_at_slot(
             no_available_sat_reason=no_available_sat_reason,
         )
     )
+
+
+def activate_flowlets_at_slot_ids(
+    flowlets: FlowletState,
+    slot_idx: int,
+    current_time: float,
+    nearest_region_sat_ids: np.ndarray,
+    nearest_region_sat_distances: np.ndarray,
+    region_distance_matrix: np.ndarray,
+    access_data_rate: float,
+    no_available_sat_reason: int,
+) -> np.ndarray:
+    if slot_idx < 0 or slot_idx + 1 >= len(flowlets.slot_offsets):
+        return np.empty(0, dtype=np.int64)
+    start = int(flowlets.slot_offsets[slot_idx])
+    end = int(flowlets.slot_offsets[slot_idx + 1])
+    if end <= start:
+        return np.empty(0, dtype=np.int64)
+
+    flowlet_ids = np.arange(start, end, dtype=np.int64)
+    source_regions = flowlets.source_region_id[flowlet_ids]
+    source_sat_ids = nearest_region_sat_ids[source_regions]
+    visible = source_sat_ids >= 0
+    if (~visible).any():
+        drop_flowlet_ids(flowlets, flowlet_ids[~visible], current_time, no_available_sat_reason)
+
+    active_ids = flowlet_ids[visible]
+    if len(active_ids) == 0:
+        return active_ids
+
+    source_sat_ids = source_sat_ids[visible]
+    source_distances = nearest_region_sat_distances[source_regions[visible]]
+    source_prop_delay = source_distances / LIGHT_SPEED_MS
+    source_tx_delay = flowlets.size[active_ids] / access_data_rate
+
+    flowlets.source_id[active_ids] = source_sat_ids
+    flowlets.current_sat[active_ids] = source_sat_ids
+    flowlets.status[active_ids] = FLOWLET_AT_NODE
+    flowlets.first_access_delay[active_ids] = source_prop_delay + source_tx_delay
+    flowlets.propagation_delay[active_ids] += source_prop_delay
+    flowlets.transmission_delay[active_ids] += source_tx_delay
+
+    initial_gcd = region_distance_matrix[
+        flowlets.source_region_id[active_ids],
+        flowlets.target_region_id[active_ids],
+    ].copy()
+    initial_gcd[initial_gcd <= 0] = 1e-6
+    flowlets.initial_gcd[active_ids] = initial_gcd
+    flowlets.shortest_gcd[active_ids] = initial_gcd
+    return active_ids
 
 
 def activate_flowlets_at_slot_mask(
@@ -570,9 +671,9 @@ def schedule_flowlets_by_link(
     link_ids: np.ndarray,
     act: np.ndarray,
     current_time: float,
-) -> np.ndarray:
+) -> tuple[np.ndarray, np.ndarray]:
     if len(flowlet_ids) == 0:
-        return np.empty(0, dtype=np.int64)
+        return np.empty(0, dtype=np.int64), np.empty(0, dtype=np.int64)
 
     order = np.argsort(link_ids, kind="stable")
     sorted_link_ids = link_ids[order]
@@ -598,7 +699,7 @@ def schedule_flowlets_by_link(
 
     rejected_ids = sorted_ids[~accepted]
     if not accepted.any():
-        return rejected_ids
+        return np.empty(0, dtype=np.int64), rejected_ids
 
     accepted_ids = sorted_ids[accepted]
     accepted_link_ids = sorted_link_ids[accepted]
@@ -651,7 +752,7 @@ def schedule_flowlets_by_link(
 
     flowlets.last_node2[accepted_ids] = flowlets.last_node1[accepted_ids]
     flowlets.last_node1[accepted_ids] = flowlets.current_sat[accepted_ids]
-    return rejected_ids
+    return accepted_ids, rejected_ids
 
 
 def drop_flowlets_on_disconnected_links(

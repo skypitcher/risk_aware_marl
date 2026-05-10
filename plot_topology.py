@@ -4,8 +4,6 @@ It plots satellites and inter-satellite links (ISL_N) on a world map.
 """
 
 import argparse
-import os
-import json
 import matplotlib.pyplot as plt
 import cartopy.crs as ccrs
 import cartopy.feature as cfeature
@@ -13,6 +11,7 @@ from cartopy.mpl.gridliner import LONGITUDE_FORMATTER, LATITUDE_FORMATTER
 
 
 from sat_net.network import SatelliteNetwork
+from sat_net.util import NamedDict
 
 # Set matplotlib to use Type 1 fonts (avoids Type 3)
 plt.rcParams["ps.useafm"] = True  # Use Adobe Font Metrics (AFM) fonts
@@ -21,8 +20,7 @@ plt.rcParams["text.usetex"] = False  # Avoid using LaTeX which may override font
 
 
 def load_config(config_path):
-    with open(config_path, "r", encoding="utf-8") as f:
-        return json.load(f)
+    return NamedDict.load(config_path).to_dict()
 
 
 def create_network(config):
@@ -147,7 +145,7 @@ def main():
     parser = argparse.ArgumentParser(description="Simple satellite network topology visualization (ISL_N only)")
     parser.add_argument(
         "--config",
-        default="configs/starlink_dvbs2_test.json",
+        default="configs/env/starlink_world_eval.json",
         help="Configuration file path",
     )
     parser.add_argument("--timestamp", type=int, default=0, help="Timestamp in milliseconds")

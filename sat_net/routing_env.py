@@ -1,3 +1,4 @@
+import heapq
 import time
 from collections.abc import Mapping
 from pathlib import Path
@@ -16,20 +17,18 @@ from sat_net.sim_kernel import (
     FLOWLET_ON_LINK,
     FlowletState,
     LinkState,
-    activate_flowlets_at_slot_mask,
+    activate_flowlets_at_slot_ids,
     build_routing_batch,
     create_flowlet_state,
     create_link_state,
     deliver_flowlet_ids,
     drop_flowlet_ids,
-    drop_flowlets_on_disconnected_links,
-    flowlet_mask_to_ids,
-    handle_flowlet_arrivals_mask,
-    partition_deliverable_flowlet_mask,
+    handle_flowlet_arrival_ids,
+    partition_deliverable_flowlets,
     apply_no_route_mask,
     prepare_link_schedule_inputs,
     prepare_route_candidate_mask,
-    release_transmitted_flowlets,
+    release_transmitted_flowlet_ids,
     schedule_flowlets_by_link,
 )
 from sat_net.stats import Metrics
@@ -119,6 +118,13 @@ class RoutingEnv:
         self._progress_interval_ms = 0.0
         self._next_progress_time = 0.0
         self._pending_routing_batch: RoutingBatch | None = None
+        self._arrival_events: dict[int, list[np.ndarray]] = {}
+        self._release_events: dict[int, list[np.ndarray]] = {}
+        self._arrival_event_heap: list[int] = []
+        self._release_event_heap: list[int] = []
+        self._on_link_id_chunks: list[np.ndarray] = []
+        self._creation_event_slots = np.empty(0, dtype=np.int64)
+        self._creation_event_cursor = 0
 
     def _create_network(self):
         """Create the network based on the configuration."""
@@ -176,6 +182,13 @@ class RoutingEnv:
         self._flowlets = None
         self._links = None
         self._pending_routing_batch = None
+        self._arrival_events = {}
+        self._release_events = {}
+        self._arrival_event_heap = []
+        self._release_event_heap = []
+        self._on_link_id_chunks = []
+        self._creation_event_slots = np.empty(0, dtype=np.int64)
+        self._creation_event_cursor = 0
         self._episode_started = False
         self._episode_done = False
 
@@ -333,31 +346,42 @@ class RoutingEnv:
             start_time=self.start_time,
             slot_ms=self.slot_ms,
         )
+        self._creation_event_slots = np.flatnonzero(slot_counts > 0).astype(np.int64, copy=False)
+        self._creation_event_cursor = 0
 
     def _release_transmitted_flowlets(self):
         if self._flowlets is None or self._links is None:
             return
-        release_transmitted_flowlets(
+        release_ids = self._pop_event_ids(self._release_events, self._step_index)
+        if len(release_ids) == 0:
+            return
+        release_transmitted_flowlet_ids(
             flowlets=self._flowlets,
             links=self._links,
+            flowlet_ids=release_ids,
             current_time=self.current_time,
         )
 
-    def _handle_flowlet_arrivals_mask(self) -> np.ndarray:
+    def _handle_flowlet_arrival_ids(self) -> np.ndarray:
         if self._flowlets is None:
-            return np.empty(0, dtype=bool)
-        return handle_flowlet_arrivals_mask(
+            return np.empty(0, dtype=np.int64)
+        arrival_ids = self._pop_event_ids(self._arrival_events, self._step_index)
+        if len(arrival_ids) == 0:
+            return arrival_ids
+        route_ready_ids = handle_flowlet_arrival_ids(
             flowlets=self._flowlets,
+            flowlet_ids=arrival_ids,
             current_time=self.current_time,
             ttl_expired_reason=int(NetworkError.TTL_EXPIRED),
         )
+        return route_ready_ids
 
-    def _activate_flowlets_at_current_slot_mask(self) -> np.ndarray:
+    def _activate_flowlets_at_current_slot_ids(self) -> np.ndarray:
         if self._flowlets is None:
-            return np.empty(0, dtype=bool)
+            return np.empty(0, dtype=np.int64)
 
         slot_idx = int(round((self.current_time - self.start_time) / self.slot_ms))
-        return activate_flowlets_at_slot_mask(
+        return activate_flowlets_at_slot_ids(
             flowlets=self._flowlets,
             slot_idx=slot_idx,
             current_time=self.current_time,
@@ -371,49 +395,91 @@ class RoutingEnv:
     def _prepare_step_observation(self) -> RoutingBatch:
         if self._flowlets is None or self._links is None:
             return self._empty_routing_batch()
-        if self._step_index >= self._num_steps:
+        while self._step_index < self._num_steps:
+            self.current_time = self.start_time + self._step_index * self.slot_ms
+            if self.current_time >= self._end_time:
+                self._episode_done = True
+                return self._empty_routing_batch()
+
+            if self.current_time >= self._next_topology_time:
+                while self.current_time >= self._next_topology_time:
+                    self._next_topology_time += self.update_interval_ms
+                self.network.update_topology(self.current_time, None)
+                self.topology_update_steps += 1
+                self._update_region_access_cache()
+                self._refresh_link_state_arrays()
+                self._drop_flowlets_on_disconnected_links()
+
+            self._release_transmitted_flowlets()
+            arrival_ids = self._handle_flowlet_arrival_ids()
+            activated_ids = self._activate_flowlets_at_current_slot_ids()
+            if len(arrival_ids) == 0:
+                route_ready_ids = activated_ids
+            elif len(activated_ids) == 0:
+                route_ready_ids = arrival_ids
+            else:
+                route_ready_ids = np.concatenate((arrival_ids, activated_ids))
+
+            batch = self._build_step_routing_batch(route_ready_ids)
+            self._maybe_print_progress()
+            if batch.decision_count > 0:
+                return batch
+
+            next_step = self._next_activity_step(self._step_index + 1)
+            if next_step <= self._step_index:
+                next_step = self._step_index + 1
+            self._step_index = next_step
+
+        self.current_time = self._end_time
+        self._episode_done = True
+        return self._empty_routing_batch()
+
+    def _maybe_print_progress(self):
+        if not (self.verbose and self._progress_interval_ms > 0 and self.current_time >= self._next_progress_time):
+            return
+        self._print_progress(
+            step=self._step_index + 1,
+            num_steps=self._num_steps,
+            wall_start_time=self._wall_start_time,
+        )
+        while self._next_progress_time <= self.current_time:
+            self._next_progress_time += self._progress_interval_ms
+
+    def _next_activity_step(self, lower_bound: int) -> int:
+        if lower_bound >= self._num_steps:
+            return self._num_steps
+        candidates = [self._num_steps]
+
+        creation_step = self._peek_creation_step(lower_bound)
+        if creation_step is not None:
+            candidates.append(creation_step)
+
+        arrival_step = self._peek_event_step(self._arrival_events, self._arrival_event_heap, lower_bound)
+        if arrival_step is not None:
+            candidates.append(arrival_step)
+
+        release_step = self._peek_event_step(self._release_events, self._release_event_heap, lower_bound)
+        if release_step is not None:
+            candidates.append(release_step)
+
+        if self._next_topology_time < self._end_time:
+            candidates.append(self._slot_index_for_time(self._next_topology_time))
+
+        if self.verbose and self._progress_interval_ms > 0 and self._next_progress_time < self._end_time:
+            candidates.append(self._slot_index_for_time(self._next_progress_time))
+
+        return max(lower_bound, min(candidates))
+
+    def _build_step_routing_batch(self, at_node_ids: np.ndarray) -> RoutingBatch:
+        if len(at_node_ids) == 0:
             return self._empty_routing_batch()
 
-        self.current_time = self.start_time + self._step_index * self.slot_ms
-        if self.current_time >= self._end_time:
-            self._episode_done = True
+        delivered_ids, route_ids = self._partition_deliverable_flowlets(at_node_ids)
+        if len(delivered_ids) > 0:
+            self._deliver_flowlet_ids(delivered_ids)
+        if len(route_ids) == 0:
             return self._empty_routing_batch()
 
-        if self.current_time >= self._next_topology_time:
-            while self.current_time >= self._next_topology_time:
-                self._next_topology_time += self.update_interval_ms
-            self.network.update_topology(self.current_time, None)
-            self.topology_update_steps += 1
-            self._update_region_access_cache()
-            self._refresh_link_state_arrays()
-            self._drop_flowlets_on_disconnected_links()
-
-        self._release_transmitted_flowlets()
-        route_ready_mask = self._handle_flowlet_arrivals_mask()
-        route_ready_mask |= self._activate_flowlets_at_current_slot_mask()
-
-        batch = self._build_step_routing_batch(route_ready_mask)
-        if self.verbose and self._progress_interval_ms > 0 and self.current_time >= self._next_progress_time:
-            self._print_progress(
-                step=self._step_index + 1,
-                num_steps=self._num_steps,
-                wall_start_time=self._wall_start_time,
-            )
-            while self._next_progress_time <= self.current_time:
-                self._next_progress_time += self._progress_interval_ms
-        return batch
-
-    def _build_step_routing_batch(self, at_node_mask: np.ndarray) -> RoutingBatch:
-        if not at_node_mask.any():
-            return self._empty_routing_batch()
-
-        delivered_mask, route_mask = self._partition_deliverable_flowlet_mask(at_node_mask)
-        if delivered_mask.any():
-            self._deliver_flowlet_ids(flowlet_mask_to_ids(delivered_mask))
-        if not route_mask.any():
-            return self._empty_routing_batch()
-
-        route_ids = flowlet_mask_to_ids(route_mask)
         current_sats = self._flowlets.current_sat[route_ids]
         target_regions = self._flowlets.target_region_id[route_ids]
         candidate_local_mask, target_access_sats = prepare_route_candidate_mask(
@@ -471,11 +537,13 @@ class RoutingEnv:
         if len(scheduled_ids) == 0:
             return
 
-        rejected_ids = self._schedule_flowlets_by_link(
+        accepted_ids, rejected_ids = self._schedule_flowlets_by_link(
             flowlet_ids=scheduled_ids,
             link_ids=link_ids,
             act=scheduled_act,
         )
+        if len(accepted_ids) > 0:
+            self._schedule_flowlet_events(accepted_ids)
         if len(rejected_ids) > 0:
             self._drop_flowlet_ids(rejected_ids, NetworkError.LINK_FULL)
 
@@ -577,15 +645,9 @@ class RoutingEnv:
         }
 
     def _partition_deliverable_flowlets(self, flowlet_ids: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-        flowlet_mask = np.zeros(self._flowlets.count, dtype=bool)
-        flowlet_mask[flowlet_ids] = True
-        delivered_mask, route_mask = self._partition_deliverable_flowlet_mask(flowlet_mask)
-        return flowlet_mask_to_ids(delivered_mask), flowlet_mask_to_ids(route_mask)
-
-    def _partition_deliverable_flowlet_mask(self, flowlet_mask: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-        return partition_deliverable_flowlet_mask(
+        return partition_deliverable_flowlets(
             flowlets=self._flowlets,
-            flowlet_mask=flowlet_mask,
+            flowlet_ids=flowlet_ids,
             sat_id_to_col_array=self._sat_id_to_col_array,
             region_sat_visible=self._region_sat_visible,
         )
@@ -633,12 +695,108 @@ class RoutingEnv:
         delta = sat_positions - target_positions
         return np.linalg.norm(delta, axis=1)
 
+    def _event_slots_for_time(self, timestamps: np.ndarray) -> np.ndarray:
+        slots = np.ceil((timestamps - self.start_time) / self.slot_ms - 1e-9).astype(np.int64)
+        return np.clip(slots, 0, self._num_steps)
+
+    def _slot_index_for_time(self, timestamp: float) -> int:
+        slot = int(np.ceil((timestamp - self.start_time) / self.slot_ms - 1e-9))
+        return min(max(slot, 0), self._num_steps)
+
+    def _add_event_ids(
+        self,
+        events: dict[int, list[np.ndarray]],
+        event_heap: list[int],
+        event_slots: np.ndarray,
+        flowlet_ids: np.ndarray,
+    ) -> None:
+        if len(flowlet_ids) == 0:
+            return
+        valid = (event_slots >= self._step_index) & (event_slots < self._num_steps)
+        if not valid.any():
+            return
+        slots = event_slots[valid]
+        ids = flowlet_ids[valid]
+        order = np.argsort(slots, kind="stable")
+        sorted_slots = slots[order]
+        sorted_ids = ids[order]
+        starts = np.r_[0, np.flatnonzero(sorted_slots[1:] != sorted_slots[:-1]) + 1]
+        ends = np.r_[starts[1:], len(sorted_slots)]
+        for start, end in zip(starts, ends):
+            slot = int(sorted_slots[start])
+            if slot not in events:
+                events[slot] = []
+                heapq.heappush(event_heap, slot)
+            events[slot].append(sorted_ids[start:end].copy())
+
+    @staticmethod
+    def _pop_event_ids(events: dict[int, list[np.ndarray]], step_index: int) -> np.ndarray:
+        batches = events.pop(step_index, None)
+        if not batches:
+            return np.empty(0, dtype=np.int64)
+        if len(batches) == 1:
+            return batches[0]
+        return np.concatenate(batches)
+
+    def _peek_creation_step(self, lower_bound: int) -> int | None:
+        slots = self._creation_event_slots
+        cursor = self._creation_event_cursor
+        while cursor < len(slots) and int(slots[cursor]) < lower_bound:
+            cursor += 1
+        self._creation_event_cursor = cursor
+        if cursor >= len(slots):
+            return None
+        return int(slots[cursor])
+
+    @staticmethod
+    def _peek_event_step(
+        events: dict[int, list[np.ndarray]],
+        event_heap: list[int],
+        lower_bound: int,
+    ) -> int | None:
+        while event_heap and (event_heap[0] not in events or event_heap[0] < lower_bound):
+            heapq.heappop(event_heap)
+        if not event_heap:
+            return None
+        return int(event_heap[0])
+
+    def _schedule_flowlet_events(self, accepted_ids: np.ndarray) -> None:
+        if self._flowlets is None or len(accepted_ids) == 0:
+            return
+        self._add_event_ids(
+            events=self._release_events,
+            event_heap=self._release_event_heap,
+            event_slots=self._event_slots_for_time(self._flowlets.transmit_end_time[accepted_ids]),
+            flowlet_ids=accepted_ids,
+        )
+        self._add_event_ids(
+            events=self._arrival_events,
+            event_heap=self._arrival_event_heap,
+            event_slots=self._event_slots_for_time(self._flowlets.arrival_time[accepted_ids]),
+            flowlet_ids=accepted_ids,
+        )
+        self._on_link_id_chunks.append(accepted_ids.copy())
+
+    def _compact_on_link_ids(self) -> np.ndarray:
+        if self._flowlets is None or not self._on_link_id_chunks:
+            return np.empty(0, dtype=np.int64)
+        if len(self._on_link_id_chunks) == 1:
+            candidate_ids = self._on_link_id_chunks[0]
+        else:
+            candidate_ids = np.concatenate(self._on_link_id_chunks)
+        if len(candidate_ids) == 0:
+            self._on_link_id_chunks = []
+            return candidate_ids
+        active_ids = candidate_ids[self._flowlets.status[candidate_ids] == FLOWLET_ON_LINK]
+        self._on_link_id_chunks = [active_ids.copy()] if len(active_ids) > 0 else []
+        return active_ids
+
     def _schedule_flowlets_by_link(
         self,
         flowlet_ids: np.ndarray,
         link_ids: np.ndarray,
         act: np.ndarray,
-    ) -> np.ndarray:
+    ) -> tuple[np.ndarray, np.ndarray]:
         return schedule_flowlets_by_link(
             flowlets=self._flowlets,
             links=self._links,
@@ -672,12 +830,26 @@ class RoutingEnv:
     def _drop_flowlets_on_disconnected_links(self):
         if self._flowlets is None or self._links is None:
             return
-        drop_flowlets_on_disconnected_links(
+        on_link = self._compact_on_link_ids()
+        if len(on_link) == 0:
+            return
+        link_ids = self._flowlets.link_id[on_link]
+        dropped = on_link[~self._links.connected[link_ids]]
+        if len(dropped) == 0:
+            return
+        unreleased = dropped[~self._flowlets.link_released[dropped]]
+        if len(unreleased) > 0:
+            np.add.at(self._links.queue_load, self._flowlets.link_id[unreleased], -self._flowlets.size[unreleased])
+            self._flowlets.link_released[unreleased] = True
+        self._links.queue_load[~self._links.connected] = 0.0
+        self._links.free_time[~self._links.connected] = self.current_time
+        drop_flowlet_ids(
             flowlets=self._flowlets,
-            links=self._links,
+            flowlet_ids=dropped,
             current_time=self.current_time,
-            link_disconnected_reason=int(NetworkError.LINK_DISCONNECTED),
+            reason=int(NetworkError.LINK_DISCONNECTED),
         )
+        self._compact_on_link_ids()
 
     def _drop_flowlet_ids(self, flowlet_ids: np.ndarray, reason: NetworkError):
         if self._flowlets is None:

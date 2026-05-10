@@ -1,0 +1,33 @@
+{
+    "name": "starlink_hotspot",
+    "agent": "configs/agents/madqn.json",
+    "env": {
+        "train": "configs/env/starlink_hotspot_train.json",
+        "eval": "configs/env/starlink_hotspot_eval.json",
+        "spf": "configs/env/starlink_hotspot_eval.json"
+    },
+    "train": {
+        "runs_dir": "runs_train",
+        "num_epochs": 1,
+        "seed": 33333,
+        "eval_interval": 10,
+        "eval_after_epoch": 1,
+        "eval_seeds": "6666,7777,8888",
+        "save_interval": 1,
+        "flowlet_dump_interval": 0,
+        "selection_metric": "risk_adjusted",
+        "notes": "",
+        "archive_source": true
+    },
+    "eval": {
+        "runs_dir": "runs_eval",
+        "eval_seed": 3333,
+        "num_eval_seeds": 5,
+        "agents": [
+            "configs/agents/spf.json"
+        ]
+    },
+    "spf": {
+        "seed": 3333
+    }
+}
