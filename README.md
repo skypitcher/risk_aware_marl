@@ -23,7 +23,7 @@ The simulator has been refactored from an event-queue packet model into a data-o
 1. **Region traffic**: Flowlets are sampled from population/region weights and bind to the currently visible access satellite.
 2. **Flowlet batches**: A flowlet represents a batch of packets with common source/target regions.
 3. **Array network state**: Satellite positions, neighbor/link matrices, link delays, connectivity, queues, and flowlet state are stored in NumPy arrays.
-4. **Separated slot kernels**: `sat_net/sim_kernel.py` owns flowlet/link state transitions, keeping the environment orchestration thin.
+4. **Mask-first slot kernels**: `sat_net/sim_kernel.py` owns flowlet/link state transitions and returns full-length masks before NumPy compression.
 5. **Batched policy API**: Solvers receive `RoutingBatch` arrays and return vectorized `RoutingDecision` next hops.
 6. **SPF baseline**: Shortest-path next-hop rows are computed from sparse arrays, cached in a dense matrix, and refreshed with topology updates.
 

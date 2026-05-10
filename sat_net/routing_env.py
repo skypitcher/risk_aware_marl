@@ -12,15 +12,16 @@ from sat_net.sim_kernel import (
     FLOWLET_NOT_STARTED,
     FlowletState,
     LinkState,
-    activate_flowlets_at_slot,
+    activate_flowlets_at_slot_mask,
     build_routing_batch,
     create_flowlet_state,
     create_link_state,
     deliver_flowlet_ids,
     drop_flowlet_ids,
     drop_flowlets_on_disconnected_links,
-    handle_flowlet_arrivals,
-    partition_deliverable_flowlets,
+    flowlet_mask_to_ids,
+    handle_flowlet_arrivals_mask,
+    partition_deliverable_flowlet_mask,
     release_transmitted_flowlets,
     schedule_flowlets_by_link,
 )
@@ -198,14 +199,10 @@ class RoutingEnv:
                 self._drop_flowlets_on_disconnected_links()
 
             self._release_transmitted_flowlets()
-            arrived_ids = self._handle_flowlet_arrivals()
-            activated_ids = self._activate_flowlets_at_current_slot()
-            if len(arrived_ids) > 0 and len(activated_ids) > 0:
-                self._route_flowlets_at_nodes(np.sort(np.concatenate((arrived_ids, activated_ids))))
-            elif len(arrived_ids) > 0:
-                self._route_flowlets_at_nodes(arrived_ids)
-            elif len(activated_ids) > 0:
-                self._route_flowlets_at_nodes(activated_ids)
+            route_ready_mask = self._handle_flowlet_arrivals_mask()
+            route_ready_mask |= self._activate_flowlets_at_current_slot_mask()
+            if route_ready_mask.any():
+                self._route_flowlets_at_nodes_mask(route_ready_mask)
 
         self.current_time = end_time
         self._array_metrics = self._calc_array_metrics()
@@ -276,21 +273,21 @@ class RoutingEnv:
             current_time=self.current_time,
         )
 
-    def _handle_flowlet_arrivals(self) -> np.ndarray:
+    def _handle_flowlet_arrivals_mask(self) -> np.ndarray:
         if self._flowlets is None:
-            return np.empty(0, dtype=np.int64)
-        return handle_flowlet_arrivals(
+            return np.empty(0, dtype=bool)
+        return handle_flowlet_arrivals_mask(
             flowlets=self._flowlets,
             current_time=self.current_time,
             ttl_expired_reason=int(NetworkError.TTL_EXPIRED),
         )
 
-    def _activate_flowlets_at_current_slot(self) -> np.ndarray:
+    def _activate_flowlets_at_current_slot_mask(self) -> np.ndarray:
         if self._flowlets is None:
-            return np.empty(0, dtype=np.int64)
+            return np.empty(0, dtype=bool)
 
         slot_idx = int(round((self.current_time - self.start_time) / self.slot_ms))
-        return activate_flowlets_at_slot(
+        return activate_flowlets_at_slot_mask(
             flowlets=self._flowlets,
             slot_idx=slot_idx,
             current_time=self.current_time,
@@ -313,10 +310,26 @@ class RoutingEnv:
 
         self._route_flowlets_batch(route_ids)
 
+    def _route_flowlets_at_nodes_mask(self, at_node_mask: np.ndarray):
+        if not at_node_mask.any():
+            return
+
+        delivered_mask, route_mask = self._partition_deliverable_flowlet_mask(at_node_mask)
+        if delivered_mask.any():
+            self._deliver_flowlet_ids(flowlet_mask_to_ids(delivered_mask))
+        if route_mask.any():
+            self._route_flowlets_batch(flowlet_mask_to_ids(route_mask))
+
     def _partition_deliverable_flowlets(self, flowlet_ids: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-        return partition_deliverable_flowlets(
+        flowlet_mask = np.zeros(self._flowlets.count, dtype=bool)
+        flowlet_mask[flowlet_ids] = True
+        delivered_mask, route_mask = self._partition_deliverable_flowlet_mask(flowlet_mask)
+        return flowlet_mask_to_ids(delivered_mask), flowlet_mask_to_ids(route_mask)
+
+    def _partition_deliverable_flowlet_mask(self, flowlet_mask: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        return partition_deliverable_flowlet_mask(
             flowlets=self._flowlets,
-            flowlet_ids=flowlet_ids,
+            flowlet_mask=flowlet_mask,
             sat_id_to_col_array=self._sat_id_to_col_array,
             region_sat_visible=self._region_sat_visible,
         )

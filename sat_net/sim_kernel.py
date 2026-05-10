@@ -229,6 +229,27 @@ def drop_flowlet_ids(
     flowlets.drop_reason[flowlet_ids] = reason
 
 
+def flowlet_mask_to_ids(mask: np.ndarray) -> np.ndarray:
+    return np.flatnonzero(mask)
+
+
+def empty_flowlet_mask(flowlets: FlowletState) -> np.ndarray:
+    return np.zeros(flowlets.count, dtype=bool)
+
+
+def drop_flowlet_mask(
+    flowlets: FlowletState,
+    flowlet_mask: np.ndarray,
+    current_time: float,
+    reason: int,
+) -> None:
+    if not flowlet_mask.any():
+        return
+    flowlets.status[flowlet_mask] = FLOWLET_DROPPED
+    flowlets.drop_time[flowlet_mask] = current_time
+    flowlets.drop_reason[flowlet_mask] = reason
+
+
 def release_transmitted_flowlets(
     flowlets: FlowletState,
     links: LinkState,
@@ -255,28 +276,39 @@ def handle_flowlet_arrivals(
     current_time: float,
     ttl_expired_reason: int,
 ) -> np.ndarray:
+    return flowlet_mask_to_ids(
+        handle_flowlet_arrivals_mask(
+            flowlets=flowlets,
+            current_time=current_time,
+            ttl_expired_reason=ttl_expired_reason,
+        )
+    )
+
+
+def handle_flowlet_arrivals_mask(
+    flowlets: FlowletState,
+    current_time: float,
+    ttl_expired_reason: int,
+) -> np.ndarray:
     status = flowlets.status
     if len(status) == 0:
-        return np.empty(0, dtype=np.int64)
+        return empty_flowlet_mask(flowlets)
     arrival_mask = (status == FLOWLET_ON_LINK) & (flowlets.arrival_time <= current_time)
-    flowlet_ids = np.flatnonzero(arrival_mask)
-    if len(flowlet_ids) == 0:
-        return flowlet_ids
+    if not arrival_mask.any():
+        return arrival_mask
 
-    flowlets.current_sat[flowlet_ids] = flowlets.next_sat[flowlet_ids]
-    flowlets.hops[flowlet_ids] += 1
-    flowlets.ttl[flowlet_ids] -= 1
-    flowlets.propagation_delay[flowlet_ids] += flowlets.scheduled_prop_delay[flowlet_ids]
-    flowlets.queue_delay[flowlet_ids] += current_time - flowlets.arrival_time[flowlet_ids]
-    flowlets.status[flowlet_ids] = FLOWLET_AT_NODE
-    flowlets.link_id[flowlet_ids] = -1
+    flowlets.current_sat[arrival_mask] = flowlets.next_sat[arrival_mask]
+    flowlets.hops[arrival_mask] += 1
+    flowlets.ttl[arrival_mask] -= 1
+    flowlets.propagation_delay[arrival_mask] += flowlets.scheduled_prop_delay[arrival_mask]
+    flowlets.queue_delay[arrival_mask] += current_time - flowlets.arrival_time[arrival_mask]
+    flowlets.status[arrival_mask] = FLOWLET_AT_NODE
+    flowlets.link_id[arrival_mask] = -1
 
-    expired_mask = flowlets.ttl[flowlet_ids] <= 0
+    expired_mask = arrival_mask & (flowlets.ttl <= 0)
     if expired_mask.any():
-        expired = flowlet_ids[expired_mask]
-        drop_flowlet_ids(flowlets, expired, current_time, ttl_expired_reason)
-        return flowlet_ids[~expired_mask]
-    return flowlet_ids
+        drop_flowlet_mask(flowlets, expired_mask, current_time, ttl_expired_reason)
+    return arrival_mask & (~expired_mask)
 
 
 def activate_flowlets_at_slot(
@@ -289,12 +321,37 @@ def activate_flowlets_at_slot(
     access_data_rate: float,
     no_available_sat_reason: int,
 ) -> np.ndarray:
+    return flowlet_mask_to_ids(
+        activate_flowlets_at_slot_mask(
+            flowlets=flowlets,
+            slot_idx=slot_idx,
+            current_time=current_time,
+            nearest_region_sat_ids=nearest_region_sat_ids,
+            nearest_region_sat_distances=nearest_region_sat_distances,
+            region_distance_matrix=region_distance_matrix,
+            access_data_rate=access_data_rate,
+            no_available_sat_reason=no_available_sat_reason,
+        )
+    )
+
+
+def activate_flowlets_at_slot_mask(
+    flowlets: FlowletState,
+    slot_idx: int,
+    current_time: float,
+    nearest_region_sat_ids: np.ndarray,
+    nearest_region_sat_distances: np.ndarray,
+    region_distance_matrix: np.ndarray,
+    access_data_rate: float,
+    no_available_sat_reason: int,
+) -> np.ndarray:
+    active_mask = empty_flowlet_mask(flowlets)
     if slot_idx < 0 or slot_idx + 1 >= len(flowlets.slot_offsets):
-        return np.empty(0, dtype=np.int64)
+        return active_mask
     start = int(flowlets.slot_offsets[slot_idx])
     end = int(flowlets.slot_offsets[slot_idx + 1])
     if end <= start:
-        return np.empty(0, dtype=np.int64)
+        return active_mask
 
     flowlet_ids = np.arange(start, end, dtype=np.int64)
     source_regions = flowlets.source_region_id[flowlet_ids]
@@ -305,7 +362,7 @@ def activate_flowlets_at_slot(
 
     active_ids = flowlet_ids[visible]
     if len(active_ids) == 0:
-        return active_ids
+        return active_mask
 
     source_sat_ids = source_sat_ids[visible]
     source_distances = nearest_region_sat_distances[source_regions[visible]]
@@ -326,7 +383,8 @@ def activate_flowlets_at_slot(
     initial_gcd[initial_gcd <= 0] = 1e-6
     flowlets.initial_gcd[active_ids] = initial_gcd
     flowlets.shortest_gcd[active_ids] = initial_gcd
-    return active_ids
+    active_mask[active_ids] = True
+    return active_mask
 
 
 def partition_deliverable_flowlets(
@@ -342,6 +400,29 @@ def partition_deliverable_flowlets(
     deliverable = np.zeros(len(flowlet_ids), dtype=bool)
     deliverable[valid] = region_sat_visible[target_regions[valid], sat_cols[valid]]
     return flowlet_ids[deliverable], flowlet_ids[~deliverable]
+
+
+def partition_deliverable_flowlet_mask(
+    flowlets: FlowletState,
+    flowlet_mask: np.ndarray,
+    sat_id_to_col_array: np.ndarray,
+    region_sat_visible: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    deliverable_mask = empty_flowlet_mask(flowlets)
+    route_mask = empty_flowlet_mask(flowlets)
+    flowlet_ids = flowlet_mask_to_ids(flowlet_mask)
+    if len(flowlet_ids) == 0:
+        return deliverable_mask, route_mask
+
+    delivered_ids, route_ids = partition_deliverable_flowlets(
+        flowlets=flowlets,
+        flowlet_ids=flowlet_ids,
+        sat_id_to_col_array=sat_id_to_col_array,
+        region_sat_visible=region_sat_visible,
+    )
+    deliverable_mask[delivered_ids] = True
+    route_mask[route_ids] = True
+    return deliverable_mask, route_mask
 
 
 def deliver_flowlet_ids(
