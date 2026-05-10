@@ -7,7 +7,8 @@ import numpy as np
 import torch
 
 from sat_net.sim_kernel import FLOWLET_DELIVERED, FLOWLET_DROPPED
-from sat_net.solver.base_solver import ACTION_COUNT, BaseSolver, RoutingBatch, RoutingDecision
+from sat_net.agent.base_agent import ACTION_COUNT, BaseAgent, RoutingBatch, RoutingDecision
+from sat_net.reward import RewardConfig, RewardStats, compute_transition_reward
 from sat_net.util import NamedDict
 
 
@@ -22,6 +23,8 @@ def resolve_device(config: NamedDict) -> torch.device:
 
 @dataclass(slots=True)
 class PendingTransition:
+    flowlet_id: int
+    agent_id: int
     state: np.ndarray
     action: int
     action_mask: np.ndarray
@@ -31,10 +34,11 @@ class PendingTransition:
     initial_gcd: float
     delay_norm: float
     target_cost: float
+    weight: float
 
 
-class BatchedRLSolver(BaseSolver):
-    """Shared RoutingBatch adapter for RL policies."""
+class BatchedRLAgent(BaseAgent):
+    """Shared RoutingBatch adapter for RL routing agents."""
 
     requires_shortest_path_table = False
 
@@ -53,22 +57,26 @@ class BatchedRLSolver(BaseSolver):
         self.delay_feature_norm = float(config.get("delay_feature_norm", 1000.0))
         self.size_norm = float(config.get("size_norm", 8.0))
         self.max_ttl = float(config.get("max_ttl", 64.0))
-        self.delivered_bonus = float(config.get("delivered_bonus", 1.0))
-        self.dropped_penalty = float(config.get("dropped_penalty", 1.0))
+        self.reward_config = RewardConfig.from_config(config)
+        self.delay_norm = self.reward_config.delay_norm
+        self.cost_limit = self.reward_config.cost_limit
         self._pending: dict[int, PendingTransition] = {}
+        self._reward_stats = RewardStats()
 
-    def next_hops(self, batch: RoutingBatch) -> RoutingDecision:
+    def act(self, batch: RoutingBatch) -> RoutingDecision:
         states = self.build_states(batch)
         action_masks = batch.action_mask.astype(bool, copy=False)
-        self._finalize_revisited(batch, states, action_masks)
+        if self.is_train():
+            self._finalize_revisited(batch, states, action_masks)
         actions = self.select_actions(states, action_masks)
         rows = np.arange(len(actions))
         valid = (actions >= 0) & action_masks[rows, np.maximum(actions, 0)]
-        next_hops = np.full(len(actions), -1, dtype=np.int64)
+        act = np.full(len(actions), -1, dtype=np.int64)
         if valid.any():
-            next_hops[valid] = batch.neighbor_sat_ids[rows[valid], actions[valid]]
-        self._remember_pending(batch, states, action_masks, actions)
-        return RoutingDecision(next_hop_sat_ids=next_hops)
+            act[valid] = batch.neighbor_sat_ids[rows[valid], actions[valid]]
+        if self.is_train():
+            self._remember_pending(batch, states, action_masks, actions)
+        return RoutingDecision(next_hop_sat_ids=act)
 
     def select_actions(self, states: np.ndarray, action_masks: np.ndarray) -> np.ndarray:
         raise NotImplementedError
@@ -85,6 +93,10 @@ class BatchedRLSolver(BaseSolver):
         next_state: np.ndarray,
         next_action_mask: np.ndarray,
         target_cost: float | None,
+        weight: float = 1.0,
+        flowlet_id: int = -1,
+        agent_id: int = -1,
+        next_agent_id: int = -1,
     ) -> None:
         raise NotImplementedError
 
@@ -94,6 +106,54 @@ class BatchedRLSolver(BaseSolver):
     def on_train_signal(self) -> None:
         if self.is_train():
             self.learn()
+
+    def on_episode_start(self) -> None:
+        self._pending.clear()
+        self._reward_stats = RewardStats()
+
+    def on_episode_end(self, flowlets, current_time: float) -> None:
+        if not self.is_train():
+            self._pending.clear()
+            return
+        self.observe_flowlet_outcomes(flowlets, current_time)
+        if not self._pending:
+            return
+        pending_ids = list(self._pending.keys())
+        for flowlet_id in pending_ids:
+            if flowlet_id >= flowlets.count:
+                self._pending.pop(flowlet_id, None)
+                continue
+            pending = self._pending.pop(flowlet_id, None)
+            if pending is None:
+                continue
+            transition_reward = self._compute_reward(
+                pending=pending,
+                next_remaining_distance=float(flowlets.shortest_gcd[flowlet_id]),
+                total_delay=float(
+                    flowlets.queue_delay[flowlet_id]
+                    + flowlets.transmission_delay[flowlet_id]
+                    + flowlets.propagation_delay[flowlet_id]
+                ),
+                queue_cost=float(flowlets.total_queue_cost[flowlet_id]),
+                terminal_status=None,
+                truncated=True,
+            )
+            self.add_transition(
+                state=pending.state,
+                action=pending.action,
+                action_mask=pending.action_mask,
+                reward=transition_reward.reward,
+                cost=transition_reward.cost,
+                done=False,
+                truncated=True,
+                next_state=np.zeros(self.obs_dim, dtype=np.float32),
+                next_action_mask=np.zeros(self.action_dim, dtype=bool),
+                target_cost=pending.target_cost,
+                weight=pending.weight,
+                flowlet_id=pending.flowlet_id,
+                agent_id=pending.agent_id,
+                next_agent_id=-1,
+            )
 
     def build_states(self, batch: RoutingBatch) -> np.ndarray:
         n = len(batch.flowlet_ids)
@@ -106,7 +166,8 @@ class BatchedRLSolver(BaseSolver):
         hops = self._optional(batch.hops, n)
         shortest_gcd = self._optional(batch.shortest_gcd, n)
         initial_gcd = np.maximum(self._optional(batch.initial_gcd, n), 1e-6)
-        progress = 1.0 - shortest_gcd / initial_gcd
+        progress_norm = np.maximum.reduce((initial_gcd, np.abs(shortest_gcd), np.ones(n, dtype=np.float64) * 1e-6))
+        progress = (initial_gcd - shortest_gcd) / progress_norm
         target_access_valid = (batch.target_access_sat_ids >= 0).astype(np.float32)
 
         base = np.column_stack(
@@ -146,6 +207,8 @@ class BatchedRLSolver(BaseSolver):
         return states
 
     def observe_flowlet_outcomes(self, flowlets, _current_time: float) -> None:
+        if not self.is_train():
+            return
         if not self._pending:
             return
         pending_ids = np.fromiter(self._pending.keys(), dtype=np.int64)
@@ -159,28 +222,34 @@ class BatchedRLSolver(BaseSolver):
             pending = self._pending.pop(int(flowlet_id), None)
             if pending is None:
                 continue
-            total_delay = (
-                flowlets.queue_delay[flowlet_id]
-                + flowlets.transmission_delay[flowlet_id]
-                + flowlets.propagation_delay[flowlet_id]
+            terminal_status = int(flowlets.status[flowlet_id])
+            transition_reward = self._compute_reward(
+                pending=pending,
+                next_remaining_distance=float(flowlets.shortest_gcd[flowlet_id]),
+                total_delay=float(
+                    flowlets.queue_delay[flowlet_id]
+                    + flowlets.transmission_delay[flowlet_id]
+                    + flowlets.propagation_delay[flowlet_id]
+                ),
+                queue_cost=float(flowlets.total_queue_cost[flowlet_id]),
+                terminal_status=terminal_status,
+                truncated=False,
             )
-            delta_delay = max(0.0, float(total_delay - pending.total_delay))
-            delta_queue = max(0.0, float(flowlets.total_queue_cost[flowlet_id] - pending.queue_cost))
-            delivered = flowlets.status[flowlet_id] == FLOWLET_DELIVERED
-            terminal_bonus = self.delivered_bonus if delivered else -self.dropped_penalty
-            reward = terminal_bonus - delta_delay / pending.delay_norm
-            cost = delta_queue / pending.delay_norm
             self.add_transition(
                 state=pending.state,
                 action=pending.action,
                 action_mask=pending.action_mask,
-                reward=reward,
-                cost=cost,
+                reward=transition_reward.reward,
+                cost=transition_reward.cost,
                 done=True,
                 truncated=False,
                 next_state=np.zeros(self.obs_dim, dtype=np.float32),
                 next_action_mask=np.zeros(self.action_dim, dtype=bool),
                 target_cost=pending.target_cost,
+                weight=pending.weight,
+                flowlet_id=pending.flowlet_id,
+                agent_id=pending.agent_id,
+                next_agent_id=-1,
             )
 
     def _finalize_revisited(self, batch: RoutingBatch, states: np.ndarray, action_masks: np.ndarray) -> None:
@@ -191,22 +260,29 @@ class BatchedRLSolver(BaseSolver):
             pending = self._pending.pop(int(flowlet_id), None)
             if pending is None:
                 continue
-            delta_delay = max(0.0, float(total_delay[row] - pending.total_delay))
-            delta_queue = max(0.0, float(queue_cost[row] - pending.queue_cost))
-            progress = (pending.shortest_gcd - float(shortest_gcd[row])) / max(pending.initial_gcd, 1e-6)
-            reward = progress - delta_delay / pending.delay_norm
-            cost = delta_queue / pending.delay_norm
+            transition_reward = self._compute_reward(
+                pending=pending,
+                next_remaining_distance=float(shortest_gcd[row]),
+                total_delay=float(total_delay[row]),
+                queue_cost=float(queue_cost[row]),
+                terminal_status=None,
+                truncated=False,
+            )
             self.add_transition(
                 state=pending.state,
                 action=pending.action,
                 action_mask=pending.action_mask,
-                reward=reward,
-                cost=cost,
+                reward=transition_reward.reward,
+                cost=transition_reward.cost,
                 done=False,
                 truncated=False,
                 next_state=states[row],
                 next_action_mask=action_masks[row],
                 target_cost=pending.target_cost,
+                weight=pending.weight,
+                flowlet_id=pending.flowlet_id,
+                agent_id=pending.agent_id,
+                next_agent_id=int(batch.current_sat_ids[row]),
             )
 
     def _remember_pending(
@@ -220,12 +296,14 @@ class BatchedRLSolver(BaseSolver):
         queue_cost = self._optional(batch.total_queue_cost, len(batch.flowlet_ids))
         shortest_gcd = self._optional(batch.shortest_gcd, len(batch.flowlet_ids))
         initial_gcd = np.maximum(self._optional(batch.initial_gcd, len(batch.flowlet_ids)), 1e-6)
+        packet_count = self._optional(batch.packet_count, len(batch.flowlet_ids))
         for row, action in enumerate(actions):
             if action < 0 or not action_masks[row, action]:
                 continue
             flowlet_id = int(batch.flowlet_ids[row])
-            delay_norm = self.delay_norm
             self._pending[flowlet_id] = PendingTransition(
+                flowlet_id=flowlet_id,
+                agent_id=int(batch.agent_ids[row]),
                 state=states[row].copy(),
                 action=int(action),
                 action_mask=action_masks[row].copy(),
@@ -233,9 +311,34 @@ class BatchedRLSolver(BaseSolver):
                 queue_cost=float(queue_cost[row]),
                 shortest_gcd=float(shortest_gcd[row]),
                 initial_gcd=float(initial_gcd[row]),
-                delay_norm=delay_norm,
-                target_cost=self.cost_limit / delay_norm,
+                delay_norm=self.reward_config.delay_norm,
+                target_cost=self.reward_config.cost_limit / max(self.reward_config.cost_norm, 1e-6),
+                weight=max(float(packet_count[row]), 1.0),
             )
+
+    def _compute_reward(
+        self,
+        pending: PendingTransition,
+        next_remaining_distance: float,
+        total_delay: float,
+        queue_cost: float,
+        terminal_status: int | None,
+        truncated: bool,
+    ):
+        delta_delay = max(0.0, float(total_delay - pending.total_delay))
+        delta_queue = max(0.0, float(queue_cost - pending.queue_cost))
+        reward = compute_transition_reward(
+            config=self.reward_config,
+            previous_remaining_distance=pending.shortest_gcd,
+            next_remaining_distance=next_remaining_distance,
+            initial_distance=pending.initial_gcd,
+            delta_delay=delta_delay,
+            delta_queue_cost=delta_queue,
+            terminal_status=terminal_status,
+            truncated=truncated,
+        )
+        self._reward_stats.add(reward, terminal_status=terminal_status, truncated=truncated)
+        return reward
 
     @staticmethod
     def _optional(values: np.ndarray | None, length: int) -> np.ndarray:
@@ -257,6 +360,15 @@ class BatchedRLSolver(BaseSolver):
             if len(valid_actions) > 0:
                 actions[row] = int(np.random.choice(valid_actions))
         return actions
+
+    def get_train_stats(self) -> dict:
+        stats = self._reward_stats.to_dict()
+        stats["pending_transitions"] = len(self._pending)
+        stats["reward_config"] = self.reward_config.to_dict()
+        replay_buffer = getattr(getattr(self, "global_agent", None), "replay_buffer", None)
+        if replay_buffer is not None and hasattr(replay_buffer, "metadata_summary"):
+            stats["replay"] = replay_buffer.metadata_summary()
+        return stats
 
     def _masked_argmax(self, values: torch.Tensor, action_masks: np.ndarray) -> np.ndarray:
         mask = torch.as_tensor(action_masks, dtype=torch.bool, device=values.device)

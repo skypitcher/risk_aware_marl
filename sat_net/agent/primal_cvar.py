@@ -8,12 +8,24 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-from sat_net.nn import DiscretePolicy, MLP, ReplayBuffer, TwinCritic, calc_heuristic_entropy, hard_update, soft_update
-from sat_net.solver.rl_base import BatchedRLSolver
+from sat_net.nn import (
+    DiscretePolicy,
+    IQN,
+    ReplayBuffer,
+    TwinCritic,
+    calc_heuristic_entropy,
+    hard_update,
+    quantile_huber_loss,
+    sample_taus,
+    soft_update,
+    weighted_mean,
+    weighted_mse_loss,
+)
+from sat_net.agent.rl_base import BatchedRLAgent
 from sat_net.util import NamedDict
 
 
-class PrimalAvgAgent:
+class PrimalCVaRAgent:
     def __init__(self, obs_dim: int, action_dim: int, config: NamedDict, device: torch.device, tf_writer: Any = None):
         self.config = config
         self.device = device
@@ -21,7 +33,11 @@ class PrimalAvgAgent:
         self.state_dim = obs_dim
         self.action_dim = action_dim
         self.hidden_dim = int(config.get("hidden_dim", 256))
+        self.feature_dim = int(config.get("feature_dim", 256))
+        self.embedding_dim = int(config.get("embedding_dim", 64))
+        self.num_quantiles = int(config.get("num_quantiles", 64))
         self.num_hidden_layers = int(config.get("num_hidden_layers", 2))
+        self.risk_level = float(config.get("risk_level", 0.25))
         self.discount_reward = float(config.get("discount_reward", 0.99))
         self.discount_cost = float(config.get("discount_cost", 0.97))
         self.batch_size = int(config.get("batch_size", 2048))
@@ -30,29 +46,42 @@ class PrimalAvgAgent:
         self.actor_update_freq = int(config.get("actor_update_freq", 2))
         self.cost_multiplier_update_freq = int(config.get("cost_multiplier_update_freq", 2))
         self.update_lambda_after_step = int(config.get("update_lambda_after_step", 300000))
+        self.consider_risk_after_step = int(config.get("consider_risk_after_step", 300000))
         self.update_method = str(config.get("update_method", "soft"))
         self.soft_update_tau = float(config.get("soft_update_tau", 0.05))
         self.hard_update_interval = int(config.get("hard_update_interval", 1))
         self.max_grad_norm = float(config.get("max_grad_norm", 0.5))
-        self.use_single_cost_critic = bool(config.get("use_single_cost_critic", False))
         self.training_steps = 0
 
         init_method = str(config.get("weight_init", "orthogonal"))
         actor_ln = bool(config.get("actor_use_layer_norm", True))
         critic_ln = bool(config.get("critic_use_layer_norm", True))
         lr = float(config.get("learning_rate", 1e-4))
-
         self.Qr = TwinCritic(obs_dim, action_dim, self.hidden_dim, self.num_hidden_layers, critic_ln, init_method).to(device)
         self.Qr_target = TwinCritic(obs_dim, action_dim, self.hidden_dim, self.num_hidden_layers, critic_ln, init_method).to(device)
         self.Qr_target.load_state_dict(self.Qr.state_dict())
         self.opt_Qr = torch.optim.Adam(self.Qr.parameters(), lr=lr)
 
-        if self.use_single_cost_critic:
-            self.Qc = MLP(obs_dim, action_dim, self.hidden_dim, self.num_hidden_layers, critic_ln, init_method).to(device)
-            self.Qc_target = MLP(obs_dim, action_dim, self.hidden_dim, self.num_hidden_layers, critic_ln, init_method).to(device)
-        else:
-            self.Qc = TwinCritic(obs_dim, action_dim, self.hidden_dim, self.num_hidden_layers, critic_ln, init_method).to(device)
-            self.Qc_target = TwinCritic(obs_dim, action_dim, self.hidden_dim, self.num_hidden_layers, critic_ln, init_method).to(device)
+        self.Qc = IQN(
+            obs_dim,
+            action_dim,
+            self.feature_dim,
+            self.hidden_dim,
+            self.num_hidden_layers,
+            self.embedding_dim,
+            critic_ln,
+            init_method,
+        ).to(device)
+        self.Qc_target = IQN(
+            obs_dim,
+            action_dim,
+            self.feature_dim,
+            self.hidden_dim,
+            self.num_hidden_layers,
+            self.embedding_dim,
+            critic_ln,
+            init_method,
+        ).to(device)
         self.Qc_target.load_state_dict(self.Qc.state_dict())
         self.opt_Qc = torch.optim.Adam(self.Qc.parameters(), lr=lr)
 
@@ -89,8 +118,7 @@ class PrimalAvgAgent:
             if eval_mode:
                 actions = torch.argmax(logits, dim=-1)
             else:
-                probs = F.softmax(logits, dim=-1)
-                actions = torch.multinomial(probs, 1).squeeze(-1)
+                actions = torch.multinomial(F.softmax(logits, dim=-1), 1).squeeze(-1)
         out = actions.cpu().numpy().astype(np.int64)
         out[~action_masks.any(axis=1)] = -1
         return out
@@ -117,8 +145,8 @@ class PrimalAvgAgent:
             target_reward = batch.rewards + self.discount_reward * bootstrap * next_vr
 
         qr, qr1, qr2 = self.Qr(batch.states)
-        reward_loss = F.mse_loss(qr1.gather(-1, batch.actions), target_reward) + F.mse_loss(
-            qr2.gather(-1, batch.actions), target_reward
+        reward_loss = weighted_mse_loss(qr1.gather(-1, batch.actions), target_reward, batch.weights) + weighted_mse_loss(
+            qr2.gather(-1, batch.actions), target_reward, batch.weights
         )
         self.opt_Qr.zero_grad()
         reward_loss.backward()
@@ -127,21 +155,15 @@ class PrimalAvgAgent:
         self._update_target(self.Qr_target, self.Qr)
 
         with torch.no_grad():
-            if self.use_single_cost_critic:
-                next_qc = self.Qc_target(batch.next_states)
-            else:
-                next_qc, _, _ = self.Qc_target(batch.next_states)
-            next_vc = torch.sum(next_probs * next_qc, dim=-1, keepdim=True)
-            target_cost = batch.costs + self.discount_cost * bootstrap * next_vc
+            next_taus = sample_taus(self.batch_size, self.num_quantiles, self.device)
+            next_quantiles = self.Qc_target(batch.next_states, next_taus)
+            next_vc = torch.sum(next_probs.unsqueeze(1) * next_quantiles, dim=-1, keepdim=True)
+            target_cost = batch.costs.unsqueeze(1) + self.discount_cost * bootstrap.unsqueeze(1) * next_vc
 
-        if self.use_single_cost_critic:
-            qc = self.Qc(batch.states)
-            cost_loss = F.mse_loss(qc.gather(-1, batch.actions), target_cost)
-        else:
-            qc, qc1, qc2 = self.Qc(batch.states)
-            cost_loss = F.mse_loss(qc1.gather(-1, batch.actions), target_cost) + F.mse_loss(
-                qc2.gather(-1, batch.actions), target_cost
-            )
+        taus = sample_taus(self.batch_size, self.num_quantiles, self.device)
+        qc = self.Qc(batch.states, taus)
+        qc_a = qc.gather(-1, batch.actions.unsqueeze(1).expand(-1, self.num_quantiles, 1))
+        cost_loss = quantile_huber_loss(qc_a, target_cost, taus.unsqueeze(-1), sample_weights=batch.weights)
         self.opt_Qc.zero_grad()
         cost_loss.backward()
         torch.nn.utils.clip_grad_norm_(self.Qc.parameters(), self.max_grad_norm)
@@ -152,32 +174,37 @@ class PrimalAvgAgent:
             logits = self.actor(batch.states, batch.action_masks)
             probs = F.softmax(logits, dim=-1)
             log_probs = F.log_softmax(logits, dim=-1)
-            actor_loss = (
+            min_tau = 1.0 - self.risk_level if self.training_steps >= self.consider_risk_after_step else 0.0
+            with torch.no_grad():
+                cvar_taus = sample_taus(self.batch_size, self.num_quantiles, self.device, min_tau=min_tau, max_tau=1.0)
+                cvar = self.Qc(batch.states, cvar_taus).mean(dim=1)
+            actor_objective = (
                 probs
-                * (self.alpha().detach() * log_probs - qr.detach() + self.lambdar().detach() * qc.detach())
-            ).sum(dim=-1).mean()
+                * (self.alpha().detach() * log_probs - qr.detach() + self.lambdar().detach() * cvar.detach())
+            ).sum(dim=-1, keepdim=True)
+            actor_loss = weighted_mean(actor_objective, batch.weights)
             self.opt_actor.zero_grad()
             actor_loss.backward()
             torch.nn.utils.clip_grad_norm_(self.actor.parameters(), self.max_grad_norm)
             self.opt_actor.step()
 
             entropy = (-probs * log_probs).sum(dim=-1).detach()
-            alpha_loss = (self.alpha() * (entropy - self.target_entropy)).mean()
+            alpha_loss = weighted_mean(self.alpha() * (entropy.unsqueeze(-1) - self.target_entropy), batch.weights)
             self.opt_log_alpha.zero_grad()
             alpha_loss.backward()
             self.opt_log_alpha.step()
 
             if self.training_steps >= self.update_lambda_after_step:
-                expected_cost = (probs * qc).sum(dim=-1, keepdim=True).detach()
+                policy_cvar = (probs * cvar).sum(dim=-1, keepdim=True).detach()
                 if self.training_steps % (self.cost_multiplier_update_freq * self.actor_update_freq) == 0:
-                    lambda_loss = (self.lambdar() * (batch.target_costs - expected_cost)).mean()
+                    lambda_loss = weighted_mean(self.lambdar() * (batch.target_costs - policy_cvar), batch.weights)
                     self.opt_log_lambda.zero_grad()
                     lambda_loss.backward()
                     self.opt_log_lambda.step()
 
         if self._tf_writer is not None:
-            self._tf_writer.add_scalar("primal_avg/reward_loss", reward_loss.item(), self.training_steps)
-            self._tf_writer.add_scalar("primal_avg/cost_loss", cost_loss.item(), self.training_steps)
+            self._tf_writer.add_scalar("primal_cvar/reward_loss", reward_loss.item(), self.training_steps)
+            self._tf_writer.add_scalar("primal_cvar/cost_loss", cost_loss.item(), self.training_steps)
 
     def _update_target(self, target: torch.nn.Module, source: torch.nn.Module) -> None:
         if self.update_method == "soft":
@@ -214,14 +241,14 @@ class PrimalAvgAgent:
         )
 
 
-class PrimalAvg(BatchedRLSolver):
+class PrimalCVaR(BatchedRLAgent):
     def __init__(self, config: NamedDict, obs_dim: int = 94, action_dim: int = 4, tf_writer: Any = None):
         super().__init__(config=config, obs_dim=obs_dim, action_dim=action_dim, tf_writer=tf_writer)
-        self.global_agent = PrimalAvgAgent(self.obs_dim, self.action_dim, config, self.device, tf_writer)
+        self.global_agent = PrimalCVaRAgent(self.obs_dim, self.action_dim, config, self.device, tf_writer)
 
     @property
     def name(self) -> str:
-        return "PrimalAvg"
+        return "PrimalCVaR"
 
     def select_actions(self, states: np.ndarray, action_masks: np.ndarray) -> np.ndarray:
         return self.global_agent.act(states, action_masks, eval_mode=self.is_eval())

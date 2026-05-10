@@ -20,5 +20,16 @@
     "use_layer_norm": true,
     "device": "auto",
     "delay_norm": 1000.0,
-    "cost_limit": 10.0
+    "cost_limit": 10.0,
+    "reward": {
+        "progress_weight": 1.0,
+        "delay_weight": 1.0,
+        "queue_cost_weight": 0.25,
+        "delivered_bonus": 1.0,
+        "dropped_penalty": 1.0,
+        "truncated_penalty": 0.0,
+        "delay_norm": 1000.0,
+        "cost_norm": 1000.0,
+        "cost_limit": 10.0
+    }
 }

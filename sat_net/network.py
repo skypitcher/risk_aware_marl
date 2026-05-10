@@ -51,7 +51,7 @@ class SatelliteNetwork:
         self.orbit_cycle = calculate_orbital_period(self.altitude)
 
         self.topology_version = 0
-        self._shortest_next_hops = np.full((self.num_nodes, self.num_nodes), -1, dtype=np.int64)
+        self._shortest_act = np.full((self.num_nodes, self.num_nodes), -1, dtype=np.int64)
         self._shortest_next_hop_ready = np.zeros(self.num_nodes, dtype=bool)
         self._shortest_reverse_csr: csr_matrix | None = None
         self._shortest_reverse_csr_version = -1
@@ -158,7 +158,7 @@ class SatelliteNetwork:
         self._shortest_reverse_csr_version = -1
 
     def _reset_shortest_next_hop_cache(self):
-        self._shortest_next_hops.fill(-1)
+        self._shortest_act.fill(-1)
         self._shortest_next_hop_ready.fill(False)
 
     def _update_satellite_positions_vectorized(self, timestamp: float):
@@ -282,13 +282,13 @@ class SatelliteNetwork:
         if current < 0 or current >= self.num_nodes or sink < 0 or sink >= self.num_nodes or current == sink:
             return None
         self._ensure_shortest_next_hop_rows(np.array([sink], dtype=np.int64))
-        next_hop = int(self._shortest_next_hops[sink, current])
+        next_hop = int(self._shortest_act[sink, current])
         return next_hop if next_hop >= 0 else None
 
     def get_shortest_next_hops(self, current: np.ndarray, sink: np.ndarray) -> np.ndarray:
-        next_hops = np.full(len(current), -1, dtype=np.int64)
+        act = np.full(len(current), -1, dtype=np.int64)
         if len(current) == 0:
-            return next_hops
+            return act
 
         valid = (
             (current >= 0)
@@ -298,12 +298,12 @@ class SatelliteNetwork:
             & (current != sink)
         )
         if not valid.any():
-            return next_hops
+            return act
 
         target_sinks = np.unique(sink[valid])
         self._ensure_shortest_next_hop_rows(target_sinks)
-        next_hops[valid] = self._shortest_next_hops[sink[valid], current[valid]]
-        return next_hops
+        act[valid] = self._shortest_act[sink[valid], current[valid]]
+        return act
 
     def precompute_shortest_next_hops(self, sinks: np.ndarray):
         self._ensure_shortest_next_hop_rows(np.asarray(sinks, dtype=np.int64))
@@ -314,7 +314,7 @@ class SatelliteNetwork:
         self._ensure_shortest_next_hop_rows(valid_sinks)
         rows = np.full((len(sinks), self.num_nodes), -1, dtype=np.int64)
         valid = (sinks >= 0) & (sinks < self.num_nodes)
-        rows[valid] = self._shortest_next_hops[sinks[valid]]
+        rows[valid] = self._shortest_act[sinks[valid]]
         return rows
 
     def _ensure_shortest_next_hop_rows(self, sinks: np.ndarray):
@@ -338,5 +338,5 @@ class SatelliteNetwork:
         next_hop_rows[next_hop_rows < 0] = -1
         next_hop_rows[np.arange(len(missing_sinks)), missing_sinks] = -1
 
-        self._shortest_next_hops[missing_sinks] = next_hop_rows
+        self._shortest_act[missing_sinks] = next_hop_rows
         self._shortest_next_hop_ready[missing_sinks] = True

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import numpy as np
 
-from sat_net.solver.base_solver import BaseSolver, RoutingBatch, RoutingDecision
+from sat_net.agent.base_agent import BaseAgent, RoutingBatch, RoutingDecision
 
 
 def spf_next_hops(
@@ -22,8 +22,8 @@ def spf_next_hops(
     return np.where(valid, table_next_hops, -1).astype(np.int64, copy=False)
 
 
-class SPF(BaseSolver):
-    """Shortest-path policy backed by a precomputed region-to-next-hop table."""
+class SPFAgent(BaseAgent):
+    """Shortest-path routing agent backed by a precomputed region-to-next-hop table."""
 
     requires_shortest_path_table = True
 
@@ -37,7 +37,7 @@ class SPF(BaseSolver):
     def get_stats(self) -> str | None:
         return "backend=numpy"
 
-    def next_hops(self, batch: RoutingBatch) -> RoutingDecision:
+    def act(self, batch: RoutingBatch) -> RoutingDecision:
         if batch.region_next_hop_table is None:
             raise ValueError("SPF requires region_next_hop_table in RoutingBatch.")
 

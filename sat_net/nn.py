@@ -150,12 +150,33 @@ def quantile_huber_loss(
     quantile_values: torch.Tensor,
     target_values: torch.Tensor,
     taus: torch.Tensor,
+    sample_weights: torch.Tensor | None = None,
     kappa: float = 1.0,
 ) -> torch.Tensor:
     diff = target_values.unsqueeze(1) - quantile_values.unsqueeze(2)
     huber = torch.where(diff.abs() <= kappa, 0.5 * diff.square(), kappa * (diff.abs() - 0.5 * kappa))
     weight = torch.abs(taus.unsqueeze(-1) - (diff < 0).float())
-    return (weight * huber).mean()
+    loss = weight * huber
+    if sample_weights is None:
+        return loss.mean()
+    sample_loss = loss.flatten(start_dim=1).mean(dim=1, keepdim=True)
+    return weighted_mean(sample_loss, sample_weights)
+
+
+def normalized_sample_weights(weights: torch.Tensor) -> torch.Tensor:
+    weights = weights.float()
+    return weights / weights.mean().clamp_min(1e-6)
+
+
+def weighted_mean(values: torch.Tensor, weights: torch.Tensor) -> torch.Tensor:
+    weights = normalized_sample_weights(weights)
+    while weights.ndim < values.ndim:
+        weights = weights.unsqueeze(-1)
+    return (values * weights).mean()
+
+
+def weighted_mse_loss(input_values: torch.Tensor, target_values: torch.Tensor, weights: torch.Tensor) -> torch.Tensor:
+    return weighted_mean((input_values - target_values).square(), weights)
 
 
 def calc_heuristic_entropy(action_dim: int, max_action_prob: float) -> float:
@@ -177,6 +198,10 @@ class Batch:
     next_states: torch.Tensor
     next_action_masks: torch.Tensor
     target_costs: torch.Tensor
+    weights: torch.Tensor
+    flowlet_ids: torch.Tensor
+    agent_ids: torch.Tensor
+    next_agent_ids: torch.Tensor
 
 
 class ReplayBuffer:
@@ -193,6 +218,10 @@ class ReplayBuffer:
         self.next_states = np.zeros((self.buffer_size, state_dim), dtype=np.float32)
         self.next_action_masks = np.zeros((self.buffer_size, action_dim), dtype=bool)
         self.target_costs = np.zeros((self.buffer_size, 1), dtype=np.float32)
+        self.weights = np.ones((self.buffer_size, 1), dtype=np.float32)
+        self.flowlet_ids = np.full((self.buffer_size, 1), -1, dtype=np.int64)
+        self.agent_ids = np.full((self.buffer_size, 1), -1, dtype=np.int64)
+        self.next_agent_ids = np.full((self.buffer_size, 1), -1, dtype=np.int64)
         self.ptr = 0
         self.current_size = 0
 
@@ -208,6 +237,10 @@ class ReplayBuffer:
         next_state: np.ndarray,
         next_action_mask: np.ndarray,
         target_cost: float | None,
+        weight: float = 1.0,
+        flowlet_id: int = -1,
+        agent_id: int = -1,
+        next_agent_id: int = -1,
     ) -> None:
         idx = self.ptr
         self.states[idx] = state
@@ -220,6 +253,10 @@ class ReplayBuffer:
         self.next_states[idx] = next_state
         self.next_action_masks[idx] = next_action_mask
         self.target_costs[idx, 0] = 0.0 if target_cost is None else target_cost
+        self.weights[idx, 0] = max(float(weight), 1.0)
+        self.flowlet_ids[idx, 0] = int(flowlet_id)
+        self.agent_ids[idx, 0] = int(agent_id)
+        self.next_agent_ids[idx, 0] = int(next_agent_id)
         self.ptr = (self.ptr + 1) % self.buffer_size
         self.current_size = min(self.current_size + 1, self.buffer_size)
 
@@ -236,7 +273,32 @@ class ReplayBuffer:
             next_states=torch.as_tensor(self.next_states[indices], dtype=torch.float32, device=self.device),
             next_action_masks=torch.as_tensor(self.next_action_masks[indices], dtype=torch.bool, device=self.device),
             target_costs=torch.as_tensor(self.target_costs[indices], dtype=torch.float32, device=self.device),
+            weights=torch.as_tensor(self.weights[indices], dtype=torch.float32, device=self.device),
+            flowlet_ids=torch.as_tensor(self.flowlet_ids[indices], dtype=torch.long, device=self.device),
+            agent_ids=torch.as_tensor(self.agent_ids[indices], dtype=torch.long, device=self.device),
+            next_agent_ids=torch.as_tensor(self.next_agent_ids[indices], dtype=torch.long, device=self.device),
         )
+
+    def metadata_summary(self) -> dict[str, float | int]:
+        if self.current_size == 0:
+            return {
+                "replay_size": 0,
+                "sample_weight_mean": 0.0,
+                "sample_weight_max": 0.0,
+                "unique_agent_count": 0,
+                "unique_next_agent_count": 0,
+            }
+
+        weights = self.weights[: self.current_size, 0]
+        agent_ids = self.agent_ids[: self.current_size, 0]
+        next_agent_ids = self.next_agent_ids[: self.current_size, 0]
+        return {
+            "replay_size": int(self.current_size),
+            "sample_weight_mean": float(weights.mean()),
+            "sample_weight_max": float(weights.max()),
+            "unique_agent_count": int(len(np.unique(agent_ids[agent_ids >= 0]))),
+            "unique_next_agent_count": int(len(np.unique(next_agent_ids[next_agent_ids >= 0]))),
+        }
 
     def __len__(self) -> int:
         return self.current_size

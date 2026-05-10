@@ -1,15 +1,19 @@
+import time
+from collections.abc import Mapping
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any
 
 import numpy as np
 import pandas as pd
 
 from sat_net.network import SatelliteNetwork
-from sat_net.solver.base_solver import ACTION_COUNT, BaseSolver
+from sat_net.agent.base_agent import ACTION_COUNT, RoutingBatch, RoutingDecision
 from sat_net.sim_kernel import (
+    FLOWLET_AT_NODE,
     FLOWLET_DELIVERED,
     FLOWLET_DROPPED,
     FLOWLET_NOT_STARTED,
+    FLOWLET_ON_LINK,
     FlowletState,
     LinkState,
     activate_flowlets_at_slot_mask,
@@ -80,10 +84,9 @@ class RoutingEnv:
         self.action_dim = ACTION_COUNT  # N, E, S, W - fixed for satellite routing
         self.obs_dim = 94
 
-        self.current_solver: Optional["BaseSolver"] = None
-
         self.verbose = self.config.verbose
         self.update_interval_ms = self.config.update_interval_ms
+        self.progress_interval_seconds = float(self.config.get("progress_interval_seconds", 60.0))
 
         self.next_flowlet_id = 0
         self._region_positions = np.array(
@@ -105,6 +108,17 @@ class RoutingEnv:
         self._array_metrics: Metrics | None = None
         self._flowlets: FlowletState | None = None
         self._links: LinkState | None = None
+        self._include_spf_table = False
+        self._episode_started = False
+        self._episode_done = False
+        self._step_index = 0
+        self._num_steps = 0
+        self._end_time = 0.0
+        self._next_topology_time = 0.0
+        self._wall_start_time = 0.0
+        self._progress_interval_ms = 0.0
+        self._next_progress_time = 0.0
+        self._pending_routing_batch: RoutingBatch | None = None
 
     def _create_network(self):
         """Create the network based on the configuration."""
@@ -140,14 +154,18 @@ class RoutingEnv:
                     distances[i, j] = source.distance_to(target)
         return distances
 
-    def reset(self, seed=None, start_time=None):
+    def reset(self, seed=None, start_time=None, options: dict | None = None, include_spf_table: bool | None = None):
         """
-        Reset the environment to the initial state.
+        Reset the multi-agent environment and return the first decision batch.
 
         Returns:
-            Initial observations for all agents
+            A tuple of (RoutingBatch, info). Each RoutingBatch row is one
+            satellite-agent decision for one flowlet.
         """
         self._set_seed(seed)
+        options = {} if options is None else options
+        if include_spf_table is None:
+            include_spf_table = bool(options.get("include_spf_table", False))
 
         self.network = self._create_network()
 
@@ -157,6 +175,9 @@ class RoutingEnv:
         self._array_metrics = None
         self._flowlets = None
         self._links = None
+        self._pending_routing_batch = None
+        self._episode_started = False
+        self._episode_done = False
 
         if start_time is None:
             self.start_time = 0
@@ -166,53 +187,95 @@ class RoutingEnv:
         self.network.update_topology(self.start_time, None)
         self._refresh_satellite_index_cache()
         self._update_region_access_cache()
+        self._start_episode(include_spf_table=include_spf_table)
+        return self._pending_routing_batch, self._build_step_info()
 
-    def run(
-        self,
-        solver: "BaseSolver",
-    ):
-        return self._run_slot_array_kernel(solver)
-
-    def _run_slot_array_kernel(
-        self,
-        solver: "BaseSolver",
-    ):
-        self.current_solver = solver
+    def _start_episode(self, include_spf_table: bool = False):
+        self._include_spf_table = bool(include_spf_table)
         self._build_link_array_cache()
         self._generate_flowlet_state()
 
-        num_steps = int(np.ceil(self.time_limit / self.slot_ms))
-        next_topology_time = self.start_time + self.update_interval_ms
-        end_time = self.start_time + self.time_limit
+        self._num_steps = int(np.ceil(self.time_limit / self.slot_ms))
+        self._step_index = 0
+        self._end_time = self.start_time + self.time_limit
+        self._next_topology_time = self.start_time + self.update_interval_ms
+        self._wall_start_time = time.perf_counter()
+        self._progress_interval_ms = max(self.progress_interval_seconds * 1000.0, 0.0)
+        self._next_progress_time = self.start_time
+        self._episode_started = True
+        self._episode_done = False
 
         if self.verbose:
-            print("Env is in slot-array evaluation mode")
+            print("Env is in slot-array evaluation mode", flush=True)
+            print(
+                f"Generated {self._flowlets.count:,} flowlets over {self._num_steps:,} slots "
+                f"({self.time_limit / 1000.0:.1f}s simulated)",
+                flush=True,
+            )
+        self._pending_routing_batch = self._prepare_step_observation()
 
-        for step in range(num_steps):
-            self.current_time = self.start_time + step * self.slot_ms
-            if self.current_time >= end_time:
-                break
+    def step(self, action=None):
+        """
+        Advance one simulation slot.
 
-            if self.current_time >= next_topology_time:
-                while self.current_time >= next_topology_time:
-                    next_topology_time += self.update_interval_ms
-                self.network.update_topology(self.current_time, None)
-                self.topology_update_steps += 1
-                self._update_region_access_cache()
-                self._refresh_link_state_arrays()
-                self._drop_flowlets_on_disconnected_links()
+        Args:
+            action: Either a row-aligned action-index array with one entry per
+                RoutingBatch row, a MARL dict keyed by satellite-agent id, or a
+                RoutingDecision for agent adapters that already return next-hop
+                satellite ids.
 
-            self._release_transmitted_flowlets()
-            route_ready_mask = self._handle_flowlet_arrivals_mask()
-            route_ready_mask |= self._activate_flowlets_at_current_slot_mask()
-            if route_ready_mask.any():
-                self._route_flowlets_at_nodes_mask(route_ready_mask)
-            self.current_solver.observe_flowlet_outcomes(self._flowlets, self.current_time)
-            self.current_solver.on_train_signal()
+        Returns:
+            (observation, reward, terminated, truncated, info)
+        """
+        if not self._episode_started:
+            raise RuntimeError("Call reset() before step().")
+        if self._episode_done:
+            return (
+                self._pending_routing_batch or self._empty_routing_batch(),
+                np.empty(0, dtype=np.float32),
+                True,
+                False,
+                self._build_step_info(),
+            )
 
-        self.current_time = end_time
-        self.current_solver.observe_flowlet_outcomes(self._flowlets, self.current_time)
-        self._array_metrics = self._calc_array_metrics()
+        batch = self._pending_routing_batch or self._empty_routing_batch()
+        act = self._normalize_step_action(action, len(batch.flowlet_ids))
+        reward = np.zeros(len(batch.flowlet_ids), dtype=np.float32)
+        if len(batch.flowlet_ids) > 0:
+            self._apply_routing_actions(batch, act)
+
+        self._step_index += 1
+        if self._step_index >= self._num_steps:
+            self.current_time = self._end_time
+            self._episode_done = True
+            self._pending_routing_batch = self._empty_routing_batch()
+            if self.verbose and self._progress_interval_ms > 0:
+                self._print_progress(
+                    step=self._num_steps,
+                    num_steps=self._num_steps,
+                    wall_start_time=self._wall_start_time,
+            )
+            self._array_metrics = self._calc_array_metrics()
+            return self._pending_routing_batch, reward, True, False, self._build_step_info()
+
+        self._pending_routing_batch = self._prepare_step_observation()
+        return self._pending_routing_batch, reward, False, False, self._build_step_info()
+
+    @property
+    def observation(self) -> RoutingBatch:
+        return self._pending_routing_batch or self._empty_routing_batch()
+
+    @property
+    def flowlets(self) -> FlowletState | None:
+        return self._flowlets
+
+    @property
+    def links(self) -> LinkState | None:
+        return self._links
+
+    @property
+    def terminated(self) -> bool:
+        return self._episode_done
 
     def _build_link_array_cache(self):
         self._links = create_link_state(
@@ -305,27 +368,213 @@ class RoutingEnv:
             no_available_sat_reason=int(NetworkError.NO_AVAILABLE_SAT),
         )
 
-    def _route_flowlets_at_nodes(self, at_node_ids: np.ndarray):
-        if len(at_node_ids) == 0:
-            return
+    def _prepare_step_observation(self) -> RoutingBatch:
+        if self._flowlets is None or self._links is None:
+            return self._empty_routing_batch()
+        if self._step_index >= self._num_steps:
+            return self._empty_routing_batch()
 
-        delivered_ids, route_ids = self._partition_deliverable_flowlets(at_node_ids)
-        if len(delivered_ids) > 0:
-            self._deliver_flowlet_ids(delivered_ids)
-        if len(route_ids) == 0:
-            return
+        self.current_time = self.start_time + self._step_index * self.slot_ms
+        if self.current_time >= self._end_time:
+            self._episode_done = True
+            return self._empty_routing_batch()
 
-        self._route_flowlets_batch(route_ids)
+        if self.current_time >= self._next_topology_time:
+            while self.current_time >= self._next_topology_time:
+                self._next_topology_time += self.update_interval_ms
+            self.network.update_topology(self.current_time, None)
+            self.topology_update_steps += 1
+            self._update_region_access_cache()
+            self._refresh_link_state_arrays()
+            self._drop_flowlets_on_disconnected_links()
 
-    def _route_flowlets_at_nodes_mask(self, at_node_mask: np.ndarray):
+        self._release_transmitted_flowlets()
+        route_ready_mask = self._handle_flowlet_arrivals_mask()
+        route_ready_mask |= self._activate_flowlets_at_current_slot_mask()
+
+        batch = self._build_step_routing_batch(route_ready_mask)
+        if self.verbose and self._progress_interval_ms > 0 and self.current_time >= self._next_progress_time:
+            self._print_progress(
+                step=self._step_index + 1,
+                num_steps=self._num_steps,
+                wall_start_time=self._wall_start_time,
+            )
+            while self._next_progress_time <= self.current_time:
+                self._next_progress_time += self._progress_interval_ms
+        return batch
+
+    def _build_step_routing_batch(self, at_node_mask: np.ndarray) -> RoutingBatch:
         if not at_node_mask.any():
-            return
+            return self._empty_routing_batch()
 
         delivered_mask, route_mask = self._partition_deliverable_flowlet_mask(at_node_mask)
         if delivered_mask.any():
             self._deliver_flowlet_ids(flowlet_mask_to_ids(delivered_mask))
-        if route_mask.any():
-            self._route_flowlets_batch(flowlet_mask_to_ids(route_mask))
+        if not route_mask.any():
+            return self._empty_routing_batch()
+
+        route_ids = flowlet_mask_to_ids(route_mask)
+        current_sats = self._flowlets.current_sat[route_ids]
+        target_regions = self._flowlets.target_region_id[route_ids]
+        candidate_local_mask, target_access_sats = prepare_route_candidate_mask(
+            flowlets=self._flowlets,
+            route_flowlet_ids=route_ids,
+            nearest_region_sat_ids=self._nearest_region_sat_ids,
+            current_time=self.current_time,
+            no_available_sat_reason=int(NetworkError.NO_AVAILABLE_SAT),
+        )
+        candidate_ids = route_ids[candidate_local_mask]
+        if len(candidate_ids) == 0:
+            return self._empty_routing_batch()
+
+        current_sats = current_sats[candidate_local_mask]
+        target_regions = target_regions[candidate_local_mask]
+        if self._include_spf_table and not self._region_next_hop_eager_ready:
+            self._ensure_region_next_hops(target_regions)
+
+        return self._build_routing_batch(
+            flowlet_ids=candidate_ids,
+            current_sats=current_sats,
+            target_regions=target_regions,
+            target_access_sats=target_access_sats[candidate_local_mask],
+            include_spf_table=self._include_spf_table,
+        )
+
+    def _apply_routing_actions(self, batch: RoutingBatch, act: np.ndarray):
+        candidate_ids = batch.flowlet_ids
+        if len(act) != len(candidate_ids):
+            raise ValueError(f"Expected {len(candidate_ids)} actions, got {len(act)}.")
+        if len(candidate_ids) == 0:
+            return
+
+        routable_local_mask = apply_no_route_mask(
+            flowlets=self._flowlets,
+            candidate_ids=candidate_ids,
+            act=act,
+            current_time=self.current_time,
+            failed_to_find_next_hop_reason=int(NetworkError.FAILED_TO_FIND_NEXT_HOP),
+        )
+        routable_ids = candidate_ids[routable_local_mask]
+        if len(routable_ids) == 0:
+            return
+
+        scheduled_ids, link_ids, scheduled_act = prepare_link_schedule_inputs(
+            flowlets=self._flowlets,
+            links=self._links,
+            routable_ids=routable_ids,
+            current_sats=batch.current_sat_ids[routable_local_mask],
+            act=act[routable_local_mask],
+            neighbor_sat_ids_by_node=self.network.neighbor_sat_ids,
+            current_time=self.current_time,
+            invalid_next_hop_reason=int(NetworkError.INVALID_NEXT_HOP),
+        )
+        if len(scheduled_ids) == 0:
+            return
+
+        rejected_ids = self._schedule_flowlets_by_link(
+            flowlet_ids=scheduled_ids,
+            link_ids=link_ids,
+            act=scheduled_act,
+        )
+        if len(rejected_ids) > 0:
+            self._drop_flowlet_ids(rejected_ids, NetworkError.LINK_FULL)
+
+    def _normalize_step_action(self, action, expected_count: int) -> np.ndarray:
+        if action is None:
+            if expected_count == 0:
+                return np.empty(0, dtype=np.int64)
+            raise ValueError(f"Expected {expected_count} actions, got None.")
+        if isinstance(action, RoutingDecision):
+            return np.asarray(action.next_hop_sat_ids, dtype=np.int64)
+        if isinstance(action, Mapping):
+            action = self._action_dict_to_row_actions(action, expected_count)
+
+        actions = np.asarray(action, dtype=np.int64)
+        if actions.ndim != 1:
+            raise ValueError(f"Actions must be a 1-D array, got shape {actions.shape}.")
+        if len(actions) != expected_count:
+            raise ValueError(f"Expected {expected_count} actions, got {len(actions)}.")
+        if expected_count == 0:
+            return np.empty(0, dtype=np.int64)
+
+        batch = self.observation
+        rows = np.arange(expected_count)
+        valid = (actions >= 0) & (actions < ACTION_COUNT)
+        act = np.full(expected_count, -1, dtype=np.int64)
+        if valid.any():
+            act[valid] = batch.neighbor_sat_ids[rows[valid], actions[valid]]
+        return act
+
+    def _action_dict_to_row_actions(self, action_by_agent: Mapping, expected_count: int) -> np.ndarray:
+        if expected_count == 0:
+            return np.empty(0, dtype=np.int64)
+
+        batch = self.observation
+        actions = np.full(expected_count, -1, dtype=np.int64)
+        unique_agents = np.unique(batch.agent_ids)
+        for agent_id in unique_agents:
+            agent_key = int(agent_id)
+            if agent_key not in action_by_agent:
+                raise ValueError(f"Missing action for active satellite agent {agent_key}.")
+
+            rows = np.flatnonzero(batch.agent_ids == agent_id)
+            value = np.asarray(action_by_agent[agent_key], dtype=np.int64)
+            if value.ndim == 0:
+                actions[rows] = int(value)
+            elif value.ndim == 1 and len(value) == len(rows):
+                actions[rows] = value
+            else:
+                raise ValueError(
+                    f"Action for satellite agent {agent_key} must be scalar or length {len(rows)}, "
+                    f"got shape {value.shape}."
+                )
+        return actions
+
+    def _empty_routing_batch(self) -> RoutingBatch:
+        neighbor_i = np.empty((0, ACTION_COUNT), dtype=np.int64)
+        neighbor_f = np.empty((0, ACTION_COUNT), dtype=np.float64)
+        return RoutingBatch(
+            flowlet_ids=np.empty(0, dtype=np.int64),
+            current_sat_ids=np.empty(0, dtype=np.int64),
+            target_region_ids=np.empty(0, dtype=np.int64),
+            target_access_sat_ids=np.empty(0, dtype=np.int64),
+            neighbor_sat_ids=neighbor_i,
+            neighbor_link_ids=neighbor_i.astype(np.int32, copy=True),
+            action_mask=np.empty((0, ACTION_COUNT), dtype=bool),
+            neighbor_queue_load=neighbor_f,
+            neighbor_link_capacity=neighbor_f.copy(),
+            neighbor_link_delay=neighbor_f.copy(),
+            neighbor_link_free_time=neighbor_f.copy(),
+            flowlet_size=np.empty(0, dtype=np.float64),
+            packet_count=np.empty(0, dtype=np.int64),
+            ttl=np.empty(0, dtype=np.int16),
+            current_time=self.current_time,
+            region_next_hop_table=self._region_next_hop_table if self._include_spf_table else None,
+            region_next_hop_version=self._region_next_hop_version if self._include_spf_table else 0,
+            hops=np.empty(0, dtype=np.int16),
+            queue_delay=np.empty(0, dtype=np.float64),
+            transmission_delay=np.empty(0, dtype=np.float64),
+            propagation_delay=np.empty(0, dtype=np.float64),
+            total_queue_cost=np.empty(0, dtype=np.float64),
+            shortest_gcd=np.empty(0, dtype=np.float64),
+            initial_gcd=np.empty(0, dtype=np.float64),
+        )
+
+    def _build_step_info(self) -> dict:
+        batch = self._pending_routing_batch
+        decision_count = 0 if batch is None else batch.decision_count
+        active_agent_count = 0 if batch is None else len(batch.active_agent_ids)
+        return {
+            "time_ms": self.current_time,
+            "step": self._step_index,
+            "num_steps": self._num_steps,
+            "progress": self._step_index / max(self._num_steps, 1),
+            "decision_count": decision_count,
+            "active_agent_count": active_agent_count,
+            "route_count": decision_count,
+            "topology_updates": self.topology_update_steps,
+            "terminated": self._episode_done,
+        }
 
     def _partition_deliverable_flowlets(self, flowlet_ids: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
         flowlet_mask = np.zeros(self._flowlets.count, dtype=bool)
@@ -351,74 +600,6 @@ class RoutingEnv:
             access_data_rate=self.access_data_rate,
         )
 
-    def _route_flowlets_batch(self, flowlet_ids: np.ndarray):
-        current_sats = self._flowlets.current_sat[flowlet_ids]
-        target_regions = self._flowlets.target_region_id[flowlet_ids]
-        candidate_local_mask, target_access_sats = prepare_route_candidate_mask(
-            flowlets=self._flowlets,
-            route_flowlet_ids=flowlet_ids,
-            nearest_region_sat_ids=self._nearest_region_sat_ids,
-            current_time=self.current_time,
-            no_available_sat_reason=int(NetworkError.NO_AVAILABLE_SAT),
-        )
-
-        candidate_ids = flowlet_ids[candidate_local_mask]
-        if len(candidate_ids) == 0:
-            return
-
-        current_sats = current_sats[candidate_local_mask]
-        target_regions = target_regions[candidate_local_mask]
-        if solver_requires_spf := self.current_solver.requires_shortest_path_table:
-            if not self._region_next_hop_eager_ready:
-                self._ensure_region_next_hops(target_regions)
-
-        batch = self._build_routing_batch(
-            flowlet_ids=candidate_ids,
-            current_sats=current_sats,
-            target_regions=target_regions,
-            target_access_sats=target_access_sats[candidate_local_mask],
-            include_spf_table=solver_requires_spf,
-        )
-        decision = self.current_solver.next_hops(batch)
-        next_hops = np.asarray(decision.next_hop_sat_ids, dtype=np.int64)
-        if len(next_hops) != len(candidate_ids):
-            raise ValueError(
-                f"Solver {self.current_solver.name} returned {len(next_hops)} next hops "
-                f"for {len(candidate_ids)} flowlets."
-            )
-
-        routable_local_mask = apply_no_route_mask(
-            flowlets=self._flowlets,
-            candidate_ids=candidate_ids,
-            next_hops=next_hops,
-            current_time=self.current_time,
-            failed_to_find_next_hop_reason=int(NetworkError.FAILED_TO_FIND_NEXT_HOP),
-        )
-        routable_ids = candidate_ids[routable_local_mask]
-        if len(routable_ids) == 0:
-            return
-
-        scheduled_ids, link_ids, scheduled_next_hops = prepare_link_schedule_inputs(
-            flowlets=self._flowlets,
-            links=self._links,
-            routable_ids=routable_ids,
-            current_sats=current_sats[routable_local_mask],
-            next_hops=next_hops[routable_local_mask],
-            neighbor_sat_ids_by_node=self.network.neighbor_sat_ids,
-            current_time=self.current_time,
-            invalid_next_hop_reason=int(NetworkError.INVALID_NEXT_HOP),
-        )
-        if len(scheduled_ids) == 0:
-            return
-
-        rejected_ids = self._schedule_flowlets_by_link(
-            flowlet_ids=scheduled_ids,
-            link_ids=link_ids,
-            next_hops=scheduled_next_hops,
-        )
-        if len(rejected_ids) > 0:
-            self._drop_flowlet_ids(rejected_ids, NetworkError.LINK_FULL)
-
     def _build_routing_batch(
         self,
         flowlet_ids: np.ndarray,
@@ -427,7 +608,7 @@ class RoutingEnv:
         target_access_sats: np.ndarray,
         include_spf_table: bool,
     ):
-        return build_routing_batch(
+        batch = build_routing_batch(
             flowlets=self._flowlets,
             links=self._links,
             flowlet_ids=flowlet_ids,
@@ -439,19 +620,31 @@ class RoutingEnv:
             region_next_hop_table=self._region_next_hop_table if include_spf_table else None,
             region_next_hop_version=self._region_next_hop_version if include_spf_table else 0,
         )
+        remaining_distances = self._remaining_target_distances(current_sats, target_regions)
+        batch.shortest_gcd = remaining_distances
+        self._flowlets.shortest_gcd[flowlet_ids] = remaining_distances
+        return batch
+
+    def _remaining_target_distances(self, current_sats: np.ndarray, target_regions: np.ndarray) -> np.ndarray:
+        if len(current_sats) == 0:
+            return np.empty(0, dtype=np.float64)
+        sat_positions = self.network._satellite_positions_by_id[current_sats]
+        target_positions = self._region_positions[target_regions]
+        delta = sat_positions - target_positions
+        return np.linalg.norm(delta, axis=1)
 
     def _schedule_flowlets_by_link(
         self,
         flowlet_ids: np.ndarray,
         link_ids: np.ndarray,
-        next_hops: np.ndarray,
+        act: np.ndarray,
     ) -> np.ndarray:
         return schedule_flowlets_by_link(
             flowlets=self._flowlets,
             links=self._links,
             flowlet_ids=flowlet_ids,
             link_ids=link_ids,
-            next_hops=next_hops,
+            act=act,
             current_time=self.current_time,
         )
 
@@ -595,10 +788,59 @@ class RoutingEnv:
         metrics = self.calc_metrics()
         self._print(metrics.get_summary() + " " * 4, end="\r")
 
+    def _print_progress(self, step: int, num_steps: int, wall_start_time: float):
+        flowlets = self._flowlets
+        if flowlets is None:
+            return
+
+        status = flowlets.status
+        not_started = int(np.count_nonzero(status == FLOWLET_NOT_STARTED))
+        at_node = int(np.count_nonzero(status == FLOWLET_AT_NODE))
+        on_link = int(np.count_nonzero(status == FLOWLET_ON_LINK))
+        delivered = int(np.count_nonzero(status == FLOWLET_DELIVERED))
+        dropped = int(np.count_nonzero(status == FLOWLET_DROPPED))
+        generated = flowlets.count - not_started
+        active = at_node + on_link
+
+        sim_elapsed_ms = min(max(self.current_time - self.start_time, 0.0), self.time_limit)
+        progress = sim_elapsed_ms / max(self.time_limit, 1e-12)
+        wall_elapsed = time.perf_counter() - wall_start_time
+        eta = wall_elapsed * (1.0 - progress) / progress if progress > 1e-9 else None
+        eta_text = f"{eta:.1f}s" if eta is not None else "n/a"
+        rss_mb = self._get_max_rss_mb()
+        rss_text = f" max_rss={rss_mb:.0f}MB" if rss_mb is not None else ""
+
+        self._print(
+            f"progress {progress * 100.0:6.2f}% "
+            f"step={min(step, num_steps):,}/{num_steps:,} "
+            f"wall={wall_elapsed:.1f}s eta={eta_text} "
+            f"flowlets={generated:,}/{flowlets.count:,} "
+            f"active={active:,}(node={at_node:,},link={on_link:,}) "
+            f"ok={delivered:,} drop={dropped:,} "
+            f"topo={self.topology_update_steps}{rss_text}"
+        )
+
+    @staticmethod
+    def _get_max_rss_mb() -> float | None:
+        try:
+            import resource
+        except ImportError:
+            return None
+
+        rss = float(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss)
+        if rss <= 0:
+            return None
+        if rss > 10_000_000:
+            return rss / (1024.0 * 1024.0)
+        return rss / 1024.0
+
     def _print(self, line: str, end=None):
+        kwargs = {"flush": True}
+        if end is not None:
+            kwargs["end"] = end
         print(
             f"{ms2str(self.start_time)}+{ms2str(self.current_time-self.start_time)}: {line}",
-            end=end,
+            **kwargs,
         )
 
     def _update_region_access_cache(self):

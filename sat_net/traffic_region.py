@@ -72,6 +72,23 @@ def _load_records_from_file(region_file: Path) -> list[dict]:
     return data
 
 
+def _population_array_from_file(path: Path, channel: str, max_value: float | None = None) -> np.ndarray:
+    if path.suffix == ".npy":
+        values = np.load(path).astype(np.float64, copy=False)
+    elif path.suffix == ".npz":
+        with np.load(path) as data:
+            key = "population" if "population" in data else data.files[0]
+            values = data[key].astype(np.float64, copy=False)
+    else:
+        values = _population_array_from_image(path, channel)
+
+    values = np.nan_to_num(values, nan=0.0, posinf=0.0, neginf=0.0)
+    values[values < 0] = 0
+    if max_value is not None:
+        values[values > max_value] = 0
+    return values
+
+
 def _population_array_from_image(path: Path, channel: str) -> np.ndarray:
     with Image.open(path) as img:
         arr = np.asarray(img)
@@ -94,8 +111,6 @@ def _population_array_from_image(path: Path, channel: str) -> np.ndarray:
     else:
         raise ValueError(f"Unsupported population map shape {arr.shape}: {path}")
 
-    values = np.nan_to_num(values, nan=0.0, posinf=0.0, neginf=0.0)
-    values[values < 0] = 0
     return values
 
 
@@ -106,8 +121,10 @@ def _regions_from_population_map(
     max_regions: int | None,
     min_weight: float,
     channel: str,
+    max_value: float | None,
+    area_scale_weights: bool,
 ) -> list[TrafficRegion]:
-    values = _population_array_from_image(map_path, channel=channel)
+    values = _population_array_from_file(map_path, channel=channel, max_value=max_value)
     height, width = values.shape
 
     y_edges = np.linspace(0, height, lat_bins + 1, dtype=int)
@@ -124,7 +141,9 @@ def _regions_from_population_map(
             x0, x1 = x_edges[ix], x_edges[ix + 1]
             if x1 <= x0:
                 continue
-            weight = float(values[y0:y1, x0:x1].sum() * area_scale)
+            weight = float(values[y0:y1, x0:x1].sum())
+            if area_scale_weights:
+                weight *= area_scale
             if weight <= min_weight:
                 continue
             lon = ((x0 + x1) * 0.5 / width) * 360.0 - 180.0
@@ -170,6 +189,8 @@ class TrafficRegionModel:
                 max_regions=traffic_config.get("max_regions", 512),
                 min_weight=float(traffic_config.get("min_region_weight", 0.0)),
                 channel=str(traffic_config.get("population_channel", "luma")),
+                max_value=traffic_config.get("population_max_value", None),
+                area_scale_weights=bool(traffic_config.get("population_area_scale", True)),
             )
         elif region_file is not None and region_file.exists():
             regions = _regions_from_records(_load_records_from_file(region_file))

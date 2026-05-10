@@ -7,10 +7,9 @@ from typing import Any
 
 import numpy as np
 import torch
-import torch.nn.functional as F
 
-from sat_net.nn import MLP, ReplayBuffer, hard_update, soft_update
-from sat_net.solver.rl_base import BatchedRLSolver
+from sat_net.nn import MLP, ReplayBuffer, hard_update, soft_update, weighted_mse_loss
+from sat_net.agent.rl_base import BatchedRLAgent
 from sat_net.util import NamedDict
 
 
@@ -105,7 +104,7 @@ class DQNAgent:
             next_actions = next_q_main.argmax(1, keepdim=True)
             next_q = self.Q_target(batch.next_states).gather(1, next_actions)
             target_q = batch.rewards + bootstrap_mask.float() * self.gamma * next_q
-        loss = F.mse_loss(current_q, target_q)
+        loss = weighted_mse_loss(current_q, target_q, batch.weights)
 
         self.optimizer.zero_grad()
         loss.backward()
@@ -164,7 +163,7 @@ class DQNAgent:
         self.epsilon_step_count = int(checkpoint.get("epsilon_step_count", 0))
 
 
-class MaDQN(BatchedRLSolver):
+class MaDQN(BatchedRLAgent):
     def __init__(self, config: NamedDict, obs_dim: int = 94, action_dim: int = 4, tf_writer: Any = None):
         super().__init__(config=config, obs_dim=obs_dim, action_dim=action_dim, tf_writer=tf_writer)
         self.global_agent = DQNAgent(self.obs_dim, self.action_dim, config, self.device, tf_writer)

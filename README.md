@@ -24,9 +24,13 @@ The simulator has been refactored from an event-queue packet model into a data-o
 2. **Flowlet batches**: A flowlet represents a batch of packets with common source/target regions.
 3. **Array network state**: Satellite positions, neighbor/link matrices, link delays, connectivity, queues, and flowlet state are stored in NumPy arrays.
 4. **Mask-first slot kernels**: `sat_net/sim_kernel.py` owns flowlet/link state transitions and returns full-length masks before NumPy compression.
-5. **Batched policy API**: Solvers receive `RoutingBatch` arrays and return vectorized `RoutingDecision` next hops.
-6. **SPF baseline**: Shortest-path next-hop rows are computed from sparse arrays, cached in a dense matrix, and refreshed with topology updates.
-7. **Torch RL on NumPy kernels**: The default path is NumPy/SciPy simulation plus PyTorch MaDQN/PRIMAL training.
+5. **MARL env API**: `RoutingEnv.reset()` returns a batched multi-agent `RoutingBatch`; every row is one satellite-agent decision for one flowlet.
+6. **MARL training pipeline**: `sat_net/pipeline.py` runs `reset -> agent.act -> env.step -> observe outcomes -> train update` episodes.
+7. **Reward and experiment logs**: `sat_net/reward.py` defines configurable transition rewards, and `sat_net/experiment.py` writes manifests, checkpoints, and train/eval metrics.
+8. **SPF baseline**: Shortest-path next-hop rows are computed from sparse arrays, cached in a dense matrix, and refreshed with topology updates.
+9. **Torch RL on NumPy kernels**: The default path is NumPy/SciPy simulation plus PyTorch MaDQN/PRIMAL training.
+
+The default Starlink configs use a downsampled WorldPop 2020 total-population grid at `assets/population/worldpop_total_population_2020_1440x720.npy`; regenerate it with `python scripts/fetch_worldpop_population.py`.
 
 ### 📊 Key Results
 
@@ -80,11 +84,11 @@ brew install proj geos
 ```
 </details>
 
-## 🧠 Routing Policies
+## 🧠 Routing Agents
 
-- **SPF**: Dijkstra shortest-path first, backed by dense satellite next-hop rows and region-to-next-hop tables.
-- **Batched policy contract**: `sat_net/solver/base_solver.py` defines `RoutingBatch` and `RoutingDecision`.
-- **RL solvers**: MaDQN, PRIMAL-Avg, and PRIMAL-CVaR have been rebuilt for batched routing with PyTorch replay buffers. MaIQN/MaSAC remain retired until they are ported to the same interface.
+- **SPFAgent**: Dijkstra shortest-path first, backed by dense satellite next-hop rows and region-to-next-hop tables.
+- **Batched MARL contract**: `sat_net/agent/base_agent.py` defines `RoutingBatch`, `RoutingDecision`, and `BaseAgent`.
+- **RL agents**: MaDQN, PRIMAL-Avg, and PRIMAL-CVaR have been rebuilt for batched routing with PyTorch replay buffers. MaIQN/MaSAC remain retired until they are ported to the same interface.
 
 ## 📁 Project Structure
 
@@ -92,15 +96,19 @@ brew install proj geos
 risk_aware_marl/
 ├── sat_net/                    # Core simulation framework
 │   ├── routing_env.py          # Slot-array routing environment
+│   ├── pipeline.py             # MARL train/eval episode pipeline
+│   ├── reward.py               # Transition reward and cost shaping
+│   ├── experiment.py           # Run manifests, metrics, and checkpoints
 │   ├── sim_kernel.py           # Flowlet/link array transition kernels
 │   ├── network.py              # Array-oriented satellite network topology
 │   ├── traffic_region.py       # Region/population traffic model
-│   └── solver/                 # Batched routing policy API
-│       ├── base_solver.py      # RoutingBatch/RoutingDecision contract
+│   └── agent/                  # Batched MARL routing-agent API
+│       ├── base_agent.py       # RoutingBatch/RoutingDecision/BaseAgent contract
 │       └── spf.py              # Shortest-path baseline
 ├── configs/                    # Configuration files
 │   ├── starlink_dvbs2_*.json  # Network configurations
-│   └── spf.json                # Solver configuration
+│   └── spf.json                # Agent configuration
+├── assets/population/          # Downsampled WorldPop population grid
 ├── figs/                       # Figures and plots
 └── runs_*/                     # Experiment results
 ```
@@ -119,7 +127,13 @@ python run_eval.py
 
 ### RL Training Status
 
-`run_train.py` executes policy rollouts through the batched interface. Use `configs/dqn.json`, `configs/primal_avg.json`, or `configs/primal_cvar.json` to train the rebuilt MaDQN/PRIMAL baselines.
+`run_train.py` executes agent episodes through `sat_net/pipeline.py`. Use `configs/dqn.json`, `configs/primal_avg.json`, or `configs/primal_cvar.json` to train the rebuilt MaDQN/PRIMAL baselines.
+
+```bash
+python run_train.py --agent configs/dqn.json --num_epochs 10 --eval_interval 5
+```
+
+Each run writes `manifest.json`, `summary.json`, checkpoint state, and CSV/JSONL metrics under `runs_train/<run_id>/`.
 
 ## 📄 License
 

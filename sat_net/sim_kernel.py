@@ -5,7 +5,7 @@ from dataclasses import dataclass
 import numpy as np
 
 from sat_net.geometric import LIGHT_SPEED_MS
-from sat_net.solver.base_solver import RoutingBatch
+from sat_net.agent.base_agent import RoutingBatch
 
 
 FLOWLET_NOT_STARTED = 0
@@ -445,6 +445,7 @@ def deliver_flowlet_ids(
     flowlets.propagation_delay[flowlet_ids] += final_prop_delay
     flowlets.transmission_delay[flowlet_ids] += final_tx_delay
     flowlets.delivery_time[flowlet_ids] = current_time + final_delay
+    flowlets.shortest_gcd[flowlet_ids] = 0.0
     flowlets.status[flowlet_ids] = FLOWLET_DELIVERED
 
 
@@ -483,6 +484,7 @@ def build_routing_batch(
         neighbor_link_delay=np.where(valid_link, links.delay[safe_link_ids], np.inf),
         neighbor_link_free_time=np.where(valid_link, links.free_time[safe_link_ids], np.inf),
         flowlet_size=flowlets.size[flowlet_ids],
+        packet_count=flowlets.packet_count[flowlet_ids],
         ttl=flowlets.ttl[flowlet_ids],
         current_time=current_time,
         region_next_hop_table=region_next_hop_table,
@@ -520,11 +522,11 @@ def prepare_route_candidate_mask(
 def apply_no_route_mask(
     flowlets: FlowletState,
     candidate_ids: np.ndarray,
-    next_hops: np.ndarray,
+    act: np.ndarray,
     current_time: float,
     failed_to_find_next_hop_reason: int,
 ) -> np.ndarray:
-    routable_local_mask = next_hops >= 0
+    routable_local_mask = act >= 0
     if (~routable_local_mask).any():
         drop_flowlet_ids(
             flowlets=flowlets,
@@ -540,12 +542,12 @@ def prepare_link_schedule_inputs(
     links: LinkState,
     routable_ids: np.ndarray,
     current_sats: np.ndarray,
-    next_hops: np.ndarray,
+    act: np.ndarray,
     neighbor_sat_ids_by_node: np.ndarray,
     current_time: float,
     invalid_next_hop_reason: int,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    neighbor_matches = neighbor_sat_ids_by_node[current_sats] == next_hops[:, None]
+    neighbor_matches = neighbor_sat_ids_by_node[current_sats] == act[:, None]
     direction_ids = np.argmax(neighbor_matches, axis=1)
     valid_neighbor = neighbor_matches.any(axis=1)
     link_ids = links.neighbor_link_ids[current_sats, direction_ids]
@@ -558,7 +560,7 @@ def prepare_link_schedule_inputs(
             current_time=current_time,
             reason=invalid_next_hop_reason,
         )
-    return routable_ids[schedulable_mask], link_ids[schedulable_mask], next_hops[schedulable_mask]
+    return routable_ids[schedulable_mask], link_ids[schedulable_mask], act[schedulable_mask]
 
 
 def schedule_flowlets_by_link(
@@ -566,7 +568,7 @@ def schedule_flowlets_by_link(
     links: LinkState,
     flowlet_ids: np.ndarray,
     link_ids: np.ndarray,
-    next_hops: np.ndarray,
+    act: np.ndarray,
     current_time: float,
 ) -> np.ndarray:
     if len(flowlet_ids) == 0:
@@ -575,7 +577,7 @@ def schedule_flowlets_by_link(
     order = np.argsort(link_ids, kind="stable")
     sorted_link_ids = link_ids[order]
     sorted_ids = flowlet_ids[order]
-    sorted_next_hops = next_hops[order]
+    sorted_act = act[order]
 
     sizes = flowlets.size[sorted_ids]
     cumulative_size = np.cumsum(sizes)
@@ -600,7 +602,7 @@ def schedule_flowlets_by_link(
 
     accepted_ids = sorted_ids[accepted]
     accepted_link_ids = sorted_link_ids[accepted]
-    accepted_next_hops = sorted_next_hops[accepted]
+    accepted_act = sorted_act[accepted]
     accepted_sizes = sizes[accepted]
 
     transmit_times = accepted_sizes / links.data_rate[accepted_link_ids]
@@ -640,7 +642,7 @@ def schedule_flowlets_by_link(
     flowlets.transmission_delay[accepted_ids] += transmit_times
     flowlets.total_queue_cost[accepted_ids] += wait_times
     flowlets.link_id[accepted_ids] = accepted_link_ids
-    flowlets.next_sat[accepted_ids] = accepted_next_hops
+    flowlets.next_sat[accepted_ids] = accepted_act
     flowlets.transmit_end_time[accepted_ids] = transmit_end_times
     flowlets.arrival_time[accepted_ids] = transmit_end_times + propagation_delays
     flowlets.scheduled_prop_delay[accepted_ids] = propagation_delays

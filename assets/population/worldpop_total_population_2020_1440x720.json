@@ -1,0 +1,21 @@
+{
+  "source": "WorldPop Total Population 1km ImageServer",
+  "source_url": "https://worldpop.arcgis.com/arcgis/rest/services/WorldPop_Total_Population_1km/ImageServer",
+  "export_url": "https://worldpop.arcgis.com/arcgis/rest/services/WorldPop_Total_Population_1km/ImageServer/exportImage?f=json&bbox=-180%2C-90%2C180%2C90&bboxSR=4326&imageSR=4326&size=1440%2C720&format=tiff&pixelType=F32&time=2020-01-01&noData=0",
+  "download_href": "https://worldpop.arcgis.com/arcgis/rest/directories/arcgisoutput/WorldPop_Total_Population_1km_ImageServer/x_____xndkD5q6p8iInzbWBZMzt7Q..x_____x_ags_8be2450d_33c3_43fd_bdc0_6c6a2edd2c65.tif",
+  "year": 2020,
+  "shape": [
+    720,
+    1440
+  ],
+  "bbox": [
+    -180,
+    -90,
+    180,
+    90
+  ],
+  "max_valid_pop_per_pixel": 1000000.0,
+  "population_sum_in_downsampled_grid": 6757949.0,
+  "license": "WorldPop datasets are licensed under Creative Commons Attribution 4.0 International.",
+  "citation": "WorldPop (www.worldpop.org - School of Geography and Environmental Science, University of Southampton; Department of Geography and Geosciences, University of Louisville; Departement de Geographie, Universite de Namur) and CIESIN, Columbia University (2018). Global High Resolution Population Denominators Project."
+}

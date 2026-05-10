@@ -2,30 +2,33 @@
     "time_limit_seconds": 60,
     "traffic": {
         "region_file": "configs/traffic_regions_world.json",
-        "population_map_path": null,
+        "population_map_path": "assets/population/worldpop_total_population_2020_1440x720.npy",
         "grid_lat_bins": 36,
         "grid_lon_bins": 72,
         "max_regions": 512,
-        "population_channel": "luma",
-        "packet_rate_per_ms": 10,
-        "slot_ms": 5,
-        "mean_packets_per_flowlet": 32,
+        "population_channel": "value",
+        "population_max_value": 1000000.0,
+        "population_area_scale": false,
+        "packet_rate_per_ms": 200,
+        "slot_ms": 10,
+        "mean_packets_per_flowlet": 256,
         "access_data_rate": 1.0
     },
     "prob_normal_packet": 0.8,
     "small_packet_size": 0.016,
     "normal_packet_size": 0.064,
     "default_ttl": 64,
-    "update_interval_ms": 100,
+    "update_interval_ms": 1000,
     "verbose": true,
+    "progress_interval_seconds": 60,
     "network": {
-        "altitude": 600,
+        "altitude": 550,
         "inclination": 53,
         "num_orbits": 72,
         "num_sats_per_orbit": 22,
         "phasing": 3,
-        "min_elevation_angle_deg": 15,
-        "link_buffer_size": 16.0,
-        "isl_data_rate": 0.05
+        "min_elevation_angle_deg": 25,
+        "link_buffer_size": 512.0,
+        "isl_data_rate": 10.0
     }
 }

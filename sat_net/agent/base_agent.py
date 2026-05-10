@@ -15,7 +15,7 @@ ACTION_COUNT = 4
 
 @dataclass(slots=True)
 class RoutingBatch:
-    """Batched routing inputs for flowlets currently resident at satellites."""
+    """Multi-agent routing decisions for flowlets currently resident at satellites."""
 
     flowlet_ids: np.ndarray
     current_sat_ids: np.ndarray
@@ -29,6 +29,7 @@ class RoutingBatch:
     neighbor_link_delay: np.ndarray
     neighbor_link_free_time: np.ndarray
     flowlet_size: np.ndarray
+    packet_count: np.ndarray
     ttl: np.ndarray
     current_time: float
     region_next_hop_table: np.ndarray | None = None
@@ -41,6 +42,21 @@ class RoutingBatch:
     shortest_gcd: np.ndarray | None = None
     initial_gcd: np.ndarray | None = None
 
+    @property
+    def agent_ids(self) -> np.ndarray:
+        """Satellite-agent id for each row in this decision batch."""
+        return self.current_sat_ids
+
+    @property
+    def decision_count(self) -> int:
+        return len(self.flowlet_ids)
+
+    @property
+    def active_agent_ids(self) -> np.ndarray:
+        if len(self.current_sat_ids) == 0:
+            return np.empty(0, dtype=np.int64)
+        return np.unique(self.current_sat_ids)
+
 
 @dataclass(slots=True)
 class RoutingDecision:
@@ -49,8 +65,8 @@ class RoutingDecision:
     next_hop_sat_ids: np.ndarray
 
 
-class BaseSolver(ABC):
-    """Batched routing policy interface used by the slot-array simulator."""
+class BaseAgent(ABC):
+    """Batched MARL routing-agent interface used by the slot-array simulator."""
 
     requires_shortest_path_table = False
 
@@ -63,7 +79,7 @@ class BaseSolver(ABC):
         raise NotImplementedError
 
     @abstractmethod
-    def next_hops(self, batch: RoutingBatch) -> RoutingDecision:
+    def act(self, batch: RoutingBatch) -> RoutingDecision:
         raise NotImplementedError
 
     def set_train(self):
@@ -84,6 +100,12 @@ class BaseSolver(ABC):
     def observe_flowlet_outcomes(self, flowlets, current_time: float):
         pass
 
+    def on_episode_start(self):
+        pass
+
+    def on_episode_end(self, flowlets, current_time: float):
+        pass
+
     def save_models(self, model_dir_path: str):
         pass
 
@@ -92,3 +114,6 @@ class BaseSolver(ABC):
 
     def get_stats(self) -> str | None:
         return None
+
+    def get_train_stats(self) -> dict:
+        return {}

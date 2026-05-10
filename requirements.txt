@@ -10,3 +10,4 @@ pandas
 seaborn
 scipy
 plotly
+tifffile
