@@ -26,6 +26,7 @@ The simulator has been refactored from an event-queue packet model into a data-o
 4. **Mask-first slot kernels**: `sat_net/sim_kernel.py` owns flowlet/link state transitions and returns full-length masks before NumPy compression.
 5. **Batched policy API**: Solvers receive `RoutingBatch` arrays and return vectorized `RoutingDecision` next hops.
 6. **SPF baseline**: Shortest-path next-hop rows are computed from sparse arrays, cached in a dense matrix, and refreshed with topology updates.
+7. **Torch RL on NumPy kernels**: The default path is NumPy/SciPy simulation plus PyTorch MaDQN/PRIMAL training.
 
 ### 📊 Key Results
 
@@ -81,9 +82,9 @@ brew install proj geos
 
 ## 🧠 Routing Policies
 
-- **SPF**: Dijkstra shortest-path first, backed by dense satellite next-hop rows and region-to-next-hop tables. `configs/spf.json` enables the JAX/JIT next-hop kernel; set `use_jax` to `false` for the NumPy path.
-- **Batched policy contract**: `sat_net/solver/base_solver.py` defines `RoutingBatch` and `RoutingDecision`, the interface future JAX/PRIMAL policies should implement.
-- **RL status**: Legacy PyTorch callback solvers have been removed. PRIMAL/MADQN/MaIQN/MaSAC need to be reimplemented against the batched policy API.
+- **SPF**: Dijkstra shortest-path first, backed by dense satellite next-hop rows and region-to-next-hop tables.
+- **Batched policy contract**: `sat_net/solver/base_solver.py` defines `RoutingBatch` and `RoutingDecision`.
+- **RL solvers**: MaDQN, PRIMAL-Avg, and PRIMAL-CVaR have been rebuilt for batched routing with PyTorch replay buffers. MaIQN/MaSAC remain retired until they are ported to the same interface.
 
 ## 📁 Project Structure
 
@@ -118,7 +119,7 @@ python run_eval.py
 
 ### RL Training Status
 
-`run_train.py` currently executes policy rollouts through the same batched interface. Learning is intentionally not implemented until PRIMAL-style policies are rebuilt on `RoutingBatch` arrays, which is the intended entry point for a future JAX/JIT implementation.
+`run_train.py` executes policy rollouts through the batched interface. Use `configs/dqn.json`, `configs/primal_avg.json`, or `configs/primal_cvar.json` to train the rebuilt MaDQN/PRIMAL baselines.
 
 ## 📄 License
 

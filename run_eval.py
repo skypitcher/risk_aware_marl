@@ -92,7 +92,11 @@ def load_solver_from(env, saved_path: str):
     Loads a trained solver from a specified path.
     """
     solver_config = NamedDict.load(f"{saved_path}/solver_config.json")
-    solver = create_solver(solver_config)
+    solver = create_solver(
+        solver_config,
+        obs_dim=env.obs_dim,
+        action_dim=env.action_dim,
+    )
     solver.load_models(f"{saved_path}/models/best_model")
     solver.set_eval()
     return solver
@@ -115,7 +119,13 @@ def run_evaluation(model_path_list: list[str], eval_seed: int, num_eval_seeds: i
 
     # Initialize solvers
     solvers = [load_solver_from(env, model_path) for model_path in model_path_list]
-    solvers.append(create_solver(NamedDict.load("configs/spf.json")))
+    solvers.append(
+        create_solver(
+            NamedDict.load("configs/spf.json"),
+            obs_dim=env.obs_dim,
+            action_dim=env.action_dim,
+        )
+    )
 
     if not solvers:
         logging.error("No solvers available for evaluation")

@@ -487,6 +487,13 @@ def build_routing_batch(
         current_time=current_time,
         region_next_hop_table=region_next_hop_table,
         region_next_hop_version=region_next_hop_version,
+        hops=flowlets.hops[flowlet_ids],
+        queue_delay=flowlets.queue_delay[flowlet_ids],
+        transmission_delay=flowlets.transmission_delay[flowlet_ids],
+        propagation_delay=flowlets.propagation_delay[flowlet_ids],
+        total_queue_cost=flowlets.total_queue_cost[flowlet_ids],
+        shortest_gcd=flowlets.shortest_gcd[flowlet_ids],
+        initial_gcd=flowlets.initial_gcd[flowlet_ids],
     )
 
 

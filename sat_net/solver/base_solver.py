@@ -33,6 +33,13 @@ class RoutingBatch:
     current_time: float
     region_next_hop_table: np.ndarray | None = None
     region_next_hop_version: int = 0
+    hops: np.ndarray | None = None
+    queue_delay: np.ndarray | None = None
+    transmission_delay: np.ndarray | None = None
+    propagation_delay: np.ndarray | None = None
+    total_queue_cost: np.ndarray | None = None
+    shortest_gcd: np.ndarray | None = None
+    initial_gcd: np.ndarray | None = None
 
 
 @dataclass(slots=True)
@@ -47,6 +54,9 @@ class BaseSolver(ABC):
 
     requires_shortest_path_table = False
 
+    def __init__(self):
+        self._is_eval = True
+
     @property
     @abstractmethod
     def name(self) -> str:
@@ -57,16 +67,22 @@ class BaseSolver(ABC):
         raise NotImplementedError
 
     def set_train(self):
-        pass
+        self._is_eval = False
 
     def set_eval(self):
-        pass
+        self._is_eval = True
 
     def is_train(self) -> bool:
-        return False
+        return not getattr(self, "_is_eval", True)
 
     def is_eval(self) -> bool:
-        return True
+        return getattr(self, "_is_eval", True)
+
+    def on_train_signal(self):
+        pass
+
+    def observe_flowlet_outcomes(self, flowlets, current_time: float):
+        pass
 
     def save_models(self, model_dir_path: str):
         pass

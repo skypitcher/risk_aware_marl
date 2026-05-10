@@ -253,7 +253,12 @@ def main():
         logging.info("solver_config: %s", solver_config.to_string())
 
         env = RoutingEnv(env_config, tf_writer=tf_writer)
-        solver = create_solver(solver_config)
+        solver = create_solver(
+            solver_config,
+            obs_dim=env.obs_dim,
+            action_dim=env.action_dim,
+            tf_writer=tf_writer,
+        )
         solver.load_models(f"{log_dir}/models/last_model")
     else:
         env_config = NamedDict.load(args.env)
@@ -276,7 +281,12 @@ def main():
 
         # create env and solver
         env = RoutingEnv(env_config, tf_writer=tf_writer)
-        solver = create_solver(solver_config)
+        solver = create_solver(
+            solver_config,
+            obs_dim=env.obs_dim,
+            action_dim=env.action_dim,
+            tf_writer=tf_writer,
+        )
 
         logging.info("env_config: %s", env_config.to_string())
         logging.info("solver_config: %s", solver_config.to_string())

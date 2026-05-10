@@ -207,8 +207,11 @@ class RoutingEnv:
             route_ready_mask |= self._activate_flowlets_at_current_slot_mask()
             if route_ready_mask.any():
                 self._route_flowlets_at_nodes_mask(route_ready_mask)
+            self.current_solver.observe_flowlet_outcomes(self._flowlets, self.current_time)
+            self.current_solver.on_train_signal()
 
         self.current_time = end_time
+        self.current_solver.observe_flowlet_outcomes(self._flowlets, self.current_time)
         self._array_metrics = self._calc_array_metrics()
 
     def _build_link_array_cache(self):

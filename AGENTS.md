@@ -2,7 +2,7 @@
 
 ## Project Structure & Module Organization
 
-`sat_net/` contains the fixed-step, data-oriented satellite routing simulator. `sat_net/network.py` stores topology, neighbor/link matrices, and dense SPF next-hop rows in NumPy arrays, `sat_net/sim_kernel.py` owns mask-first flowlet/link transitions, `sat_net/routing_env.py` orchestrates topology, traffic, and solver calls, and `sat_net/solver/` defines the batched routing policy contract plus the SPF baseline with optional JAX/JIT next-hop execution. Root-level scripts are entry points: `run_train.py`, `run_eval.py`, `run_spf.py`, and plotting utilities named `plot_*.py`. JSON environment and solver settings live in `configs/`. Static map data is in `assets/`; generated figures and run outputs are in `figs/` and `runs_*`.
+`sat_net/` contains the fixed-step, data-oriented satellite routing simulator. `sat_net/network.py` stores topology, neighbor/link matrices, and dense SPF next-hop rows in NumPy arrays, `sat_net/sim_kernel.py` owns mask-first flowlet/link transitions, `sat_net/routing_env.py` orchestrates topology, traffic, and solver calls, and `sat_net/solver/` defines the batched policy contract plus SPF, MaDQN, PRIMAL-Avg, and PRIMAL-CVaR. The default research path is NumPy/SciPy simulation with PyTorch solvers. Root-level scripts are entry points: `run_train.py`, `run_eval.py`, `run_spf.py`, and plotting utilities named `plot_*.py`. JSON environment and solver settings live in `configs/`. Static map data is in `assets/`; generated figures and run outputs are in `figs/` and `runs_*`.
 
 ## Build, Test, and Development Commands
 
