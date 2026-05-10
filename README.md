@@ -23,8 +23,9 @@ The simulator has been refactored from an event-queue packet model into a data-o
 1. **Region traffic**: Flowlets are sampled from population/region weights and bind to the currently visible access satellite.
 2. **Flowlet batches**: A flowlet represents a batch of packets with common source/target regions.
 3. **Array network state**: Satellite positions, link endpoints, link delays, connectivity, queues, and flowlet state are stored in NumPy arrays.
-4. **Batched policy API**: Solvers receive `RoutingBatch` arrays and return vectorized `RoutingDecision` next hops.
-5. **SPF baseline**: Shortest-path next-hop rows are computed from sparse arrays, cached in a dense matrix, and refreshed with topology updates.
+4. **Separated slot kernels**: `sat_net/sim_kernel.py` owns flowlet/link state transitions, keeping the environment orchestration thin.
+5. **Batched policy API**: Solvers receive `RoutingBatch` arrays and return vectorized `RoutingDecision` next hops.
+6. **SPF baseline**: Shortest-path next-hop rows are computed from sparse arrays, cached in a dense matrix, and refreshed with topology updates.
 
 ### 📊 Key Results
 
@@ -90,6 +91,7 @@ brew install proj geos
 risk_aware_marl/
 ├── sat_net/                    # Core simulation framework
 │   ├── routing_env.py          # Slot-array routing environment
+│   ├── sim_kernel.py           # Flowlet/link array transition kernels
 │   ├── network.py              # Array-oriented satellite network topology
 │   ├── traffic_region.py       # Region/population traffic model
 │   └── solver/                 # Batched routing policy API

@@ -1,127 +1,34 @@
 from pathlib import Path
-from dataclasses import dataclass
 from typing import Any, Optional
 
 import numpy as np
 import pandas as pd
 
-from sat_net.geometric import LIGHT_SPEED_MS
 from sat_net.network import SatelliteNetwork
-from sat_net.solver.base_solver import ACTION_COUNT, BaseSolver, RoutingBatch
+from sat_net.solver.base_solver import ACTION_COUNT, BaseSolver
+from sat_net.sim_kernel import (
+    FLOWLET_DELIVERED,
+    FLOWLET_DROPPED,
+    FLOWLET_NOT_STARTED,
+    FlowletState,
+    LinkState,
+    activate_flowlets_at_slot,
+    build_routing_batch,
+    create_link_state,
+    deliver_flowlet_ids,
+    drop_flowlet_ids,
+    drop_flowlets_on_disconnected_links,
+    handle_flowlet_arrivals,
+    partition_deliverable_flowlets,
+    release_transmitted_flowlets,
+    schedule_flowlets_by_link,
+)
 from sat_net.stats import Metrics
 from sat_net.traffic_region import TrafficRegionModel
 from sat_net.util import NamedDict, NetworkError, ms2str
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-
-FLOWLET_NOT_STARTED = 0
-FLOWLET_AT_NODE = 1
-FLOWLET_ON_LINK = 2
-FLOWLET_DELIVERED = 3
-FLOWLET_DROPPED = 4
-
-
-@dataclass(slots=True)
-class FlowletState:
-    """Array state for all generated flowlets."""
-
-    slot_offsets: np.ndarray
-    status: np.ndarray
-    creation_slot: np.ndarray
-    creation_time: np.ndarray
-    source_region_id: np.ndarray
-    target_region_id: np.ndarray
-    source_id: np.ndarray
-    current_sat: np.ndarray
-    next_sat: np.ndarray
-    link_id: np.ndarray
-    packet_count: np.ndarray
-    packet_size: np.ndarray
-    is_normal: np.ndarray
-    size: np.ndarray
-    ttl: np.ndarray
-    hops: np.ndarray
-    queue_delay: np.ndarray
-    transmission_delay: np.ndarray
-    propagation_delay: np.ndarray
-    total_queue_cost: np.ndarray
-    first_access_delay: np.ndarray
-    final_access_delay: np.ndarray
-    delivery_time: np.ndarray
-    drop_time: np.ndarray
-    drop_reason: np.ndarray
-    transmit_end_time: np.ndarray
-    arrival_time: np.ndarray
-    link_released: np.ndarray
-    scheduled_prop_delay: np.ndarray
-    shortest_gcd: np.ndarray
-    initial_gcd: np.ndarray
-    last_node1: np.ndarray
-    last_node2: np.ndarray
-
-    @property
-    def count(self) -> int:
-        return len(self.status)
-
-    @classmethod
-    def empty(cls) -> "FlowletState":
-        empty_i64 = np.empty(0, dtype=np.int64)
-        empty_f64 = np.empty(0, dtype=np.float64)
-        return cls(
-            slot_offsets=np.zeros(1, dtype=np.int64),
-            status=np.empty(0, dtype=np.int8),
-            creation_slot=empty_i64.copy(),
-            creation_time=empty_f64.copy(),
-            source_region_id=empty_i64.copy(),
-            target_region_id=empty_i64.copy(),
-            source_id=empty_i64.copy(),
-            current_sat=empty_i64.copy(),
-            next_sat=empty_i64.copy(),
-            link_id=np.empty(0, dtype=np.int32),
-            packet_count=empty_i64.copy(),
-            packet_size=empty_f64.copy(),
-            is_normal=np.empty(0, dtype=bool),
-            size=empty_f64.copy(),
-            ttl=np.empty(0, dtype=np.int16),
-            hops=np.empty(0, dtype=np.int16),
-            queue_delay=empty_f64.copy(),
-            transmission_delay=empty_f64.copy(),
-            propagation_delay=empty_f64.copy(),
-            total_queue_cost=empty_f64.copy(),
-            first_access_delay=empty_f64.copy(),
-            final_access_delay=empty_f64.copy(),
-            delivery_time=empty_f64.copy(),
-            drop_time=empty_f64.copy(),
-            drop_reason=np.empty(0, dtype=np.int16),
-            transmit_end_time=empty_f64.copy(),
-            arrival_time=empty_f64.copy(),
-            link_released=np.empty(0, dtype=bool),
-            scheduled_prop_delay=empty_f64.copy(),
-            shortest_gcd=empty_f64.copy(),
-            initial_gcd=empty_f64.copy(),
-            last_node1=empty_i64.copy(),
-            last_node2=empty_i64.copy(),
-        )
-
-
-@dataclass(slots=True)
-class LinkState:
-    """Runtime link arrays used by the slot scheduler."""
-
-    source_ids: np.ndarray
-    sink_ids: np.ndarray
-    data_rate: np.ndarray
-    capacity: np.ndarray
-    connected: np.ndarray
-    delay: np.ndarray
-    id_by_pair: np.ndarray
-    free_time: np.ndarray
-    queue_load: np.ndarray
-
-    @property
-    def count(self) -> int:
-        return len(self.source_ids)
 
 
 class RoutingEnv:
@@ -303,24 +210,14 @@ class RoutingEnv:
         self._array_metrics = self._calc_array_metrics()
 
     def _build_link_array_cache(self):
-        source_ids = self.network._link_source_ids
-        sink_ids = self.network._link_sink_ids
-        num_links = len(source_ids)
-        id_by_pair = np.full((self.network.num_nodes, self.network.num_nodes), -1, dtype=np.int32)
-        id_by_pair[source_ids, sink_ids] = np.arange(
-            num_links,
-            dtype=np.int32,
-        )
-        self._links = LinkState(
-            source_ids=source_ids,
-            sink_ids=sink_ids,
+        self._links = create_link_state(
+            source_ids=self.network._link_source_ids,
+            sink_ids=self.network._link_sink_ids,
             data_rate=self.network._link_data_rate_array,
             capacity=self.network._link_capacity_array,
             connected=self.network._link_connected_array,
             delay=self.network._link_delay_array,
-            id_by_pair=id_by_pair,
-            free_time=np.zeros(num_links, dtype=np.float64),
-            queue_load=np.zeros(num_links, dtype=np.float64),
+            num_nodes=self.network.num_nodes,
         )
 
         self._refresh_link_state_arrays()
@@ -404,96 +301,38 @@ class RoutingEnv:
         )
 
     def _release_transmitted_flowlets(self):
-        status = self._flowlets.status
-        if len(status) == 0:
+        if self._flowlets is None or self._links is None:
             return
-        release_mask = (
-            (status == FLOWLET_ON_LINK)
-            & (~self._flowlets.link_released)
-            & (self._flowlets.transmit_end_time <= self.current_time)
+        release_transmitted_flowlets(
+            flowlets=self._flowlets,
+            links=self._links,
+            current_time=self.current_time,
         )
-        release_ids = np.flatnonzero(release_mask)
-        if len(release_ids) == 0:
-            return
-        np.add.at(
-            self._links.queue_load,
-            self._flowlets.link_id[release_ids],
-            -self._flowlets.size[release_ids],
-        )
-        self._flowlets.link_released[release_ids] = True
-        np.maximum(self._links.queue_load, 0.0, out=self._links.queue_load)
 
     def _handle_flowlet_arrivals(self) -> np.ndarray:
-        status = self._flowlets.status
-        if len(status) == 0:
+        if self._flowlets is None:
             return np.empty(0, dtype=np.int64)
-        arrival_mask = (status == FLOWLET_ON_LINK) & (
-            self._flowlets.arrival_time <= self.current_time
+        return handle_flowlet_arrivals(
+            flowlets=self._flowlets,
+            current_time=self.current_time,
+            ttl_expired_reason=int(NetworkError.TTL_EXPIRED),
         )
-        flowlet_ids = np.flatnonzero(arrival_mask)
-        if len(flowlet_ids) == 0:
-            return flowlet_ids
-
-        self._flowlets.current_sat[flowlet_ids] = self._flowlets.next_sat[flowlet_ids]
-        self._flowlets.hops[flowlet_ids] += 1
-        self._flowlets.ttl[flowlet_ids] -= 1
-        self._flowlets.propagation_delay[flowlet_ids] += self._flowlets.scheduled_prop_delay[flowlet_ids]
-        self._flowlets.queue_delay[flowlet_ids] += (
-            self.current_time - self._flowlets.arrival_time[flowlet_ids]
-        )
-        self._flowlets.status[flowlet_ids] = FLOWLET_AT_NODE
-        self._flowlets.link_id[flowlet_ids] = -1
-
-        expired_mask = self._flowlets.ttl[flowlet_ids] <= 0
-        if expired_mask.any():
-            expired = flowlet_ids[expired_mask]
-            self._drop_flowlet_ids(expired, NetworkError.TTL_EXPIRED)
-            return flowlet_ids[~expired_mask]
-        return flowlet_ids
 
     def _activate_flowlets_at_current_slot(self) -> np.ndarray:
         if self._flowlets is None:
             return np.empty(0, dtype=np.int64)
 
         slot_idx = int(round((self.current_time - self.start_time) / self.slot_ms))
-        if slot_idx < 0 or slot_idx + 1 >= len(self._flowlets.slot_offsets):
-            return np.empty(0, dtype=np.int64)
-        start = int(self._flowlets.slot_offsets[slot_idx])
-        end = int(self._flowlets.slot_offsets[slot_idx + 1])
-        if end <= start:
-            return np.empty(0, dtype=np.int64)
-        flowlet_ids = np.arange(start, end, dtype=np.int64)
-
-        source_regions = self._flowlets.source_region_id[flowlet_ids]
-        source_sat_ids = self._nearest_region_sat_ids[source_regions]
-        visible = source_sat_ids >= 0
-        if (~visible).any():
-            self._drop_flowlet_ids(flowlet_ids[~visible], NetworkError.NO_AVAILABLE_SAT)
-
-        active_ids = flowlet_ids[visible]
-        if len(active_ids) == 0:
-            return active_ids
-
-        source_sat_ids = source_sat_ids[visible]
-        source_distances = self._nearest_region_sat_distances[source_regions[visible]]
-        source_prop_delay = source_distances / LIGHT_SPEED_MS
-        source_tx_delay = self._flowlets.size[active_ids] / self.access_data_rate
-
-        self._flowlets.source_id[active_ids] = source_sat_ids
-        self._flowlets.current_sat[active_ids] = source_sat_ids
-        self._flowlets.status[active_ids] = FLOWLET_AT_NODE
-        self._flowlets.first_access_delay[active_ids] = source_prop_delay + source_tx_delay
-        self._flowlets.propagation_delay[active_ids] += source_prop_delay
-        self._flowlets.transmission_delay[active_ids] += source_tx_delay
-
-        initial_gcd = self._region_distance_matrix[
-            self._flowlets.source_region_id[active_ids],
-            self._flowlets.target_region_id[active_ids],
-        ].copy()
-        initial_gcd[initial_gcd <= 0] = 1e-6
-        self._flowlets.initial_gcd[active_ids] = initial_gcd
-        self._flowlets.shortest_gcd[active_ids] = initial_gcd
-        return active_ids
+        return activate_flowlets_at_slot(
+            flowlets=self._flowlets,
+            slot_idx=slot_idx,
+            current_time=self.current_time,
+            nearest_region_sat_ids=self._nearest_region_sat_ids,
+            nearest_region_sat_distances=self._nearest_region_sat_distances,
+            region_distance_matrix=self._region_distance_matrix,
+            access_data_rate=self.access_data_rate,
+            no_available_sat_reason=int(NetworkError.NO_AVAILABLE_SAT),
+        )
 
     def _route_flowlets_at_nodes(self, at_node_ids: np.ndarray):
         if len(at_node_ids) == 0:
@@ -508,28 +347,22 @@ class RoutingEnv:
         self._route_flowlets_batch(route_ids)
 
     def _partition_deliverable_flowlets(self, flowlet_ids: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-        current_sats = self._flowlets.current_sat[flowlet_ids]
-        target_regions = self._flowlets.target_region_id[flowlet_ids]
-        sat_cols = self._sat_id_to_col_array[current_sats]
-        valid = sat_cols >= 0
-        deliverable = np.zeros(len(flowlet_ids), dtype=bool)
-        deliverable[valid] = self._region_sat_visible[target_regions[valid], sat_cols[valid]]
-        return flowlet_ids[deliverable], flowlet_ids[~deliverable]
+        return partition_deliverable_flowlets(
+            flowlets=self._flowlets,
+            flowlet_ids=flowlet_ids,
+            sat_id_to_col_array=self._sat_id_to_col_array,
+            region_sat_visible=self._region_sat_visible,
+        )
 
     def _deliver_flowlet_ids(self, flowlet_ids: np.ndarray):
-        current_sats = self._flowlets.current_sat[flowlet_ids]
-        target_regions = self._flowlets.target_region_id[flowlet_ids]
-        sat_cols = self._sat_id_to_col_array[current_sats]
-        distance2 = self._region_sat_distance2[target_regions, sat_cols]
-        final_prop_delay = np.sqrt(distance2) / LIGHT_SPEED_MS
-        final_tx_delay = self._flowlets.size[flowlet_ids] / self.access_data_rate
-        final_delay = final_prop_delay + final_tx_delay
-
-        self._flowlets.final_access_delay[flowlet_ids] = final_delay
-        self._flowlets.propagation_delay[flowlet_ids] += final_prop_delay
-        self._flowlets.transmission_delay[flowlet_ids] += final_tx_delay
-        self._flowlets.delivery_time[flowlet_ids] = self.current_time + final_delay
-        self._flowlets.status[flowlet_ids] = FLOWLET_DELIVERED
+        deliver_flowlet_ids(
+            flowlets=self._flowlets,
+            flowlet_ids=flowlet_ids,
+            current_time=self.current_time,
+            sat_id_to_col_array=self._sat_id_to_col_array,
+            region_sat_distance2=self._region_sat_distance2,
+            access_data_rate=self.access_data_rate,
+        )
 
     def _route_flowlets_batch(self, flowlet_ids: np.ndarray):
         current_sats = self._flowlets.current_sat[flowlet_ids]
@@ -607,46 +440,18 @@ class RoutingEnv:
         target_regions: np.ndarray,
         target_access_sats: np.ndarray,
         include_spf_table: bool,
-    ) -> RoutingBatch:
-        neighbor_sat_ids = np.column_stack(
-            (
-                self.network.isl_n[current_sats],
-                self.network.isl_e[current_sats],
-                self.network.isl_s[current_sats],
-                self.network.isl_w[current_sats],
-            )
-        ).astype(np.int64, copy=False)
-
-        neighbor_link_ids = np.full(neighbor_sat_ids.shape, -1, dtype=np.int32)
-        valid_neighbor = neighbor_sat_ids >= 0
-        if valid_neighbor.any():
-            source_ids = np.broadcast_to(current_sats[:, None], neighbor_sat_ids.shape)
-            neighbor_link_ids[valid_neighbor] = self._links.id_by_pair[
-                source_ids[valid_neighbor],
-                neighbor_sat_ids[valid_neighbor],
-            ]
-
-        valid_link = neighbor_link_ids >= 0
-        safe_link_ids = np.where(valid_link, neighbor_link_ids, 0)
-        connected = np.zeros(neighbor_link_ids.shape, dtype=bool)
-        if valid_link.any():
-            connected[valid_link] = self._links.connected[safe_link_ids[valid_link]]
-        action_mask = valid_link & connected
-
-        return RoutingBatch(
+    ):
+        return build_routing_batch(
+            flowlets=self._flowlets,
+            links=self._links,
             flowlet_ids=flowlet_ids,
-            current_sat_ids=current_sats,
-            target_region_ids=target_regions,
-            target_access_sat_ids=target_access_sats,
-            neighbor_sat_ids=neighbor_sat_ids,
-            neighbor_link_ids=neighbor_link_ids,
-            action_mask=action_mask,
-            neighbor_queue_load=np.where(valid_link, self._links.queue_load[safe_link_ids], np.inf),
-            neighbor_link_capacity=np.where(valid_link, self._links.capacity[safe_link_ids], 0.0),
-            neighbor_link_delay=np.where(valid_link, self._links.delay[safe_link_ids], np.inf),
-            neighbor_link_free_time=np.where(valid_link, self._links.free_time[safe_link_ids], np.inf),
-            flowlet_size=self._flowlets.size[flowlet_ids],
-            ttl=self._flowlets.ttl[flowlet_ids],
+            current_sats=current_sats,
+            target_regions=target_regions,
+            target_access_sats=target_access_sats,
+            isl_n=self.network.isl_n,
+            isl_e=self.network.isl_e,
+            isl_s=self.network.isl_s,
+            isl_w=self.network.isl_w,
             current_time=self.current_time,
             region_next_hop_table=self._region_next_hop_table if include_spf_table else None,
         )
@@ -657,85 +462,14 @@ class RoutingEnv:
         link_ids: np.ndarray,
         next_hops: np.ndarray,
     ) -> np.ndarray:
-        if len(flowlet_ids) == 0:
-            return np.empty(0, dtype=np.int64)
-
-        order = np.argsort(link_ids, kind="stable")
-        sorted_link_ids = link_ids[order]
-        sorted_ids = flowlet_ids[order]
-        sorted_next_hops = next_hops[order]
-        split_points = np.flatnonzero(np.diff(sorted_link_ids)) + 1
-        starts = np.r_[0, split_points]
-        ends = np.r_[split_points, len(sorted_link_ids)]
-        group_link_ids = sorted_link_ids[starts]
-        group_lengths = ends - starts
-        group_ids = np.repeat(np.arange(len(starts)), group_lengths)
-
-        sizes = self._flowlets.size[sorted_ids]
-        cumulative_size = np.cumsum(sizes)
-        size_offsets = np.zeros(len(starts), dtype=np.float64)
-        if len(starts) > 1:
-            size_offsets[1:] = cumulative_size[starts[1:] - 1]
-        group_cumulative_size = cumulative_size - size_offsets[group_ids]
-        remaining_capacity = self._links.capacity[group_link_ids] - self._links.queue_load[group_link_ids]
-        accepted = group_cumulative_size <= remaining_capacity[group_ids]
-
-        rejected_ids = sorted_ids[~accepted]
-        if not accepted.any():
-            return rejected_ids
-
-        accepted_ids = sorted_ids[accepted]
-        accepted_link_ids = sorted_link_ids[accepted]
-        accepted_next_hops = sorted_next_hops[accepted]
-        accepted_sizes = sizes[accepted]
-        accepted_group_ids = group_ids[accepted]
-
-        accepted_split_points = np.flatnonzero(np.diff(accepted_group_ids)) + 1
-        accepted_starts = np.r_[0, accepted_split_points]
-        accepted_ends = np.r_[accepted_split_points, len(accepted_ids)]
-        accepted_group_numbers = np.repeat(
-            np.arange(len(accepted_starts)),
-            accepted_ends - accepted_starts,
+        return schedule_flowlets_by_link(
+            flowlets=self._flowlets,
+            links=self._links,
+            flowlet_ids=flowlet_ids,
+            link_ids=link_ids,
+            next_hops=next_hops,
+            current_time=self.current_time,
         )
-        accepted_original_group_ids = accepted_group_ids[accepted_starts]
-
-        transmit_times = accepted_sizes / self._links.data_rate[accepted_link_ids]
-        cumulative_tx = np.cumsum(transmit_times)
-        tx_offsets = np.zeros(len(accepted_starts), dtype=np.float64)
-        if len(accepted_starts) > 1:
-            tx_offsets[1:] = cumulative_tx[accepted_starts[1:] - 1]
-        group_cumulative_tx = cumulative_tx - tx_offsets[accepted_group_numbers]
-
-        accepted_group_link_ids = group_link_ids[accepted_original_group_ids]
-        start_base_by_group = np.maximum(
-            self.current_time,
-            self._links.free_time[accepted_group_link_ids],
-        )
-        start_base = start_base_by_group[accepted_group_numbers]
-        transmit_end_times = start_base + group_cumulative_tx
-        wait_times = transmit_end_times - transmit_times - self.current_time
-        propagation_delays = self._links.delay[accepted_link_ids]
-
-        self._links.free_time[accepted_group_link_ids] = transmit_end_times[accepted_ends - 1]
-        self._links.queue_load[accepted_group_link_ids] += np.add.reduceat(
-            accepted_sizes,
-            accepted_starts,
-        )
-
-        self._flowlets.queue_delay[accepted_ids] += wait_times
-        self._flowlets.transmission_delay[accepted_ids] += transmit_times
-        self._flowlets.total_queue_cost[accepted_ids] += wait_times
-        self._flowlets.link_id[accepted_ids] = accepted_link_ids
-        self._flowlets.next_sat[accepted_ids] = accepted_next_hops
-        self._flowlets.transmit_end_time[accepted_ids] = transmit_end_times
-        self._flowlets.arrival_time[accepted_ids] = transmit_end_times + propagation_delays
-        self._flowlets.scheduled_prop_delay[accepted_ids] = propagation_delays
-        self._flowlets.link_released[accepted_ids] = False
-        self._flowlets.status[accepted_ids] = FLOWLET_ON_LINK
-
-        self._flowlets.last_node2[accepted_ids] = self._flowlets.last_node1[accepted_ids]
-        self._flowlets.last_node1[accepted_ids] = self._flowlets.current_sat[accepted_ids]
-        return rejected_ids
 
     def _ensure_region_next_hops(self, target_regions: np.ndarray):
         missing_mask = ~self._region_next_hop_ready[target_regions]
@@ -758,34 +492,24 @@ class RoutingEnv:
         self._region_next_hop_ready[missing_regions] = True
 
     def _drop_flowlets_on_disconnected_links(self):
-        status = self._flowlets.status
-        if len(status) == 0:
+        if self._flowlets is None or self._links is None:
             return
-        on_link = np.flatnonzero(status == FLOWLET_ON_LINK)
-        if len(on_link) == 0:
-            return
-        link_ids = self._flowlets.link_id[on_link]
-        dropped = on_link[~self._links.connected[link_ids]]
-        if len(dropped) == 0:
-            return
-        unreleased = dropped[~self._flowlets.link_released[dropped]]
-        if len(unreleased) > 0:
-            np.add.at(
-                self._links.queue_load,
-                self._flowlets.link_id[unreleased],
-                -self._flowlets.size[unreleased],
-            )
-            self._flowlets.link_released[unreleased] = True
-        self._links.queue_load[~self._links.connected] = 0.0
-        self._links.free_time[~self._links.connected] = self.current_time
-        self._drop_flowlet_ids(dropped, NetworkError.LINK_DISCONNECTED)
+        drop_flowlets_on_disconnected_links(
+            flowlets=self._flowlets,
+            links=self._links,
+            current_time=self.current_time,
+            link_disconnected_reason=int(NetworkError.LINK_DISCONNECTED),
+        )
 
     def _drop_flowlet_ids(self, flowlet_ids: np.ndarray, reason: NetworkError):
-        if len(flowlet_ids) == 0:
+        if self._flowlets is None:
             return
-        self._flowlets.status[flowlet_ids] = FLOWLET_DROPPED
-        self._flowlets.drop_time[flowlet_ids] = self.current_time
-        self._flowlets.drop_reason[flowlet_ids] = int(reason)
+        drop_flowlet_ids(
+            flowlets=self._flowlets,
+            flowlet_ids=flowlet_ids,
+            current_time=self.current_time,
+            reason=int(reason),
+        )
 
     def _calc_array_metrics(self) -> Metrics:
         flowlets = self._flowlets
