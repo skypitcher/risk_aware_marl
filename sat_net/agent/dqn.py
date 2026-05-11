@@ -31,10 +31,10 @@ class DQNAgent:
         self.epsilon_step_count = 0
         self.batch_size = int(config.get("batch_size", 2048))
         self.train_start_size = int(config.get("train_start_size", 1000))
-        self.train_steps_per_update = int(config.get("train_steps_per_update", 1))
+        self.utd = max(int(config.get("utd", 1)), 1)
         self.update_method = str(config.get("update_method", "soft"))
         self.soft_update_tau = float(config.get("soft_update_tau", 0.05))
-        self.hard_update_interval = int(config.get("hard_update_interval", 10))
+        self.target_update_interval = max(int(config.get("target_update_interval", 1)), 1)
         self.clip_grad_norm = float(config.get("clip_grad_norm", 0.5))
         self.inference_device = resolve_inference_device(config, device)
         self.inference_sync_interval = max(int(config.get("inference_sync_interval", 64)), 1)
@@ -109,7 +109,7 @@ class DQNAgent:
     def learn(self) -> None:
         if len(self.replay_buffer) < max(self.batch_size, self.train_start_size):
             return
-        for _ in range(self.train_steps_per_update):
+        for _ in range(self.utd):
             self._train_step()
 
     def _train_step(self) -> None:
@@ -148,9 +148,11 @@ class DQNAgent:
         self.epsilon_train = max(self.epsilon_train, self.epsilon_end)
 
     def _update_target_network(self) -> None:
+        if self.training_steps % self.target_update_interval != 0:
+            return
         if self.update_method == "soft":
             soft_update(self.Q_target, self.Q, self.soft_update_tau)
-        elif self.training_steps % self.hard_update_interval == 0:
+        elif self.update_method == "hard":
             hard_update(self.Q_target, self.Q)
 
     def _sync_q_inference(self, force: bool = False) -> None:
@@ -218,7 +220,8 @@ class MaDQN(BatchedRLAgent):
             f"epsilon={self.global_agent.epsilon_train:.4f} "
             f"buffer={len(self.global_agent.replay_buffer)} "
             f"training_steps={self.global_agent.training_steps} device={self.device} "
-            f"inference_device={self.global_agent.inference_device}"
+            f"inference_device={self.global_agent.inference_device} "
+            f"utd={self.global_agent.utd} target_update_interval={self.global_agent.target_update_interval}"
         )
 
     def save_models(self, model_dir_path: str) -> None:

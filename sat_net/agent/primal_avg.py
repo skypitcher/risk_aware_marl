@@ -36,13 +36,13 @@ class PrimalAvgAgent:
         self.discount_cost = float(config.get("discount_cost", 0.97))
         self.batch_size = int(config.get("batch_size", 2048))
         self.train_start_size = int(config.get("train_start_size", 10000))
-        self.train_steps_per_update = int(config.get("train_steps_per_update", 1))
-        self.actor_update_freq = int(config.get("actor_update_freq", 2))
+        self.utd = max(int(config.get("utd", 1)), 1)
+        self.policy_delay = max(int(config.get("policy_delay", 2)), 1)
         self.cost_multiplier_update_freq = int(config.get("cost_multiplier_update_freq", 2))
         self.update_lambda_after_step = int(config.get("update_lambda_after_step", 300000))
         self.update_method = str(config.get("update_method", "soft"))
         self.soft_update_tau = float(config.get("soft_update_tau", 0.05))
-        self.hard_update_interval = int(config.get("hard_update_interval", 1))
+        self.target_update_interval = max(int(config.get("target_update_interval", 1)), 1)
         self.max_grad_norm = float(config.get("max_grad_norm", 0.5))
         self.use_single_cost_critic = bool(config.get("use_single_cost_critic", False))
         self.inference_device = resolve_inference_device(config, device)
@@ -129,7 +129,7 @@ class PrimalAvgAgent:
     def learn(self) -> None:
         if len(self.replay_buffer) < max(self.batch_size, self.train_start_size):
             return
-        for _ in range(self.train_steps_per_update):
+        for _ in range(self.utd):
             self.training_steps += 1
             self._train_step()
 
@@ -176,7 +176,7 @@ class PrimalAvgAgent:
         self.opt_Qc.step()
         self._update_target(self.Qc_target, self.Qc)
 
-        if self.training_steps % self.actor_update_freq == 0:
+        if self.training_steps % self.policy_delay == 0:
             logits = self.actor(batch.states, batch.action_masks)
             probs = F.softmax(logits, dim=-1)
             log_probs = F.log_softmax(logits, dim=-1)
@@ -199,7 +199,7 @@ class PrimalAvgAgent:
 
             if self.training_steps >= self.update_lambda_after_step:
                 expected_cost = (probs * qc).sum(dim=-1, keepdim=True).detach()
-                if self.training_steps % (self.cost_multiplier_update_freq * self.actor_update_freq) == 0:
+                if self.training_steps % (self.cost_multiplier_update_freq * self.policy_delay) == 0:
                     lambda_loss = weighted_mean(self.lambdar() * (batch.target_costs - expected_cost), batch.weights)
                     self.opt_log_lambda.zero_grad()
                     lambda_loss.backward()
@@ -210,9 +210,11 @@ class PrimalAvgAgent:
             self._tf_writer.add_scalar("primal_avg/cost_loss", cost_loss.item(), self.training_steps)
 
     def _update_target(self, target: torch.nn.Module, source: torch.nn.Module) -> None:
+        if self.training_steps % self.target_update_interval != 0:
+            return
         if self.update_method == "soft":
             soft_update(target, source, self.soft_update_tau)
-        elif self.training_steps % self.hard_update_interval == 0:
+        elif self.update_method == "hard":
             hard_update(target, source)
 
     def _sync_actor_inference(self, force: bool = False) -> None:
@@ -255,7 +257,9 @@ class PrimalAvgAgent:
         return (
             f"alpha={self.alpha().item():.4f} lambda={self.lambdar().item():.4f} "
             f"buffer={len(self.replay_buffer)} training_steps={self.training_steps} "
-            f"inference_device={self.inference_device} actor_sync_step={self._last_actor_sync_step}"
+            f"inference_device={self.inference_device} actor_sync_step={self._last_actor_sync_step} "
+            f"utd={self.utd} policy_delay={self.policy_delay} "
+            f"target_update_interval={self.target_update_interval}"
         )
 
 

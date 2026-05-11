@@ -83,7 +83,7 @@ class BatchedRLAgent(BaseAgent):
         self.delay_feature_norm = float(config.get("delay_feature_norm", 1000.0))
         self.size_norm = float(config.get("size_norm", 8.0))
         self.max_ttl = float(config.get("max_ttl", 64.0))
-        self.learn_interval = max(int(config.get("learn_interval", 1)), 1)
+        self.train_freq = max(int(config.get("train_freq", 1)), 1)
         self._train_signal_count = 0
         self.reward_config = RewardConfig.from_config(config)
         self.delay_norm = self.reward_config.delay_norm
@@ -141,7 +141,7 @@ class BatchedRLAgent(BaseAgent):
         if not self.is_train():
             return
         self._train_signal_count += 1
-        if force or self._train_signal_count % self.learn_interval == 0:
+        if force or self._train_signal_count % self.train_freq == 0:
             self.learn()
 
     def on_episode_start(self) -> None:
@@ -402,7 +402,7 @@ class BatchedRLAgent(BaseAgent):
     def get_train_stats(self) -> dict:
         stats = self._reward_stats.to_dict()
         stats["pending_transitions"] = len(self._pending)
-        stats["learn_interval"] = self.learn_interval
+        stats["train_freq"] = self.train_freq
         stats["train_signals"] = self._train_signal_count
         stats["reward_config"] = self.reward_config.to_dict()
         replay_buffer = getattr(getattr(self, "global_agent", None), "replay_buffer", None)
