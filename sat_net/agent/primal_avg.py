@@ -19,7 +19,7 @@ from sat_net.nn import (
     weighted_mean,
     weighted_mse_loss,
 )
-from sat_net.agent.rl_base import BatchedRLAgent
+from sat_net.agent.rl_base import BatchedRLAgent, resolve_inference_device, sync_module_to_device
 from sat_net.util import NamedDict
 
 
@@ -45,11 +45,15 @@ class PrimalAvgAgent:
         self.hard_update_interval = int(config.get("hard_update_interval", 1))
         self.max_grad_norm = float(config.get("max_grad_norm", 0.5))
         self.use_single_cost_critic = bool(config.get("use_single_cost_critic", False))
+        self.inference_device = resolve_inference_device(config, device)
+        self.inference_sync_interval = max(int(config.get("inference_sync_interval", 64)), 1)
+        self._last_actor_sync_step = -1
         self.training_steps = 0
 
         init_method = str(config.get("weight_init", "orthogonal"))
         actor_ln = bool(config.get("actor_use_layer_norm", True))
         critic_ln = bool(config.get("critic_use_layer_norm", True))
+        actor_temperature = float(config.get("softmax_temperature", 1.0))
         lr = float(config.get("learning_rate", 1e-4))
 
         self.Qr = TwinCritic(obs_dim, action_dim, self.hidden_dim, self.num_hidden_layers, critic_ln, init_method).to(device)
@@ -72,9 +76,22 @@ class PrimalAvgAgent:
             self.hidden_dim,
             self.num_hidden_layers,
             actor_ln,
-            float(config.get("softmax_temperature", 1.0)),
+            actor_temperature,
             init_method,
         ).to(device)
+        if self.inference_device == self.device:
+            self.actor_inference = self.actor
+        else:
+            self.actor_inference = DiscretePolicy(
+                obs_dim,
+                action_dim,
+                self.hidden_dim,
+                self.num_hidden_layers,
+                actor_ln,
+                actor_temperature,
+                init_method,
+            ).to(self.inference_device)
+            self._sync_actor_inference(force=True)
         self.opt_actor = torch.optim.Adam(self.actor.parameters(), lr=lr)
         self.target_entropy = calc_heuristic_entropy(action_dim, float(config.get("max_action_prob", 0.99)))
         self.log_alpha = torch.tensor(np.log(1.0), dtype=torch.float32, requires_grad=True, device=device)
@@ -92,10 +109,11 @@ class PrimalAvgAgent:
     def act(self, states: np.ndarray, action_masks: np.ndarray, eval_mode: bool) -> np.ndarray:
         if len(states) == 0:
             return np.empty(0, dtype=np.int64)
-        with torch.no_grad():
-            state_tensor = torch.as_tensor(states, dtype=torch.float32, device=self.device)
-            mask_tensor = torch.as_tensor(action_masks, dtype=torch.bool, device=self.device)
-            logits = self.actor(state_tensor, mask_tensor)
+        with torch.inference_mode():
+            self.actor_inference.eval()
+            state_tensor = torch.as_tensor(states, dtype=torch.float32, device=self.inference_device)
+            mask_tensor = torch.as_tensor(action_masks, dtype=torch.bool, device=self.inference_device)
+            logits = self.actor_inference(state_tensor, mask_tensor)
             if eval_mode:
                 actions = torch.argmax(logits, dim=-1)
             else:
@@ -171,6 +189,7 @@ class PrimalAvgAgent:
             actor_loss.backward()
             torch.nn.utils.clip_grad_norm_(self.actor.parameters(), self.max_grad_norm)
             self.opt_actor.step()
+            self._sync_actor_inference()
 
             entropy = (-probs * log_probs).sum(dim=-1).detach()
             alpha_loss = weighted_mean(self.alpha() * (entropy.unsqueeze(-1) - self.target_entropy), batch.weights)
@@ -196,6 +215,19 @@ class PrimalAvgAgent:
         elif self.training_steps % self.hard_update_interval == 0:
             hard_update(target, source)
 
+    def _sync_actor_inference(self, force: bool = False) -> None:
+        if self.actor_inference is self.actor:
+            self._last_actor_sync_step = self.training_steps
+            return
+        if not force and self.training_steps - self._last_actor_sync_step < self.inference_sync_interval:
+            return
+        sync_module_to_device(self.actor_inference, self.actor, self.inference_device)
+        self.actor_inference.eval()
+        self._last_actor_sync_step = self.training_steps
+
+    def sync_inference(self, force: bool = True) -> None:
+        self._sync_actor_inference(force=force)
+
     def get_model_dict(self) -> dict[str, Any]:
         return {
             "training_steps": self.training_steps,
@@ -217,11 +249,13 @@ class PrimalAvgAgent:
         self.actor.load_state_dict(checkpoint["actor"])
         self.log_alpha.data.fill_(float(checkpoint.get("log_alpha", 0.0)))
         self.log_lambda.data.fill_(float(checkpoint.get("log_lambda", 0.0)))
+        self._sync_actor_inference(force=True)
 
     def get_stats(self) -> str:
         return (
             f"alpha={self.alpha().item():.4f} lambda={self.lambdar().item():.4f} "
-            f"buffer={len(self.replay_buffer)} training_steps={self.training_steps}"
+            f"buffer={len(self.replay_buffer)} training_steps={self.training_steps} "
+            f"inference_device={self.inference_device} actor_sync_step={self._last_actor_sync_step}"
         )
 
 

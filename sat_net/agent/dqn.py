@@ -9,7 +9,7 @@ import numpy as np
 import torch
 
 from sat_net.nn import MLP, ReplayBuffer, hard_update, soft_update, weighted_mse_loss
-from sat_net.agent.rl_base import BatchedRLAgent
+from sat_net.agent.rl_base import BatchedRLAgent, resolve_inference_device, sync_module_to_device
 from sat_net.util import NamedDict
 
 
@@ -36,25 +36,42 @@ class DQNAgent:
         self.soft_update_tau = float(config.get("soft_update_tau", 0.05))
         self.hard_update_interval = int(config.get("hard_update_interval", 10))
         self.clip_grad_norm = float(config.get("clip_grad_norm", 0.5))
+        self.inference_device = resolve_inference_device(config, device)
+        self.inference_sync_interval = max(int(config.get("inference_sync_interval", 64)), 1)
+        self._last_q_sync_step = -1
         self.training_steps = 0
+        use_layer_norm = bool(config.get("use_layer_norm", True))
+        init_method = str(config.get("weight_init", "orthogonal"))
 
         self.Q = MLP(
             input_dim=obs_dim,
             output_dim=action_dim,
             hidden_dim=self.hidden_dim,
             num_hidden_layers=self.num_hidden_layers,
-            use_layer_norm=bool(config.get("use_layer_norm", True)),
-            init_method=str(config.get("weight_init", "orthogonal")),
+            use_layer_norm=use_layer_norm,
+            init_method=init_method,
         ).to(device)
         self.Q_target = MLP(
             input_dim=obs_dim,
             output_dim=action_dim,
             hidden_dim=self.hidden_dim,
             num_hidden_layers=self.num_hidden_layers,
-            use_layer_norm=bool(config.get("use_layer_norm", True)),
-            init_method=str(config.get("weight_init", "orthogonal")),
+            use_layer_norm=use_layer_norm,
+            init_method=init_method,
         ).to(device)
         self.Q_target.load_state_dict(self.Q.state_dict())
+        if self.inference_device == self.device:
+            self.Q_inference = self.Q
+        else:
+            self.Q_inference = MLP(
+                input_dim=obs_dim,
+                output_dim=action_dim,
+                hidden_dim=self.hidden_dim,
+                num_hidden_layers=self.num_hidden_layers,
+                use_layer_norm=use_layer_norm,
+                init_method=init_method,
+            ).to(self.inference_device)
+            self._sync_q_inference(force=True)
         self.optimizer = torch.optim.Adam(self.Q.parameters(), lr=float(config.get("learning_rate", 1e-4)))
         self.replay_buffer = ReplayBuffer(
             state_dim=obs_dim,
@@ -73,11 +90,11 @@ class DQNAgent:
             explore = np.zeros(len(states), dtype=bool)
             random_actions = np.full(len(states), -1, dtype=np.int64)
 
-        with torch.no_grad():
-            self.Q.eval()
-            state_tensor = torch.as_tensor(states, dtype=torch.float32, device=self.device)
-            q_values = self.Q(state_tensor)
-            mask = torch.as_tensor(action_masks, dtype=torch.bool, device=self.device)
+        with torch.inference_mode():
+            self.Q_inference.eval()
+            state_tensor = torch.as_tensor(states, dtype=torch.float32, device=self.inference_device)
+            q_values = self.Q_inference(state_tensor)
+            mask = torch.as_tensor(action_masks, dtype=torch.bool, device=self.inference_device)
             greedy_actions = torch.argmax(q_values.masked_fill(~mask, -1e9), dim=1).cpu().numpy()
 
         actions = np.where(explore, random_actions, greedy_actions).astype(np.int64, copy=False)
@@ -112,6 +129,7 @@ class DQNAgent:
         self.optimizer.step()
         self.training_steps += 1
         self._update_target_network()
+        self._sync_q_inference()
         if self._tf_writer is not None:
             self._tf_writer.add_scalar("madqn/loss", loss.item(), global_step=self.training_steps)
             self._tf_writer.add_scalar("madqn/q", current_q.mean().item(), global_step=self.training_steps)
@@ -134,6 +152,19 @@ class DQNAgent:
             soft_update(self.Q_target, self.Q, self.soft_update_tau)
         elif self.training_steps % self.hard_update_interval == 0:
             hard_update(self.Q_target, self.Q)
+
+    def _sync_q_inference(self, force: bool = False) -> None:
+        if self.Q_inference is self.Q:
+            self._last_q_sync_step = self.training_steps
+            return
+        if not force and self.training_steps - self._last_q_sync_step < self.inference_sync_interval:
+            return
+        sync_module_to_device(self.Q_inference, self.Q, self.inference_device)
+        self.Q_inference.eval()
+        self._last_q_sync_step = self.training_steps
+
+    def sync_inference(self, force: bool = True) -> None:
+        self._sync_q_inference(force=force)
 
     @staticmethod
     def _random_actions(action_masks: np.ndarray) -> np.ndarray:
@@ -161,6 +192,7 @@ class DQNAgent:
         self.training_steps = int(checkpoint.get("training_steps", 0))
         self.epsilon_train = float(checkpoint.get("epsilon", self.epsilon_train))
         self.epsilon_step_count = int(checkpoint.get("epsilon_step_count", 0))
+        self._sync_q_inference(force=True)
 
 
 class MaDQN(BatchedRLAgent):
@@ -185,7 +217,8 @@ class MaDQN(BatchedRLAgent):
         return (
             f"epsilon={self.global_agent.epsilon_train:.4f} "
             f"buffer={len(self.global_agent.replay_buffer)} "
-            f"training_steps={self.global_agent.training_steps} device={self.device}"
+            f"training_steps={self.global_agent.training_steps} device={self.device} "
+            f"inference_device={self.global_agent.inference_device}"
         )
 
     def save_models(self, model_dir_path: str) -> None:

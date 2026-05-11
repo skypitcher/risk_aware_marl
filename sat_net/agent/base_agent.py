@@ -94,7 +94,7 @@ class BaseAgent(ABC):
     def is_eval(self) -> bool:
         return getattr(self, "_is_eval", True)
 
-    def on_train_signal(self):
+    def on_train_signal(self, force: bool = False):
         pass
 
     def observe_flowlet_outcomes(self, flowlets, current_time: float):

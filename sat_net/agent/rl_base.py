@@ -15,10 +15,36 @@ from sat_net.util import NamedDict
 def resolve_device(config: NamedDict) -> torch.device:
     configured = str(config.get("device", "auto")).lower()
     if configured == "auto":
-        return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        if torch.cuda.is_available():
+            return torch.device("cuda")
+        if _mps_available():
+            return torch.device("mps")
+        return torch.device("cpu")
+    if configured == "cuda" and not torch.cuda.is_available():
+        return torch.device("cpu")
+    if configured in {"mps", "metal"}:
+        return torch.device("mps" if _mps_available() else "cpu")
+    return torch.device(configured)
+
+
+def resolve_inference_device(config: NamedDict, training_device: torch.device) -> torch.device:
+    configured = str(config.get("inference_device", "auto")).lower()
+    if configured == "auto":
+        return torch.device("cpu" if training_device.type == "mps" else training_device.type)
+    if configured in {"mps", "metal"}:
+        return torch.device("mps" if _mps_available() else "cpu")
     if configured == "cuda" and not torch.cuda.is_available():
         return torch.device("cpu")
     return torch.device(configured)
+
+
+def sync_module_to_device(target: torch.nn.Module, source: torch.nn.Module, device: torch.device) -> None:
+    state = {key: value.detach().to(device) for key, value in source.state_dict().items()}
+    target.load_state_dict(state)
+
+
+def _mps_available() -> bool:
+    return bool(getattr(torch.backends, "mps", None) is not None and torch.backends.mps.is_available())
 
 
 @dataclass(slots=True)
@@ -57,11 +83,19 @@ class BatchedRLAgent(BaseAgent):
         self.delay_feature_norm = float(config.get("delay_feature_norm", 1000.0))
         self.size_norm = float(config.get("size_norm", 8.0))
         self.max_ttl = float(config.get("max_ttl", 64.0))
+        self.learn_interval = max(int(config.get("learn_interval", 1)), 1)
+        self._train_signal_count = 0
         self.reward_config = RewardConfig.from_config(config)
         self.delay_norm = self.reward_config.delay_norm
         self.cost_limit = self.reward_config.cost_limit
         self._pending: dict[int, PendingTransition] = {}
         self._reward_stats = RewardStats()
+
+    def set_eval(self):
+        super().set_eval()
+        sync_inference = getattr(getattr(self, "global_agent", None), "sync_inference", None)
+        if callable(sync_inference):
+            sync_inference(force=True)
 
     def act(self, batch: RoutingBatch) -> RoutingDecision:
         states = self.build_states(batch)
@@ -103,13 +137,17 @@ class BatchedRLAgent(BaseAgent):
     def learn(self) -> None:
         pass
 
-    def on_train_signal(self) -> None:
-        if self.is_train():
+    def on_train_signal(self, force: bool = False) -> None:
+        if not self.is_train():
+            return
+        self._train_signal_count += 1
+        if force or self._train_signal_count % self.learn_interval == 0:
             self.learn()
 
     def on_episode_start(self) -> None:
         self._pending.clear()
         self._reward_stats = RewardStats()
+        self._train_signal_count = 0
 
     def on_episode_end(self, flowlets, current_time: float) -> None:
         if not self.is_train():
@@ -364,6 +402,8 @@ class BatchedRLAgent(BaseAgent):
     def get_train_stats(self) -> dict:
         stats = self._reward_stats.to_dict()
         stats["pending_transitions"] = len(self._pending)
+        stats["learn_interval"] = self.learn_interval
+        stats["train_signals"] = self._train_signal_count
         stats["reward_config"] = self.reward_config.to_dict()
         replay_buffer = getattr(getattr(self, "global_agent", None), "replay_buffer", None)
         if replay_buffer is not None and hasattr(replay_buffer, "metadata_summary"):

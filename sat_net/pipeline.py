@@ -84,7 +84,7 @@ def run_marl_episode(
     if env.flowlets is not None:
         agent.on_episode_end(env.flowlets, env.current_time)
     if train:
-        agent.on_train_signal()
+        agent.on_train_signal(force=True)
 
     return EpisodeResult(
         metrics=env.calc_metrics(),

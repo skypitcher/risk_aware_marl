@@ -19,6 +19,8 @@
     "clip_grad_norm": 0.5,
     "use_layer_norm": true,
     "device": "auto",
+    "inference_device": "cpu",
+    "inference_sync_interval": 64,
     "delay_norm": 1000.0,
     "cost_limit": 10.0,
     "reward": {
