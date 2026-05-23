@@ -212,6 +212,12 @@ class MaDQN(BatchedRLAgent):
     def add_transition(self, **kwargs) -> None:
         self.global_agent.add_transition(**kwargs)
 
+    def _queue_delay_in_reward(self) -> bool:
+        return True
+
+    def _uses_cost_constraint(self) -> bool:
+        return False
+
     def learn(self) -> None:
         self.global_agent.learn()
 

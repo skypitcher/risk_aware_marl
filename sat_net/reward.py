@@ -10,16 +10,9 @@ from sat_net.sim_kernel import FLOWLET_DELIVERED, FLOWLET_DROPPED
 
 @dataclass(slots=True)
 class RewardConfig:
-    """Configurable reward shaping for per-flowlet routing transitions."""
+    """Legacy routing reward scale used by the original packet-level agents."""
 
-    progress_weight: float = 1.0
-    delay_weight: float = 1.0
-    queue_cost_weight: float = 0.25
-    delivered_bonus: float = 1.0
-    dropped_penalty: float = 1.0
-    truncated_penalty: float = 0.0
-    delay_norm: float = 1000.0
-    cost_norm: float = 1000.0
+    delay_norm: float = 100.0
     cost_limit: float = 10.0
 
     @classmethod
@@ -32,16 +25,9 @@ class RewardConfig:
                 return float(_get(source, name, default))
             return float(default)
 
-        delay_norm = value("delay_norm", float(_get(config, "delay_norm", 1000.0)))
+        delay_norm = value("delay_norm", float(_get(config, "delay_norm", 100.0)))
         return cls(
-            progress_weight=value("progress_weight", 1.0),
-            delay_weight=value("delay_weight", 1.0),
-            queue_cost_weight=value("queue_cost_weight", 0.25),
-            delivered_bonus=value("delivered_bonus", float(_get(config, "delivered_bonus", 1.0))),
-            dropped_penalty=value("dropped_penalty", float(_get(config, "dropped_penalty", 1.0))),
-            truncated_penalty=value("truncated_penalty", 0.0),
             delay_norm=delay_norm,
-            cost_norm=value("cost_norm", delay_norm),
             cost_limit=value("cost_limit", float(_get(config, "cost_limit", 10.0))),
         )
 
@@ -111,33 +97,43 @@ class RewardStats:
 
 def compute_transition_reward(
     config: RewardConfig,
-    previous_remaining_distance: float,
-    next_remaining_distance: float,
+    previous_best_distance: float,
+    current_distance: float,
     initial_distance: float,
     delta_delay: float,
     delta_queue_cost: float,
+    flowlet_size: float,
+    ttl_remaining: float,
     terminal_status: int | None = None,
     truncated: bool = False,
+    queue_delay_in_reward: bool = False,
 ) -> TransitionReward:
-    raw_initial = max(float(initial_distance), 1e-6)
-    previous_distance = _finite_or_default(previous_remaining_distance, raw_initial)
-    next_distance = _finite_or_default(next_remaining_distance, previous_distance)
-    initial = max(raw_initial, abs(previous_distance), abs(next_distance), 1e-6)
-    progress = (previous_distance - next_distance) / initial
-    progress_reward = config.progress_weight * progress
+    initial = max(float(initial_distance), 1e-6)
+    previous_best = _finite_or_default(previous_best_distance, initial)
+    current = _finite_or_default(current_distance, previous_best)
+    progress = max(0.0, previous_best - current) / initial
+    progress_reward = progress
 
-    delay_penalty = config.delay_weight * max(float(delta_delay), 0.0) / max(config.delay_norm, 1e-6)
-    queue_penalty = config.queue_cost_weight * max(float(delta_queue_cost), 0.0) / max(config.cost_norm, 1e-6)
-    terminal_reward = 0.0
+    delta_delay = max(float(delta_delay), 0.0)
+    delta_queue_cost = max(float(delta_queue_cost), 0.0)
+    delay_ms_for_reward = delta_delay if queue_delay_in_reward else max(delta_delay - delta_queue_cost, 0.0)
+    delay_penalty = delay_ms_for_reward / max(config.delay_norm, 1e-6)
+    queue_penalty = 0.0
+
+    reached_goal = 0.0
     if terminal_status == FLOWLET_DELIVERED:
-        terminal_reward += config.delivered_bonus
+        reached_goal = 1.0
     elif terminal_status == FLOWLET_DROPPED:
-        terminal_reward -= config.dropped_penalty
-    if truncated:
-        terminal_reward -= config.truncated_penalty
+        reached_goal = -1.0
 
-    cost = max(float(delta_queue_cost), 0.0) / max(config.cost_norm, 1e-6)
-    reward = progress_reward + terminal_reward - delay_penalty - queue_penalty
+    terminal_reward = reached_goal * (1.0 + float(flowlet_size))
+    reward = progress_reward + terminal_reward - delay_penalty
+    if terminal_status == FLOWLET_DROPPED:
+        current_progress = current / initial
+        reward = -current_progress - float(ttl_remaining) * 5.0 / max(config.delay_norm, 1e-6)
+        terminal_reward = reward
+
+    cost = delta_queue_cost / max(config.delay_norm, 1e-6)
     return TransitionReward(
         reward=float(reward),
         cost=float(cost),

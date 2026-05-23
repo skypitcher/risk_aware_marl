@@ -12,8 +12,8 @@ from sat_net.stats import Metrics
 
 
 @dataclass(slots=True)
-class EpisodeResult:
-    """Result of one MARL episode."""
+class RolloutResult:
+    """Result of one finite rollout window from the continuing routing process."""
 
     metrics: Metrics
     info: dict
@@ -26,9 +26,9 @@ class EpisodeResult:
 
 @dataclass(slots=True)
 class EvaluationResult:
-    """Aggregated metrics over multiple evaluation episodes."""
+    """Aggregated metrics over multiple evaluation rollouts."""
 
-    episodes: list[EpisodeResult]
+    rollouts: list[RolloutResult]
     throughput_mean: float
     throughput_std: float
     drop_rate_mean: float
@@ -38,14 +38,15 @@ class EvaluationResult:
     cost_mean: float
 
 
-def run_marl_episode(
+def run_marl_rollout(
     env: RoutingEnv,
     agent: BaseAgent,
     seed: int | None = None,
     start_time: float | None = None,
     train: bool = False,
-) -> EpisodeResult:
-    """Run one MARL episode: reset env, collect batched agent actions, step env, update agent."""
+    max_steps: int | None = None,
+) -> RolloutResult:
+    """Run one rollout window from a continuing MARL routing process."""
 
     if train:
         agent.set_train()
@@ -53,7 +54,7 @@ def run_marl_episode(
         agent.set_eval()
 
     wall_start = time.time()
-    agent.on_episode_start()
+    agent.on_rollout_start()
     observation, info = env.reset(
         seed=seed,
         start_time=start_time,
@@ -67,7 +68,7 @@ def run_marl_episode(
     decision_batches = 0
     active_agent_sum = 0
     max_active_agents = 0
-    while not (terminated or truncated):
+    while not (terminated or truncated) and (max_steps is None or step_count < max_steps):
         if not _is_empty_observation(observation):
             decision_count += observation.decision_count
             decision_batches += 1
@@ -81,12 +82,13 @@ def run_marl_episode(
             agent.observe_flowlet_outcomes(env.flowlets, env.current_time)
             agent.on_train_signal()
 
+    max_steps_reached = max_steps is not None and step_count >= max_steps and not (terminated or truncated)
     if env.flowlets is not None:
-        agent.on_episode_end(env.flowlets, env.current_time)
+        agent.on_rollout_end(env.flowlets, env.current_time)
     if train:
         agent.on_train_signal(force=True)
 
-    return EpisodeResult(
+    return RolloutResult(
         metrics=env.calc_metrics(),
         info=info,
         agent_stats=agent.get_train_stats(),
@@ -96,6 +98,7 @@ def run_marl_episode(
             "decisions": decision_count,
             "active_agents_mean": active_agent_sum / max(decision_batches, 1),
             "active_agents_max": max_active_agents,
+            "max_steps_reached": max_steps_reached,
         },
         elapsed_seconds=time.time() - wall_start,
         seed=seed,
@@ -109,18 +112,18 @@ def evaluate_agent(
     seeds: Iterable[int],
     start_time: float | None = 0,
 ) -> EvaluationResult:
-    """Evaluate one agent over multiple deterministic seeds without mutating training buffers."""
+    """Evaluate one agent over multiple deterministic rollout windows without mutating training buffers."""
 
-    episodes = [
-        run_marl_episode(env=env, agent=agent, seed=seed, start_time=start_time, train=False)
+    rollouts = [
+        run_marl_rollout(env=env, agent=agent, seed=seed, start_time=start_time, train=False)
         for seed in seeds
     ]
-    throughputs = np.array([episode.metrics.throughput for episode in episodes], dtype=np.float64)
-    drop_rates = np.array([episode.metrics.drop_rate for episode in episodes], dtype=np.float64)
-    e2e_delays = np.array([episode.metrics.e2e_delay_mean for episode in episodes], dtype=np.float64)
-    costs = np.array([episode.metrics.queue_delay_mean for episode in episodes], dtype=np.float64)
+    throughputs = np.array([rollout.metrics.throughput for rollout in rollouts], dtype=np.float64)
+    drop_rates = np.array([rollout.metrics.drop_rate for rollout in rollouts], dtype=np.float64)
+    e2e_delays = np.array([rollout.metrics.e2e_delay_mean for rollout in rollouts], dtype=np.float64)
+    costs = np.array([rollout.metrics.queue_delay_mean for rollout in rollouts], dtype=np.float64)
     return EvaluationResult(
-        episodes=episodes,
+        rollouts=rollouts,
         throughput_mean=float(throughputs.mean()) if len(throughputs) else 0.0,
         throughput_std=float(throughputs.std()) if len(throughputs) else 0.0,
         drop_rate_mean=float(drop_rates.mean()) if len(drop_rates) else 0.0,

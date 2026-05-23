@@ -19,6 +19,7 @@ class RoutingBatch:
 
     flowlet_ids: np.ndarray
     current_sat_ids: np.ndarray
+    source_region_ids: np.ndarray
     target_region_ids: np.ndarray
     target_access_sat_ids: np.ndarray
     neighbor_sat_ids: np.ndarray
@@ -30,17 +31,25 @@ class RoutingBatch:
     neighbor_link_free_time: np.ndarray
     flowlet_size: np.ndarray
     packet_count: np.ndarray
+    is_normal: np.ndarray
+    creation_time: np.ndarray
     ttl: np.ndarray
     current_time: float
     region_next_hop_table: np.ndarray | None = None
     region_next_hop_version: int = 0
+    observations: np.ndarray | None = None
     hops: np.ndarray | None = None
     queue_delay: np.ndarray | None = None
     transmission_delay: np.ndarray | None = None
     propagation_delay: np.ndarray | None = None
     total_queue_cost: np.ndarray | None = None
+    remaining_gcd: np.ndarray | None = None
     shortest_gcd: np.ndarray | None = None
     initial_gcd: np.ndarray | None = None
+    last_action1: np.ndarray | None = None
+    last_action2: np.ndarray | None = None
+    last_node1: np.ndarray | None = None
+    last_node2: np.ndarray | None = None
 
     @property
     def agent_ids(self) -> np.ndarray:
@@ -100,10 +109,10 @@ class BaseAgent(ABC):
     def observe_flowlet_outcomes(self, flowlets, current_time: float):
         pass
 
-    def on_episode_start(self):
+    def on_rollout_start(self):
         pass
 
-    def on_episode_end(self, flowlets, current_time: float):
+    def on_rollout_end(self, flowlets, current_time: float):
         pass
 
     def save_models(self, model_dir_path: str):

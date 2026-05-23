@@ -74,6 +74,7 @@ class RoutingEnv:
         self.small_packet_size = self.config.small_packet_size
 
         self.default_ttl: int = self.config.default_ttl
+        self.delay_norm: float = self.config.get("delay_norm", 100.0)
 
         self.start_time = 0.0  # the start timestamp of the simulation. randomize this to init the topology
         self.current_time = 0.0  #  # the current time offset, in milliseconds
@@ -90,6 +91,14 @@ class RoutingEnv:
         self.next_flowlet_id = 0
         self._region_positions = np.array(
             [region.position for region in self.traffic_model.regions],
+            dtype=np.float64,
+        )
+        self._region_latitudes = np.array(
+            [region.latitude for region in self.traffic_model.regions],
+            dtype=np.float64,
+        )
+        self._region_longitudes = np.array(
+            [region.longitude for region in self.traffic_model.regions],
             dtype=np.float64,
         )
         self._region_distance_matrix = self._build_region_distance_matrix()
@@ -368,12 +377,19 @@ class RoutingEnv:
         arrival_ids = self._pop_event_ids(self._arrival_events, self._step_index)
         if len(arrival_ids) == 0:
             return arrival_ids
+        was_on_link = self._flowlets.status[arrival_ids] == FLOWLET_ON_LINK
         route_ready_ids = handle_flowlet_arrival_ids(
             flowlets=self._flowlets,
             flowlet_ids=arrival_ids,
             current_time=self.current_time,
             ttl_expired_reason=int(NetworkError.TTL_EXPIRED),
         )
+        ttl_dropped = arrival_ids[
+            was_on_link
+            & (self._flowlets.status[arrival_ids] == FLOWLET_DROPPED)
+            & (self._flowlets.drop_reason[arrival_ids] == int(NetworkError.TTL_EXPIRED))
+        ]
+        self._refresh_flowlet_remaining_gcd(ttl_dropped)
         return route_ready_ids
 
     def _activate_flowlets_at_current_slot_ids(self) -> np.ndarray:
@@ -474,6 +490,7 @@ class RoutingEnv:
         if len(at_node_ids) == 0:
             return self._empty_routing_batch()
 
+        self._refresh_flowlet_remaining_gcd(at_node_ids)
         delivered_ids, route_ids = self._partition_deliverable_flowlets(at_node_ids)
         if len(delivered_ids) > 0:
             self._deliver_flowlet_ids(delivered_ids)
@@ -604,6 +621,7 @@ class RoutingEnv:
         return RoutingBatch(
             flowlet_ids=np.empty(0, dtype=np.int64),
             current_sat_ids=np.empty(0, dtype=np.int64),
+            source_region_ids=np.empty(0, dtype=np.int64),
             target_region_ids=np.empty(0, dtype=np.int64),
             target_access_sat_ids=np.empty(0, dtype=np.int64),
             neighbor_sat_ids=neighbor_i,
@@ -615,17 +633,25 @@ class RoutingEnv:
             neighbor_link_free_time=neighbor_f.copy(),
             flowlet_size=np.empty(0, dtype=np.float64),
             packet_count=np.empty(0, dtype=np.int64),
+            is_normal=np.empty(0, dtype=bool),
+            creation_time=np.empty(0, dtype=np.float64),
             ttl=np.empty(0, dtype=np.int16),
             current_time=self.current_time,
             region_next_hop_table=self._region_next_hop_table if self._include_spf_table else None,
             region_next_hop_version=self._region_next_hop_version if self._include_spf_table else 0,
+            observations=np.empty((0, self.obs_dim), dtype=np.float32),
             hops=np.empty(0, dtype=np.int16),
             queue_delay=np.empty(0, dtype=np.float64),
             transmission_delay=np.empty(0, dtype=np.float64),
             propagation_delay=np.empty(0, dtype=np.float64),
             total_queue_cost=np.empty(0, dtype=np.float64),
+            remaining_gcd=np.empty(0, dtype=np.float64),
             shortest_gcd=np.empty(0, dtype=np.float64),
             initial_gcd=np.empty(0, dtype=np.float64),
+            last_action1=np.empty(0, dtype=np.int64),
+            last_action2=np.empty(0, dtype=np.int64),
+            last_node1=np.empty(0, dtype=np.int64),
+            last_node2=np.empty(0, dtype=np.int64),
         )
 
     def _build_step_info(self) -> dict:
@@ -682,18 +708,234 @@ class RoutingEnv:
             region_next_hop_table=self._region_next_hop_table if include_spf_table else None,
             region_next_hop_version=self._region_next_hop_version if include_spf_table else 0,
         )
-        remaining_distances = self._remaining_target_distances(current_sats, target_regions)
-        batch.shortest_gcd = remaining_distances
-        self._flowlets.shortest_gcd[flowlet_ids] = remaining_distances
+        batch.remaining_gcd = self._remaining_target_distances(current_sats, target_regions)
+        batch.shortest_gcd = self._flowlets.shortest_gcd[flowlet_ids].copy()
+        self._apply_legacy_action_mask(batch)
+        batch.observations = self._build_legacy_observations(batch)
         return batch
 
     def _remaining_target_distances(self, current_sats: np.ndarray, target_regions: np.ndarray) -> np.ndarray:
         if len(current_sats) == 0:
             return np.empty(0, dtype=np.float64)
-        sat_positions = self.network._satellite_positions_by_id[current_sats]
-        target_positions = self._region_positions[target_regions]
-        delta = sat_positions - target_positions
-        return np.linalg.norm(delta, axis=1)
+        sat_lon, sat_lat = self._satellite_projected_lon_lat(current_sats)
+        target_lon = self._region_longitudes[target_regions]
+        target_lat = self._region_latitudes[target_regions]
+        return self._great_circle_distance_deg(sat_lon, sat_lat, target_lon, target_lat)
+
+    def _refresh_flowlet_remaining_gcd(self, flowlet_ids: np.ndarray) -> None:
+        if self._flowlets is None or len(flowlet_ids) == 0:
+            return
+        valid = self._flowlets.current_sat[flowlet_ids] >= 0
+        if not valid.any():
+            return
+        ids = flowlet_ids[valid]
+        self._flowlets.remaining_gcd[ids] = self._remaining_target_distances(
+            self._flowlets.current_sat[ids],
+            self._flowlets.target_region_id[ids],
+        )
+
+    def _apply_legacy_action_mask(self, batch: RoutingBatch) -> None:
+        if batch.decision_count == 0:
+            return
+        deliverable = self._neighbor_deliverable_to_target(batch.target_region_ids, batch.neighbor_sat_ids)
+        last_node1 = self._optional_int(batch.last_node1, batch.decision_count)
+        loopback = batch.neighbor_sat_ids == last_node1[:, None]
+        batch.action_mask &= ~(loopback & ~deliverable)
+
+    def _build_legacy_observations(self, batch: RoutingBatch) -> np.ndarray:
+        n = batch.decision_count
+        obs = np.zeros((n, self.obs_dim), dtype=np.float32)
+        if n == 0:
+            return obs
+
+        current_pos = self.network._satellite_positions_by_id[batch.current_sat_ids] / self.network.orbit_radius
+        target_pos = self._region_positions[batch.target_region_ids] / self.network.orbit_radius
+        relative_pos = current_pos - target_pos
+        relative_distance = np.linalg.norm(relative_pos, axis=1)
+
+        orbit_cycle_ms = max(float(self.network.orbit_cycle * 1000.0), 1e-9)
+        time_prog = np.full(n, (self.current_time % orbit_cycle_ms) / orbit_cycle_ms, dtype=np.float64)
+        initial_gcd = np.maximum(self._optional_float(batch.initial_gcd, n), 1e-6)
+        remaining_gcd = self._optional_float(batch.remaining_gcd, n)
+        current_progress = remaining_gcd / initial_gcd
+
+        current_load, current_remaining = self._node_queue_features(batch.current_sat_ids)
+        total_delay = (
+            self._optional_float(batch.queue_delay, n)
+            + self._optional_float(batch.transmission_delay, n)
+            + self._optional_float(batch.propagation_delay, n)
+        )
+        queue_delay = self._optional_float(batch.queue_delay, n)
+        ttl = batch.ttl.astype(np.float64, copy=False)
+        last_action1 = self._optional_int(batch.last_action1, n).astype(np.float64)
+        last_action2 = self._optional_int(batch.last_action2, n).astype(np.float64)
+        last_node1 = self._optional_int(batch.last_node1, n).astype(np.float64)
+        last_node2 = self._optional_int(batch.last_node2, n).astype(np.float64)
+
+        obs[:, 0:26] = np.column_stack(
+            (
+                time_prog,
+                current_pos[:, 0],
+                current_pos[:, 1],
+                current_pos[:, 2],
+                target_pos[:, 0],
+                target_pos[:, 1],
+                target_pos[:, 2],
+                relative_pos[:, 0],
+                relative_pos[:, 1],
+                relative_pos[:, 2],
+                relative_distance,
+                current_progress,
+                current_load,
+                current_remaining,
+                (self.current_time - batch.creation_time) / self.delay_norm,
+                batch.is_normal.astype(np.float64, copy=False),
+                batch.flowlet_size,
+                ttl,
+                float(self.default_ttl) - ttl,
+                ttl / max(float(self.default_ttl), 1e-6),
+                total_delay / self.delay_norm,
+                queue_delay / self.delay_norm,
+                last_action1,
+                last_node1,
+                last_action2,
+                last_node2,
+            )
+        )
+
+        neighbor_ids = batch.neighbor_sat_ids
+        valid_neighbor = neighbor_ids >= 0
+        safe_neighbor_ids = np.where(valid_neighbor, neighbor_ids, 0)
+        neighbor_pos = self.network._satellite_positions_by_id[safe_neighbor_ids] / self.network.orbit_radius
+        neighbor_pos = np.where(valid_neighbor[:, :, None], neighbor_pos, 0.0)
+        neighbor_relative = neighbor_pos - target_pos[:, None, :]
+        neighbor_relative_distance = np.linalg.norm(neighbor_relative, axis=2)
+
+        neighbor_gcd = np.zeros((n, ACTION_COUNT), dtype=np.float64)
+        if valid_neighbor.any():
+            flat_targets = np.broadcast_to(batch.target_region_ids[:, None], neighbor_ids.shape)
+            neighbor_gcd[valid_neighbor] = self._remaining_target_distances(
+                neighbor_ids[valid_neighbor],
+                flat_targets[valid_neighbor],
+            )
+        neighbor_progress = neighbor_gcd / initial_gcd[:, None]
+
+        valid_link = batch.neighbor_link_ids >= 0
+        safe_link_ids = np.where(valid_link, batch.neighbor_link_ids, 0)
+        link_remaining = np.where(
+            valid_link,
+            np.maximum(batch.neighbor_link_capacity - batch.neighbor_queue_load, 0.0),
+            0.0,
+        )
+        link_data_rate = np.where(valid_link, self._links.data_rate[safe_link_ids], 1.0)
+        normalized_queue_delay = np.where(
+            valid_link,
+            np.maximum(batch.neighbor_link_free_time - self.current_time, 0.0) / self.delay_norm,
+            0.0,
+        )
+        normalized_transmit_time = batch.flowlet_size[:, None] / np.maximum(link_data_rate, 1e-9) / self.delay_norm
+        normalized_propagation_delay = np.where(
+            valid_link,
+            batch.neighbor_link_delay / self.delay_norm,
+            0.0,
+        )
+        sink_load, sink_remaining = self._node_queue_features(safe_neighbor_ids.reshape(-1))
+        sink_load = sink_load.reshape(n, ACTION_COUNT)
+        sink_remaining = sink_remaining.reshape(n, ACTION_COUNT)
+        has_enough_capacity = (link_remaining >= batch.flowlet_size[:, None]).astype(np.float64)
+        target_access = self._neighbor_deliverable_to_target(batch.target_region_ids, neighbor_ids).astype(np.float64)
+        looped = (
+            (neighbor_ids == self._optional_int(batch.last_node1, n)[:, None])
+            | (neighbor_ids == self._optional_int(batch.last_node2, n)[:, None])
+        ).astype(np.float64)
+
+        cursor = 26
+        for action_idx in range(ACTION_COUNT):
+            obs[:, cursor : cursor + 17] = np.column_stack(
+                (
+                    neighbor_pos[:, action_idx, 0],
+                    neighbor_pos[:, action_idx, 1],
+                    neighbor_pos[:, action_idx, 2],
+                    neighbor_relative[:, action_idx, 0],
+                    neighbor_relative[:, action_idx, 1],
+                    neighbor_relative[:, action_idx, 2],
+                    neighbor_relative_distance[:, action_idx],
+                    neighbor_progress[:, action_idx],
+                    normalized_queue_delay[:, action_idx],
+                    normalized_transmit_time[:, action_idx],
+                    normalized_propagation_delay[:, action_idx],
+                    sink_load[:, action_idx],
+                    sink_remaining[:, action_idx],
+                    link_remaining[:, action_idx],
+                    has_enough_capacity[:, action_idx],
+                    looped[:, action_idx],
+                    target_access[:, action_idx],
+                )
+            )
+            cursor += 17
+
+        np.nan_to_num(obs, copy=False, nan=0.0, posinf=0.0, neginf=0.0)
+        return obs
+
+    def _neighbor_deliverable_to_target(self, target_regions: np.ndarray, neighbor_sat_ids: np.ndarray) -> np.ndarray:
+        deliverable = np.zeros(neighbor_sat_ids.shape, dtype=bool)
+        valid_neighbor = neighbor_sat_ids >= 0
+        if not valid_neighbor.any():
+            return deliverable
+        safe_neighbor = np.where(valid_neighbor, neighbor_sat_ids, 0)
+        cols = self._sat_id_to_col_array[safe_neighbor]
+        valid = valid_neighbor & (cols >= 0)
+        if valid.any():
+            target_matrix = np.broadcast_to(target_regions[:, None], neighbor_sat_ids.shape)
+            deliverable[valid] = self._region_sat_visible[target_matrix[valid], cols[valid]]
+        return deliverable
+
+    def _node_queue_features(self, sat_ids: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        sat_ids = np.asarray(sat_ids, dtype=np.int64)
+        if len(sat_ids) == 0 or self._links is None:
+            return np.empty(0, dtype=np.float64), np.empty(0, dtype=np.float64)
+        neighbor_link_ids = self._links.neighbor_link_ids[sat_ids]
+        valid = neighbor_link_ids >= 0
+        safe_link_ids = np.where(valid, neighbor_link_ids, 0)
+        queue = np.where(valid, self._links.queue_load[safe_link_ids], 0.0)
+        capacity = np.where(valid, self._links.capacity[safe_link_ids], 0.0)
+        total_capacity = capacity.sum(axis=1)
+        total_queue = queue.sum(axis=1)
+        load = np.divide(total_queue, total_capacity, out=np.zeros_like(total_queue), where=total_capacity > 0)
+        remaining = np.maximum(total_capacity - total_queue, 0.0)
+        return load, remaining
+
+    def _satellite_projected_lon_lat(self, sat_ids: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        positions = self.network._satellite_positions_by_id[sat_ids]
+        x = positions[:, 0]
+        y = positions[:, 1]
+        z = positions[:, 2]
+        lon = np.degrees(np.arctan2(y, x))
+        lat = np.degrees(np.arctan2(z, np.sqrt(x * x + y * y)))
+        return lon, lat
+
+    @staticmethod
+    def _great_circle_distance_deg(lon1: np.ndarray, lat1: np.ndarray, lon2: np.ndarray, lat2: np.ndarray) -> np.ndarray:
+        lon1_rad = np.radians(lon1)
+        lat1_rad = np.radians(lat1)
+        lon2_rad = np.radians(lon2)
+        lat2_rad = np.radians(lat2)
+        dlat = lat2_rad - lat1_rad
+        dlon = lon2_rad - lon1_rad
+        a = np.sin(dlat / 2.0) ** 2 + np.cos(lat1_rad) * np.cos(lat2_rad) * np.sin(dlon / 2.0) ** 2
+        return np.degrees(2.0 * np.arcsin(np.sqrt(np.clip(a, 0.0, 1.0))))
+
+    @staticmethod
+    def _optional_float(values: np.ndarray | None, length: int) -> np.ndarray:
+        if values is None:
+            return np.zeros(length, dtype=np.float64)
+        return np.asarray(values, dtype=np.float64)
+
+    @staticmethod
+    def _optional_int(values: np.ndarray | None, length: int) -> np.ndarray:
+        if values is None:
+            return np.full(length, -1, dtype=np.int64)
+        return np.asarray(values, dtype=np.int64)
 
     def _event_slots_for_time(self, timestamps: np.ndarray) -> np.ndarray:
         slots = np.ceil((timestamps - self.start_time) / self.slot_ms - 1e-9).astype(np.int64)
@@ -911,7 +1153,9 @@ class RoutingEnv:
         normal_cost = weighted_sum(delivered_mask & normal_mask, flowlets.total_queue_cost)
         small_cost = weighted_sum(delivered_mask & small_mask, flowlets.total_queue_cost)
 
-        throughput = float(flowlets.size[delivered_mask].sum()) / max(self.time_limit / 1000.0, 1e-12)
+        elapsed_ms = min(max(float(self.current_time - self.start_time), 0.0), self.time_limit)
+        elapsed_seconds = max(elapsed_ms / 1000.0, 1e-12)
+        throughput = float(flowlets.size[delivered_mask].sum()) / elapsed_seconds
 
         return Metrics(
             generated=generated,
@@ -925,7 +1169,7 @@ class RoutingEnv:
             dropped_normal_packet=dropped_normal,
             dropped_small_packet=dropped_small,
             throughput=throughput,
-            service_rate=delivered / max(self.time_limit / 1000.0, 1e-12),
+            service_rate=delivered / elapsed_seconds,
             delivery_rate=delivered / generated if generated else 0.0,
             drop_rate=dropped / generated if generated else 0.0,
             normal_packet_delivery_rate=delivered_normal / generated_normal if generated_normal else 0.0,

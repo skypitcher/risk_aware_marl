@@ -25,8 +25,8 @@ The simulator has been refactored from an event-queue packet model into a data-o
 3. **Array network state**: Satellite positions, neighbor/link matrices, link delays, connectivity, queues, and flowlet state are stored in NumPy arrays.
 4. **Mask-first slot kernels**: `sat_net/sim_kernel.py` owns flowlet/link state transitions and returns full-length masks before NumPy compression.
 5. **MARL env API**: `RoutingEnv.reset()` returns a batched multi-agent `RoutingBatch`; every row is one satellite-agent decision for one flowlet.
-6. **MARL training pipeline**: `sat_net/pipeline.py` runs `reset -> agent.act -> env.step -> observe outcomes -> train update` episodes.
-7. **Reward and experiment logs**: `sat_net/reward.py` defines configurable transition rewards, and `sat_net/experiment.py` writes manifests, checkpoints, and train/eval metrics.
+6. **MARL training pipeline**: `sat_net/pipeline.py` samples finite rollout windows from a continuing process and runs `reset(start_time) -> agent.act -> env.step -> observe outcomes -> train update`.
+7. **Legacy RL signals**: `sat_net/routing_env.py` emits the 94-dimensional routing observation used by the original agents, and `sat_net/reward.py` preserves the proven MaDQN/PRIMAL reward and cost scale.
 8. **SPF baseline**: Shortest-path next-hop rows are computed from sparse arrays, cached in a dense matrix, and refreshed with topology updates.
 9. **Torch RL on NumPy kernels**: The default path is NumPy/SciPy simulation plus PyTorch MaDQN/PRIMAL training.
 
@@ -96,8 +96,8 @@ brew install proj geos
 risk_aware_marl/
 ├── sat_net/                    # Core simulation framework
 │   ├── routing_env.py          # Slot-array routing environment
-│   ├── pipeline.py             # MARL train/eval episode pipeline
-│   ├── reward.py               # Transition reward and cost shaping
+│   ├── pipeline.py             # MARL train/eval rollout pipeline
+│   ├── reward.py               # Legacy MaDQN/PRIMAL transition reward and cost
 │   ├── experiment.py           # Run manifests, metrics, and checkpoints
 │   ├── sim_kernel.py           # Flowlet/link array transition kernels
 │   ├── network.py              # Array-oriented satellite network topology
@@ -129,13 +129,13 @@ python run_eval.py
 
 ### RL Training Status
 
-`run_train.py` executes agent episodes through `sat_net/pipeline.py`. `configs/main.json` selects the scenario, while `configs/agents/*.json` selects the algorithm. Use `configs/agents/madqn.json`, `configs/agents/primal_avg.json`, or `configs/agents/primal_cvar.json` to train the rebuilt MaDQN/PRIMAL baselines.
+`run_train.py` samples continuing rollout windows through `sat_net/pipeline.py` until `max_sampling_steps` is reached. `configs/main.json` selects the scenario, while `configs/agents/*.json` selects the algorithm. Use `configs/agents/madqn.json`, `configs/agents/primal_avg.json`, or `configs/agents/primal_cvar.json` to train the rebuilt MaDQN/PRIMAL baselines.
 
 ```bash
-python run_train.py --config configs/main.json --agent configs/agents/madqn.json --num_epochs 10 --eval_interval 5
+python run_train.py --config configs/main.json --agent configs/agents/madqn.json --max_sampling_steps 600000
 ```
 
-Each run writes `manifest.json`, `summary.json`, checkpoint state, and CSV/JSONL metrics under `runs_train/<run_id>/`.
+Each run writes `manifest.json`, `summary.json`, checkpoint state, and CSV/JSONL rollout metrics under `runs_train/<run_id>/`.
 
 ## 📄 License
 

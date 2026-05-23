@@ -2,11 +2,11 @@
 
 ## Project Structure & Module Organization
 
-`sat_net/` contains the fixed-step, data-oriented satellite routing simulator. `sat_net/network.py` stores topology, neighbor/link matrices, and dense SPF next-hop rows in NumPy arrays, `sat_net/sim_kernel.py` owns mask-first flowlet/link transitions, `sat_net/routing_env.py` orchestrates topology and traffic, and `sat_net/agent/` defines the batched MARL agent contract plus SPFAgent, MaDQN, PRIMAL-Avg, and PRIMAL-CVaR. The default research path is NumPy/SciPy simulation with PyTorch agents. Root-level scripts are entry points: `run_train.py`, `run_eval.py`, `run_spf.py`, `scripts/fetch_worldpop_population.py`, and plotting utilities named `plot_*.py`. JSON environment and agent settings live in `configs/`. Static map data is in `assets/`, including the WorldPop population grid in `assets/population/`; generated figures and run outputs are in `figs/` and `runs_*`.
+`sat_net/` contains the data-oriented satellite routing simulator. Key modules are `routing_env.py` for environment orchestration, `sim_kernel.py` for flowlet/link array transitions, `network.py` for topology and SPF tables, `traffic_region.py` for population-driven traffic, and `sat_net/agent/` for SPFAgent, MaDQN, PRIMAL-Avg, and PRIMAL-CVaR. Entry points are `run_train.py`, `run_eval.py`, and `run_spf.py`. Configs are under `configs/`, population assets under `assets/population/`, figures under `figs/`, and run outputs under `runs_*`.
 
 ## Build, Test, and Development Commands
 
-Create the Python 3.11 environment and install dependencies:
+Create the environment and install dependencies:
 
 ```bash
 conda create -n risk_aware_routing python=3.11
@@ -14,32 +14,30 @@ conda activate risk_aware_routing
 pip install -r requirements.txt
 ```
 
-Run core workflows from the repository root:
+Run common workflows from the repository root:
 
 ```bash
 python run_spf.py
 python run_eval.py
-python run_train.py --config=configs/main.json --agent=configs/agents/madqn.json --num_epochs=1 --eval_interval=0
+python run_train.py --config configs/main.json --agent configs/agents/primal_cvar.json --max_sampling_steps 30000 --eval_interval_steps 0
 ```
 
-Use `python -m compileall sat_net *.py` as a fast syntax check before longer simulations.
+Use `python -m compileall sat_net run_train.py run_eval.py run_spf.py` before longer simulations.
 
 ## Coding Style & Naming Conventions
 
-Use Python with 4-space indentation and type hints where they clarify simulator contracts. Keep modules focused around existing boundaries: environment logic in `routing_env.py`, graph/topology logic in `network.py`, and batched agent code under `sat_net/agent/`. Follow existing naming patterns: classes use `PascalCase`, functions and variables use `snake_case`, and config files use descriptive lowercase names such as `configs/agents/spf.json`. `.pylintrc` allows 120-character lines and disables docstring and strict naming warnings; run `pylint sat_net run_train.py run_eval.py` when changing shared code.
+Use Python with 4-space indentation and useful type hints. Keep changes inside existing boundaries: environment logic in `routing_env.py`, topology in `network.py`, array kernels in `sim_kernel.py`, and agents under `sat_net/agent/`. Classes use `PascalCase`; functions, variables, and config keys use `snake_case`. Config files should be descriptive lowercase names such as `configs/agents/spf.json`.
 
 ## Testing Guidelines
 
-There is no dedicated automated test suite yet. For behavior changes, add focused tests under `tests/` using `test_*.py` names if introducing pytest. At minimum, run `compileall` plus a short deterministic smoke command such as `python run_spf.py`; for agent changes, run a reduced training command and inspect `runs_train/<run_id>/metrics/`.
+There is no dedicated automated test suite yet. For behavior changes, run `compileall` plus a short smoke command. For agent or reward changes, run a reduced training job and inspect `runs_train/<run_id>/metrics/` and replay stats. Add focused `tests/test_*.py` pytest files when introducing reusable checks.
 
 ## MARL Modeling Notes
 
-Treat the underlying decision process as packet/flowlet trajectories, not node trajectories. A transition follows one flowlet as it moves from its current satellite to the next satellite, delivery, or drop; the next decision may belong to a different satellite agent. The decision owner for each row is still the current node, exposed as `RoutingBatch.agent_ids`.
+Treat transitions as packet/flowlet trajectories, not node trajectories. Each row is decided by the current satellite agent, but the next decision for the same flowlet may belong to another satellite. Use CTDE by default: MaDQN and PRIMAL share replay and a global model for centralized training, while execution uses local observations and action masks.
 
-Use CTDE as the default learning assumption. MaDQN and PRIMAL agents should use shared replay and a shared global model for centralized training, while execution remains decentralized through local per-node observations and action masks. This is parameter-sharing MARL, not fully independent per-node learning.
-
-When changing replay or rewards, preserve `flowlet_id`, current `agent_id`, and the next decision context so packet trajectories remain reconstructable. If adding truly independent MARL later, each node needs its own memory/model, and bootstrap targets must use the next node's value model, not blindly reuse the previous node's model. Because flowlets aggregate packets, weight losses or metrics by `packet_count` or `flowlet_size` when the objective is intended to approximate packet-level behavior.
+Preserve `flowlet_id`, current `agent_id`, and next decision context when changing replay. Because flowlets aggregate packets, weight losses or metrics by `packet_count` or `flowlet_size` when approximating packet-level objectives. Preserve the legacy 94-dimensional observation and reward scale from tag `pre-sim-kernel-optimization-20260510` unless deliberately redesigning the learning problem: PRIMAL separates non-queue delay reward from queue-delay cost, while MaDQN penalizes full action delay in its baseline reward.
 
 ## Commit & Pull Request Guidelines
 
-The current history uses short messages such as `update` and `Update ReadMe.md`; prefer more specific imperative summaries, for example `agent: add batched MARL interface`. Pull requests should describe the simulator or agent behavior changed, list commands run, identify modified configs, and note whether outputs in `figs/` or `runs_*` are intentionally included. Avoid committing transient run logs unless they are required reproducibility artifacts.
+History currently has short messages such as `update`; prefer specific imperative summaries like `agent: restore legacy reward scale`. Pull requests should describe simulator or agent behavior changes, list commands run, identify modified configs, and note whether `figs/` or `runs_*` outputs are intentional artifacts.

@@ -2,7 +2,7 @@ import argparse
 import time
 
 from sat_net import RoutingEnv
-from sat_net.pipeline import run_marl_episode
+from sat_net.pipeline import run_marl_rollout
 from sat_net.agent import create_agent
 from sat_net.config import DEFAULT_MAIN_CONFIG, DEFAULT_SPF_AGENT_CONFIG, load_config, load_env_config, merge_section
 
@@ -26,7 +26,7 @@ if __name__ == "__main__":
     agent_config = load_config(DEFAULT_SPF_AGENT_CONFIG)
     env = RoutingEnv(env_config)
     agent = create_agent(agent_config)
-    result = run_marl_episode(env=env, agent=agent, seed=args.seed, train=False)
+    result = run_marl_rollout(env=env, agent=agent, seed=args.seed, train=False)
     metrics = result.metrics
     end_time = time.time()
     time_elapsed = end_time - start_time

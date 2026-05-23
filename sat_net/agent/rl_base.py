@@ -58,8 +58,10 @@ class PendingTransition:
     queue_cost: float
     shortest_gcd: float
     initial_gcd: float
+    flowlet_size: float
+    ttl: float
     delay_norm: float
-    target_cost: float
+    target_cost: float | None
     weight: float
 
 
@@ -75,20 +77,17 @@ class BatchedRLAgent(BaseAgent):
         self.action_dim = int(action_dim)
         self._tf_writer = tf_writer
         self.device = resolve_device(config)
-        self.delay_norm = float(config.get("delay_norm", 1000.0))
+        self.delay_norm = float(config.get("delay_norm", 100.0))
         self.cost_limit = float(config.get("cost_limit", 10.0))
-        self.node_norm = float(config.get("node_norm", 2048.0))
-        self.region_norm = float(config.get("region_norm", 512.0))
-        self.queue_norm = float(config.get("queue_norm", 32.0))
-        self.delay_feature_norm = float(config.get("delay_feature_norm", 1000.0))
-        self.size_norm = float(config.get("size_norm", 8.0))
         self.max_ttl = float(config.get("max_ttl", 64.0))
+        self.discount_cost = float(config.get("discount_cost", 1.0))
         self.train_freq = max(int(config.get("train_freq", 1)), 1)
         self._train_signal_count = 0
         self.reward_config = RewardConfig.from_config(config)
         self.delay_norm = self.reward_config.delay_norm
         self.cost_limit = self.reward_config.cost_limit
         self._pending: dict[int, PendingTransition] = {}
+        self._updated_shortest_gcd: dict[int, float] = {}
         self._reward_stats = RewardStats()
 
     def set_eval(self):
@@ -144,12 +143,13 @@ class BatchedRLAgent(BaseAgent):
         if force or self._train_signal_count % self.train_freq == 0:
             self.learn()
 
-    def on_episode_start(self) -> None:
+    def on_rollout_start(self) -> None:
         self._pending.clear()
+        self._updated_shortest_gcd.clear()
         self._reward_stats = RewardStats()
         self._train_signal_count = 0
 
-    def on_episode_end(self, flowlets, current_time: float) -> None:
+    def on_rollout_end(self, flowlets, current_time: float) -> None:
         if not self.is_train():
             self._pending.clear()
             return
@@ -166,13 +166,14 @@ class BatchedRLAgent(BaseAgent):
                 continue
             transition_reward = self._compute_reward(
                 pending=pending,
-                next_remaining_distance=float(flowlets.shortest_gcd[flowlet_id]),
+                current_distance=float(flowlets.remaining_gcd[flowlet_id]),
                 total_delay=float(
                     flowlets.queue_delay[flowlet_id]
                     + flowlets.transmission_delay[flowlet_id]
                     + flowlets.propagation_delay[flowlet_id]
                 ),
                 queue_cost=float(flowlets.total_queue_cost[flowlet_id]),
+                ttl_remaining=float(flowlets.ttl[flowlet_id]),
                 terminal_status=None,
                 truncated=True,
             )
@@ -181,7 +182,7 @@ class BatchedRLAgent(BaseAgent):
                 action=pending.action,
                 action_mask=pending.action_mask,
                 reward=transition_reward.reward,
-                cost=transition_reward.cost,
+                cost=self._buffer_cost(transition_reward.cost),
                 done=False,
                 truncated=True,
                 next_state=np.zeros(self.obs_dim, dtype=np.float32),
@@ -195,54 +196,13 @@ class BatchedRLAgent(BaseAgent):
 
     def build_states(self, batch: RoutingBatch) -> np.ndarray:
         n = len(batch.flowlet_ids)
-        states = np.zeros((n, self.obs_dim), dtype=np.float32)
-        if n == 0:
-            return states
-
-        total_delay = self._total_delay(batch)
-        queue_cost = self._optional(batch.total_queue_cost, n)
-        hops = self._optional(batch.hops, n)
-        shortest_gcd = self._optional(batch.shortest_gcd, n)
-        initial_gcd = np.maximum(self._optional(batch.initial_gcd, n), 1e-6)
-        progress_norm = np.maximum.reduce((initial_gcd, np.abs(shortest_gcd), np.ones(n, dtype=np.float64) * 1e-6))
-        progress = (initial_gcd - shortest_gcd) / progress_norm
-        target_access_valid = (batch.target_access_sat_ids >= 0).astype(np.float32)
-
-        base = np.column_stack(
-            (
-                batch.current_sat_ids / self.node_norm,
-                batch.target_region_ids / self.region_norm,
-                np.maximum(batch.target_access_sat_ids, 0) / self.node_norm,
-                batch.flowlet_size / self.size_norm,
-                batch.ttl / self.max_ttl,
-                total_delay / self.delay_norm,
-                queue_cost / self.delay_norm,
-                hops / self.max_ttl,
-                progress,
-                target_access_valid,
-            )
-        ).astype(np.float32, copy=False)
-        width = min(base.shape[1], self.obs_dim)
-        states[:, :width] = base[:, :width]
-
-        cursor = width
-        per_action = (
-            batch.action_mask.astype(np.float32),
-            np.maximum(batch.neighbor_sat_ids, 0) / self.node_norm,
-            np.maximum(batch.neighbor_queue_load, 0.0) / self.queue_norm,
-            batch.neighbor_link_capacity / self.queue_norm,
-            np.minimum(batch.neighbor_link_delay, self.delay_norm) / self.delay_feature_norm,
-            np.maximum(batch.neighbor_link_free_time - batch.current_time, 0.0) / self.delay_feature_norm,
-            np.maximum(batch.neighbor_link_capacity - batch.neighbor_queue_load, 0.0) / self.queue_norm,
-        )
-        for feature in per_action:
-            if cursor >= self.obs_dim:
-                break
-            feature = np.nan_to_num(feature, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32, copy=False)
-            width = min(feature.shape[1], self.obs_dim - cursor)
-            states[:, cursor : cursor + width] = feature[:, :width]
-            cursor += width
-        return states
+        if batch.observations is None:
+            raise RuntimeError("RoutingBatch is missing the legacy 94-dimensional RL observation.")
+        observations = np.asarray(batch.observations, dtype=np.float32)
+        expected_shape = (n, self.obs_dim)
+        if observations.shape != expected_shape:
+            raise RuntimeError(f"Expected observation shape {expected_shape}, got {observations.shape}.")
+        return observations
 
     def observe_flowlet_outcomes(self, flowlets, _current_time: float) -> None:
         if not self.is_train():
@@ -263,13 +223,14 @@ class BatchedRLAgent(BaseAgent):
             terminal_status = int(flowlets.status[flowlet_id])
             transition_reward = self._compute_reward(
                 pending=pending,
-                next_remaining_distance=float(flowlets.shortest_gcd[flowlet_id]),
+                current_distance=float(flowlets.remaining_gcd[flowlet_id]),
                 total_delay=float(
                     flowlets.queue_delay[flowlet_id]
                     + flowlets.transmission_delay[flowlet_id]
                     + flowlets.propagation_delay[flowlet_id]
                 ),
                 queue_cost=float(flowlets.total_queue_cost[flowlet_id]),
+                ttl_remaining=float(flowlets.ttl[flowlet_id]),
                 terminal_status=terminal_status,
                 truncated=False,
             )
@@ -278,7 +239,7 @@ class BatchedRLAgent(BaseAgent):
                 action=pending.action,
                 action_mask=pending.action_mask,
                 reward=transition_reward.reward,
-                cost=transition_reward.cost,
+                cost=self._buffer_cost(transition_reward.cost),
                 done=True,
                 truncated=False,
                 next_state=np.zeros(self.obs_dim, dtype=np.float32),
@@ -293,25 +254,30 @@ class BatchedRLAgent(BaseAgent):
     def _finalize_revisited(self, batch: RoutingBatch, states: np.ndarray, action_masks: np.ndarray) -> None:
         total_delay = self._total_delay(batch)
         queue_cost = self._optional(batch.total_queue_cost, len(batch.flowlet_ids))
-        shortest_gcd = self._optional(batch.shortest_gcd, len(batch.flowlet_ids))
+        remaining_gcd = self._optional(batch.remaining_gcd, len(batch.flowlet_ids))
         for row, flowlet_id in enumerate(batch.flowlet_ids):
             pending = self._pending.pop(int(flowlet_id), None)
             if pending is None:
                 continue
             transition_reward = self._compute_reward(
                 pending=pending,
-                next_remaining_distance=float(shortest_gcd[row]),
+                current_distance=float(remaining_gcd[row]),
                 total_delay=float(total_delay[row]),
                 queue_cost=float(queue_cost[row]),
+                ttl_remaining=float(batch.ttl[row]),
                 terminal_status=None,
                 truncated=False,
+            )
+            self._updated_shortest_gcd[int(flowlet_id)] = min(
+                pending.shortest_gcd,
+                float(remaining_gcd[row]),
             )
             self.add_transition(
                 state=pending.state,
                 action=pending.action,
                 action_mask=pending.action_mask,
                 reward=transition_reward.reward,
-                cost=transition_reward.cost,
+                cost=self._buffer_cost(transition_reward.cost),
                 done=False,
                 truncated=False,
                 next_state=states[row],
@@ -339,6 +305,7 @@ class BatchedRLAgent(BaseAgent):
             if action < 0 or not action_masks[row, action]:
                 continue
             flowlet_id = int(batch.flowlet_ids[row])
+            updated_shortest = self._updated_shortest_gcd.pop(flowlet_id, float(shortest_gcd[row]))
             self._pending[flowlet_id] = PendingTransition(
                 flowlet_id=flowlet_id,
                 agent_id=int(batch.agent_ids[row]),
@@ -347,19 +314,22 @@ class BatchedRLAgent(BaseAgent):
                 action_mask=action_masks[row].copy(),
                 total_delay=float(total_delay[row]),
                 queue_cost=float(queue_cost[row]),
-                shortest_gcd=float(shortest_gcd[row]),
+                shortest_gcd=float(updated_shortest),
                 initial_gcd=float(initial_gcd[row]),
+                flowlet_size=float(batch.flowlet_size[row]),
+                ttl=float(batch.ttl[row]),
                 delay_norm=self.reward_config.delay_norm,
-                target_cost=self.reward_config.cost_limit / max(self.reward_config.cost_norm, 1e-6),
+                target_cost=self._target_cost(),
                 weight=max(float(packet_count[row]), 1.0),
             )
 
     def _compute_reward(
         self,
         pending: PendingTransition,
-        next_remaining_distance: float,
+        current_distance: float,
         total_delay: float,
         queue_cost: float,
+        ttl_remaining: float,
         terminal_status: int | None,
         truncated: bool,
     ):
@@ -367,16 +337,42 @@ class BatchedRLAgent(BaseAgent):
         delta_queue = max(0.0, float(queue_cost - pending.queue_cost))
         reward = compute_transition_reward(
             config=self.reward_config,
-            previous_remaining_distance=pending.shortest_gcd,
-            next_remaining_distance=next_remaining_distance,
+            previous_best_distance=pending.shortest_gcd,
+            current_distance=current_distance,
             initial_distance=pending.initial_gcd,
             delta_delay=delta_delay,
             delta_queue_cost=delta_queue,
+            flowlet_size=pending.flowlet_size,
+            ttl_remaining=ttl_remaining,
             terminal_status=terminal_status,
             truncated=truncated,
+            queue_delay_in_reward=self._queue_delay_in_reward(),
         )
         self._reward_stats.add(reward, terminal_status=terminal_status, truncated=truncated)
         return reward
+
+    def _queue_delay_in_reward(self) -> bool:
+        return False
+
+    def _uses_cost_constraint(self) -> bool:
+        return True
+
+    def _buffer_cost(self, cost: float) -> float | None:
+        return cost if self._uses_cost_constraint() else None
+
+    def _target_cost(self) -> float | None:
+        if not self._uses_cost_constraint():
+            return None
+        cost_limit = self.cost_limit / max(self.reward_config.delay_norm, 1e-6)
+        if self.discount_cost < 1.0:
+            max_episode_len = max(float(self.max_ttl), 1.0)
+            return (
+                cost_limit
+                / max_episode_len
+                * (1.0 - self.discount_cost**max_episode_len)
+                / (1.0 - self.discount_cost)
+            )
+        return cost_limit
 
     @staticmethod
     def _optional(values: np.ndarray | None, length: int) -> np.ndarray:

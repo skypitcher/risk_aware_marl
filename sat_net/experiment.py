@@ -67,12 +67,20 @@ class ExperimentLogger:
         )
 
 
-def episode_record(epoch: int, phase: str, result: Any) -> dict[str, Any]:
+def rollout_record(
+    sampling_step: int,
+    rollout: int,
+    phase: str,
+    result: Any,
+    simulated_time_ms: float | None = None,
+) -> dict[str, Any]:
     return {
-        "epoch": epoch,
+        "sampling_step": sampling_step,
+        "rollout": rollout,
         "phase": phase,
         "seed": result.seed,
         "train": result.train,
+        "simulated_time_ms": simulated_time_ms,
         "elapsed_seconds": result.elapsed_seconds,
         "metrics": result.metrics.to_dict(),
         "env": result.info,

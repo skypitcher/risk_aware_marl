@@ -48,8 +48,11 @@ class FlowletState:
     arrival_time: np.ndarray
     link_released: np.ndarray
     scheduled_prop_delay: np.ndarray
+    remaining_gcd: np.ndarray
     shortest_gcd: np.ndarray
     initial_gcd: np.ndarray
+    last_action1: np.ndarray
+    last_action2: np.ndarray
     last_node1: np.ndarray
     last_node2: np.ndarray
 
@@ -91,8 +94,11 @@ class FlowletState:
             arrival_time=empty_f64.copy(),
             link_released=np.empty(0, dtype=bool),
             scheduled_prop_delay=empty_f64.copy(),
+            remaining_gcd=empty_f64.copy(),
             shortest_gcd=empty_f64.copy(),
             initial_gcd=empty_f64.copy(),
+            last_action1=empty_i64.copy(),
+            last_action2=empty_i64.copy(),
             last_node1=empty_i64.copy(),
             last_node2=empty_i64.copy(),
         )
@@ -152,8 +158,11 @@ def create_flowlet_state(
         arrival_time=np.full(num_flowlets, np.inf, dtype=np.float64),
         link_released=np.ones(num_flowlets, dtype=bool),
         scheduled_prop_delay=np.zeros(num_flowlets, dtype=np.float64),
+        remaining_gcd=np.full(num_flowlets, np.inf, dtype=np.float64),
         shortest_gcd=np.full(num_flowlets, np.inf, dtype=np.float64),
         initial_gcd=np.ones(num_flowlets, dtype=np.float64),
+        last_action1=np.full(num_flowlets, -1, dtype=np.int64),
+        last_action2=np.full(num_flowlets, -1, dtype=np.int64),
         last_node1=np.full(num_flowlets, -1, dtype=np.int64),
         last_node2=np.full(num_flowlets, -1, dtype=np.int64),
     )
@@ -171,6 +180,7 @@ class LinkState:
     delay: np.ndarray
     id_by_pair: np.ndarray
     neighbor_link_ids: np.ndarray
+    direction_by_link_id: np.ndarray
     free_time: np.ndarray
     queue_load: np.ndarray
 
@@ -201,6 +211,11 @@ def create_link_state(
             source_cols[valid_neighbor],
             neighbor_sat_ids[valid_neighbor],
         ]
+    direction_by_link_id = np.full(num_links, -1, dtype=np.int64)
+    valid_link_direction = neighbor_link_ids >= 0
+    if valid_link_direction.any():
+        direction_cols = np.broadcast_to(np.arange(neighbor_sat_ids.shape[1], dtype=np.int64), neighbor_sat_ids.shape)
+        direction_by_link_id[neighbor_link_ids[valid_link_direction]] = direction_cols[valid_link_direction]
 
     return LinkState(
         source_ids=source_ids,
@@ -211,6 +226,7 @@ def create_link_state(
         delay=delay,
         id_by_pair=id_by_pair,
         neighbor_link_ids=neighbor_link_ids,
+        direction_by_link_id=direction_by_link_id,
         free_time=np.zeros(num_links, dtype=np.float64),
         queue_load=np.zeros(num_links, dtype=np.float64),
     )
@@ -546,7 +562,6 @@ def deliver_flowlet_ids(
     flowlets.propagation_delay[flowlet_ids] += final_prop_delay
     flowlets.transmission_delay[flowlet_ids] += final_tx_delay
     flowlets.delivery_time[flowlet_ids] = current_time + final_delay
-    flowlets.shortest_gcd[flowlet_ids] = 0.0
     flowlets.status[flowlet_ids] = FLOWLET_DELIVERED
 
 
@@ -575,6 +590,7 @@ def build_routing_batch(
     return RoutingBatch(
         flowlet_ids=flowlet_ids,
         current_sat_ids=current_sats,
+        source_region_ids=flowlets.source_region_id[flowlet_ids],
         target_region_ids=target_regions,
         target_access_sat_ids=target_access_sats,
         neighbor_sat_ids=neighbor_sat_ids,
@@ -586,6 +602,8 @@ def build_routing_batch(
         neighbor_link_free_time=np.where(valid_link, links.free_time[safe_link_ids], np.inf),
         flowlet_size=flowlets.size[flowlet_ids],
         packet_count=flowlets.packet_count[flowlet_ids],
+        is_normal=flowlets.is_normal[flowlet_ids],
+        creation_time=flowlets.creation_time[flowlet_ids],
         ttl=flowlets.ttl[flowlet_ids],
         current_time=current_time,
         region_next_hop_table=region_next_hop_table,
@@ -595,8 +613,13 @@ def build_routing_batch(
         transmission_delay=flowlets.transmission_delay[flowlet_ids],
         propagation_delay=flowlets.propagation_delay[flowlet_ids],
         total_queue_cost=flowlets.total_queue_cost[flowlet_ids],
+        remaining_gcd=flowlets.remaining_gcd[flowlet_ids],
         shortest_gcd=flowlets.shortest_gcd[flowlet_ids],
         initial_gcd=flowlets.initial_gcd[flowlet_ids],
+        last_action1=flowlets.last_action1[flowlet_ids],
+        last_action2=flowlets.last_action2[flowlet_ids],
+        last_node1=flowlets.last_node1[flowlet_ids],
+        last_node2=flowlets.last_node2[flowlet_ids],
     )
 
 
@@ -750,6 +773,8 @@ def schedule_flowlets_by_link(
     flowlets.link_released[accepted_ids] = False
     flowlets.status[accepted_ids] = FLOWLET_ON_LINK
 
+    flowlets.last_action2[accepted_ids] = flowlets.last_action1[accepted_ids]
+    flowlets.last_action1[accepted_ids] = links.direction_by_link_id[accepted_link_ids]
     flowlets.last_node2[accepted_ids] = flowlets.last_node1[accepted_ids]
     flowlets.last_node1[accepted_ids] = flowlets.current_sat[accepted_ids]
     return accepted_ids, rejected_ids

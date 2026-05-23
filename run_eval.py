@@ -12,7 +12,7 @@ import pandas as pd
 
 from sat_net.agent import BaseAgent, create_agent
 from sat_net.config import DEFAULT_MAIN_CONFIG, eval_agent_paths, load_config, load_env_config, merge_section
-from sat_net.pipeline import run_marl_episode
+from sat_net.pipeline import run_marl_rollout
 from sat_net.routing_env import RoutingEnv
 from sat_net.util import NamedDict
 
@@ -44,7 +44,7 @@ def evaluate_multi_seed(
             eval_seed = base_seed + seed_idx * 1000
             logging.info("Agent: %s  Seed %d/%d (seed=%d)", agent.name, seed_idx + 1, num_seeds, eval_seed)
             try:
-                result = run_marl_episode(env=env, agent=agent, seed=eval_seed, start_time=0, train=False)
+                result = run_marl_rollout(env=env, agent=agent, seed=eval_seed, start_time=0, train=False)
             except NotImplementedError as exc:
                 logging.warning("Skipping agent %s: %s", agent.name, exc)
                 break
