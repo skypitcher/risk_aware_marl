@@ -73,19 +73,26 @@ def rollout_record(
     phase: str,
     result: Any,
     simulated_time_ms: float | None = None,
+    cumulative: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
+    step_stats = getattr(result, "step_stats", {})
     return {
         "sampling_step": sampling_step,
         "rollout": rollout,
         "phase": phase,
         "seed": result.seed,
         "train": result.train,
-        "simulated_time_ms": simulated_time_ms,
+        "global_simulated_time_ms": simulated_time_ms,
+        "window_start_time_ms": step_stats.get("start_time_ms"),
+        "window_end_time_ms": step_stats.get("end_time_ms"),
+        "window_duration_ms": step_stats.get("duration_ms"),
         "elapsed_seconds": result.elapsed_seconds,
+        "sim_speed": step_stats.get("sim_speed"),
         "metrics": result.metrics.to_dict(),
         "env": result.info,
-        "steps": getattr(result, "step_stats", {}),
+        "steps": step_stats,
         "agent": getattr(result, "agent_stats", {}),
+        "cumulative": cumulative,
     }
 
 

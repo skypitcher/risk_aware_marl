@@ -60,6 +60,7 @@ def run_marl_rollout(
         start_time=start_time,
         options={"include_spf_table": agent.requires_shortest_path_table},
     )
+    window_start_time_ms = float(env.start_time)
 
     terminated = False
     truncated = False
@@ -88,19 +89,25 @@ def run_marl_rollout(
     if train:
         agent.on_train_signal(force=True)
 
+    elapsed_seconds = time.time() - wall_start
+    duration_seconds = max(float(env.current_time) - window_start_time_ms, 0.0) / 1000.0
     return RolloutResult(
         metrics=env.calc_metrics(),
         info=info,
         agent_stats=agent.get_train_stats(),
         step_stats={
             "steps": step_count,
+            "start_time_ms": window_start_time_ms,
+            "end_time_ms": float(env.current_time),
+            "duration_ms": duration_seconds * 1000.0,
+            "sim_speed": duration_seconds / max(elapsed_seconds, 1e-12),
             "decision_batches": decision_batches,
             "decisions": decision_count,
             "active_agents_mean": active_agent_sum / max(decision_batches, 1),
             "active_agents_max": max_active_agents,
             "max_steps_reached": max_steps_reached,
         },
-        elapsed_seconds=time.time() - wall_start,
+        elapsed_seconds=elapsed_seconds,
         seed=seed,
         train=train,
     )

@@ -18,6 +18,7 @@ from sat_net.pipeline import evaluate_agent, run_marl_rollout
 from sat_net.agent import BaseAgent, create_agent
 from sat_net.config import DEFAULT_MAIN_CONFIG, load_agent_config, load_config, load_env_config, merge_section
 from sat_net.experiment import ExperimentLogger, rollout_record
+from sat_net.stats import ContinuingMetricsAccumulator
 from sat_net.util import NamedDict, ms2str
 
 PROJECT_ROOT = str(os.path.dirname(os.path.abspath(__file__)))
@@ -133,6 +134,7 @@ def train(
     start_rollout: int,
     start_simulated_time_ms: float,
     start_best_score: float | None,
+    start_continuing_state: dict | None,
     log_dir: str,
     tf_writer,
     args: NamedDict,
@@ -151,6 +153,7 @@ def train(
     rollout = int(start_rollout)
     simulated_time_ms = float(start_simulated_time_ms)
     max_sampling_steps = int(args.max_sampling_steps)
+    continuing_metrics = ContinuingMetricsAccumulator.from_state(start_continuing_state)
     next_eval_step = _next_interval_step(sampling_step, int(args.eval_interval_steps))
     next_save_step = _next_interval_step(sampling_step, int(args.save_interval_steps))
     next_flowlet_dump_step = _next_interval_step(sampling_step, int(args.flowlet_dump_interval_steps))
@@ -179,10 +182,29 @@ def train(
         rollout_steps = int(train_result.step_stats.get("steps", 0))
         sampling_step += rollout_steps
         simulated_time_ms = float(env.current_time)
+        window_duration_ms = float(train_result.step_stats.get("duration_ms", 0.0))
+        continuing_metrics.add(train_result.metrics, window_duration_ms)
+        cumulative_record = continuing_metrics.to_record()
+        cumulative_metrics = continuing_metrics.to_metrics()
         logging.info("Training rollout finished in %.2fs", train_result.elapsed_seconds)
 
         metrics = train_result.metrics
-        logging.info("Tick: %s | %s", ms2str(env.start_time), metrics.get_summary())
+        logging.info(
+            "Window: %s->%s duration=%s sim_speed=%.2fx | %s",
+            ms2str(train_result.step_stats.get("start_time_ms", env.start_time)),
+            ms2str(train_result.step_stats.get("end_time_ms", simulated_time_ms)),
+            ms2str(window_duration_ms),
+            float(train_result.step_stats.get("sim_speed", 0.0)),
+            metrics.get_summary(),
+        )
+        logging.info(
+            "Continuing total: windows=%d simulated=%s sampling_step=%d/%d | %s",
+            continuing_metrics.windows,
+            ms2str(continuing_metrics.elapsed_ms),
+            sampling_step,
+            max_sampling_steps,
+            cumulative_metrics.get_summary(),
+        )
         logging.info("Training metrics: %s", metrics.to_json())
         agent_stats = agent.get_stats()
         if agent_stats is not None:
@@ -195,6 +217,7 @@ def train(
             phase="train",
             result=train_result,
             simulated_time_ms=simulated_time_ms,
+            cumulative=cumulative_record,
         )
         experiment.append_jsonl("metrics/train_rollouts.jsonl", train_record)
         experiment.append_csv("metrics/train_rollouts.csv", train_record)
@@ -213,6 +236,12 @@ def train(
         tf_writer.add_scalar("train/drop_rate", metrics.drop_rate, global_step=sampling_step)
         tf_writer.add_scalar("train/e2e_delay_mean", metrics.e2e_delay_mean, global_step=sampling_step)
         tf_writer.add_scalar("train/cost_mean", metrics.cost_mean, global_step=sampling_step)
+        tf_writer.add_scalar("train/sim_speed", train_result.step_stats.get("sim_speed", 0.0), global_step=sampling_step)
+        tf_writer.add_scalar("train_cumulative/throughput", cumulative_metrics.throughput, global_step=sampling_step)
+        tf_writer.add_scalar("train_cumulative/delivery_rate", cumulative_metrics.delivery_rate, global_step=sampling_step)
+        tf_writer.add_scalar("train_cumulative/drop_rate", cumulative_metrics.drop_rate, global_step=sampling_step)
+        tf_writer.add_scalar("train_cumulative/e2e_delay_mean", cumulative_metrics.e2e_delay_mean, global_step=sampling_step)
+        tf_writer.add_scalar("train_cumulative/cost_mean", cumulative_metrics.cost_mean, global_step=sampling_step)
 
         flowlet_df = env.get_flowlet_dataframe()
         delivered_flowlets = flowlet_df[flowlet_df["delivered"]] if not flowlet_df.empty else flowlet_df
@@ -262,6 +291,9 @@ def train(
                 "last_model": str(Path(last_model_save_path).relative_to(log_dir)),
                 "selection_metric": selection_metric,
                 "best_score": best_score,
+                "horizon": "continuing_rollout_windows",
+                "continuing_metrics_state": continuing_metrics.state_dict(),
+                "continuing_metrics": cumulative_record,
             },
         )
 
@@ -310,9 +342,11 @@ def train(
                 "max_sampling_steps": max_sampling_steps,
                 "rollout": rollout,
                 "simulated_time_ms": simulated_time_ms,
+                "horizon": "continuing_rollout_windows",
                 "best_score": best_score,
                 "selection_metric": selection_metric,
                 "last_train_metrics": metrics.to_dict(),
+                "cumulative_train": cumulative_record,
                 "last_train_agent_stats": train_result.agent_stats,
             },
         )
@@ -475,6 +509,7 @@ def main():
         start_rollout = int(checkpoint.get("rollout", 0))
         start_simulated_time_ms = float(checkpoint.get("simulated_time_ms", args.start_time_ms))
         start_best_score = checkpoint.get("best_score", None)
+        start_continuing_state = checkpoint.get("continuing_metrics_state", None)
         logging.info(
             "Continuing from sampling_step=%d rollout=%d simulated_time=%s",
             start_sampling_step,
@@ -532,6 +567,7 @@ def main():
         start_rollout = 0
         start_simulated_time_ms = float(args.start_time_ms)
         start_best_score = None
+        start_continuing_state = None
 
     train(
         env=env,
@@ -540,6 +576,7 @@ def main():
         start_rollout=start_rollout,
         start_simulated_time_ms=start_simulated_time_ms,
         start_best_score=start_best_score,
+        start_continuing_state=start_continuing_state,
         log_dir=log_dir,
         tf_writer=tf_writer,
         args=args,
