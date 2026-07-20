@@ -108,8 +108,7 @@ risk_aware_marl/
 ├── configs/                    # Configuration files
 │   ├── main.json               # Active experiment entry point
 │   ├── env/                    # Scenario and traffic configurations
-│   ├── agents/                 # SPF, MaDQN, and PRIMAL configs
-│   └── traffic/                # Fallback hand-written traffic regions
+│   └── agents/                 # SPF, MaDQN, and PRIMAL configs
 ├── assets/population/          # Downsampled WorldPop population grid
 ├── figs/                       # Figures and plots
 └── runs_*/                     # Experiment results
@@ -129,10 +128,10 @@ python run_eval.py
 
 ### RL Training Status
 
-`run_train.py` samples continuing rollout windows through `sat_net/pipeline.py` until `max_sampling_steps` is reached. `configs/main.json` selects the scenario, while `configs/agents/*.json` selects the algorithm. Use `configs/agents/madqn.json`, `configs/agents/primal_avg.json`, or `configs/agents/primal_cvar.json` to train the rebuilt MaDQN/PRIMAL baselines.
+`run_train.py` resets the continuing routing environment once and advances it until `max_sampling_steps` env interaction steps are reached. Traffic is generated online with `traffic.lookahead_seconds` and `traffic.generation_chunk_seconds`; flowlet state grows in fixed `traffic.flowlet_storage_chunk_size` chunks. Logs and metrics use env interaction `step` as the RL sample-efficiency axis. `configs/main.json` selects the scenario, while `configs/agents/*.json` selects the algorithm. Use `configs/agents/madqn.json`, `configs/agents/primal_avg.json`, or `configs/agents/primal_cvar.json` to train the rebuilt MaDQN/PRIMAL baselines.
 
 ```bash
-python run_train.py --config configs/main.json --agent configs/agents/madqn.json --max_sampling_steps 600000
+python run_train.py --config configs/main.json --agent configs/agents/madqn.json --max_sampling_steps 1000000 --eval_duration_seconds 60
 ```
 
 Each run writes `manifest.json`, `summary.json`, checkpoint state, and CSV/JSONL rollout metrics under `runs_train/<run_id>/`.

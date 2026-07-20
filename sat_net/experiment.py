@@ -11,7 +11,6 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-
 class ExperimentLogger:
     """Small file-based experiment manager for training and evaluation runs."""
 
@@ -76,7 +75,16 @@ def rollout_record(
     cumulative: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     step_stats = getattr(result, "step_stats", {})
+    window_steps = int(step_stats.get("env_interaction_steps", step_stats.get("steps", 0)) or 0)
+    elapsed_seconds = float(getattr(result, "elapsed_seconds", 0.0) or 0.0)
+    window_duration_ms = float(step_stats.get("duration_ms", 0.0) or 0.0)
+    aggregate_duration_ms = float(step_stats.get("aggregate_duration_ms", window_duration_ms) or 0.0)
+    decisions = int(step_stats.get("decisions", 0) or 0)
+    metrics = result.metrics
+    packet_step_denominator = max(window_steps, 1)
     return {
+        "step": sampling_step,
+        "env_interaction_steps": sampling_step,
         "sampling_step": sampling_step,
         "rollout": rollout,
         "phase": phase,
@@ -85,16 +93,28 @@ def rollout_record(
         "global_simulated_time_ms": simulated_time_ms,
         "window_start_time_ms": step_stats.get("start_time_ms"),
         "window_end_time_ms": step_stats.get("end_time_ms"),
-        "window_duration_ms": step_stats.get("duration_ms"),
-        "elapsed_seconds": result.elapsed_seconds,
+        "window_duration_ms": window_duration_ms,
+        "window_duration_seconds": window_duration_ms / 1000.0,
+        "elapsed_seconds": elapsed_seconds,
         "sim_speed": step_stats.get("sim_speed"),
-        "metrics": result.metrics.to_dict(),
+        "sample_efficiency": {
+            "env_steps": window_steps,
+            "vector_steps": step_stats.get("vector_steps"),
+            "num_envs": step_stats.get("num_envs", 1),
+            "env_steps_per_wall_second": window_steps / max(elapsed_seconds, 1e-12),
+            "decisions": decisions,
+            "decisions_per_env_step": decisions / max(window_steps, 1),
+            "generated_packets_per_env_step": metrics.generated / packet_step_denominator,
+            "delivered_packets_per_env_step": metrics.delivered / packet_step_denominator,
+            "dropped_packets_per_env_step": metrics.dropped / packet_step_denominator,
+            "simulated_seconds_per_env_step": (aggregate_duration_ms / 1000.0) / max(window_steps, 1),
+        },
+        "metrics": metrics.to_dict(),
         "env": result.info,
         "steps": step_stats,
         "agent": getattr(result, "agent_stats", {}),
         "cumulative": cumulative,
     }
-
 
 def flatten_scalars(payload: dict[str, Any], prefix: str = "") -> dict[str, Any]:
     row: dict[str, Any] = {}

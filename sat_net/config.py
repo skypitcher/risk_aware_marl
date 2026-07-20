@@ -35,19 +35,19 @@ def merge_section(defaults: dict[str, Any], main_config: NamedDict, section: str
     return NamedDict(deep_merge(data, clean_overrides))
 
 
-def env_config_path(main_config: NamedDict, split: str) -> str:
+def env_config_path(main_config: NamedDict) -> str:
     env = main_config.get("env", None)
     if isinstance(env, NamedDict):
-        path = env.get(split, None) or env.get("default", None)
+        path = env.get("path", None) or env.get("default", None)
     else:
         path = env
     if path is None:
-        raise ValueError(f"Main config does not define env.{split}")
+        raise ValueError("Main config must define env as a single config path")
     return str(path)
 
 
-def load_env_config(main_config: NamedDict, split: str, override_path: str | None = None) -> NamedDict:
-    return load_config(override_path or env_config_path(main_config, split))
+def load_env_config(main_config: NamedDict, override_path: str | None = None) -> NamedDict:
+    return load_config(override_path or env_config_path(main_config))
 
 
 def load_agent_config(main_config: NamedDict, override_path: str | None = None, default_path: str = DEFAULT_AGENT_CONFIG) -> NamedDict:

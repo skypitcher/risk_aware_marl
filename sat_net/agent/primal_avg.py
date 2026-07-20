@@ -36,7 +36,7 @@ class PrimalAvgAgent:
         self.discount_cost = float(config.get("discount_cost", 0.97))
         self.batch_size = int(config.get("batch_size", 2048))
         self.train_start_size = int(config.get("train_start_size", 10000))
-        self.utd = max(int(config.get("utd", 1)), 1)
+        self.utd = max(float(config.get("utd", 1.0)), 0.0)
         self.policy_delay = max(int(config.get("policy_delay", 2)), 1)
         self.cost_multiplier_update_freq = int(config.get("cost_multiplier_update_freq", 2))
         self.update_lambda_after_step = int(config.get("update_lambda_after_step", 300000))
@@ -126,12 +126,15 @@ class PrimalAvgAgent:
     def add_transition(self, **kwargs) -> None:
         self.replay_buffer.add(**kwargs)
 
-    def learn(self) -> None:
+    def learn(self, updates: int = 1) -> int:
         if len(self.replay_buffer) < max(self.batch_size, self.train_start_size):
-            return
-        for _ in range(self.utd):
+            return 0
+        completed = 0
+        for _ in range(max(int(updates), 0)):
             self.training_steps += 1
             self._train_step()
+            completed += 1
+        return completed
 
     def _train_step(self) -> None:
         batch = self.replay_buffer.sample(self.batch_size)
@@ -278,8 +281,8 @@ class PrimalAvg(BatchedRLAgent):
     def add_transition(self, **kwargs) -> None:
         self.global_agent.add_transition(**kwargs)
 
-    def learn(self) -> None:
-        self.global_agent.learn()
+    def learn(self, updates: int = 1) -> int:
+        return self.global_agent.learn(updates=updates)
 
     def get_stats(self) -> str:
         return f"{self.global_agent.get_stats()} device={self.device}"

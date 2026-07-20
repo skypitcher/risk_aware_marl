@@ -1,7 +1,5 @@
 {
-    "time_limit_seconds": 60,
     "traffic": {
-        "region_file": "configs/traffic/world_regions.json",
         "population_map_path": "assets/population/worldpop_total_population_2020_1440x720.npy",
         "grid_lat_bins": 36,
         "grid_lon_bins": 72,
@@ -9,8 +7,20 @@
         "population_channel": "value",
         "population_max_value": 1000000.0,
         "population_area_scale": false,
+        "od_source_population_power": 1.0,
+        "od_target_population_power": 1.0,
+        "od_distance_decay": 0.9,
+        "od_distance_offset_km": 500.0,
+        "od_min_distance_km": 50.0,
+        "od_diurnal_peak_hour": 20.0,
+        "od_diurnal_floor": 0.25,
+        "od_source_diurnal_amplitude": 0.55,
+        "od_target_diurnal_amplitude": 0.2,
         "packet_rate_per_ms": 200,
         "slot_ms": 10,
+        "lookahead_seconds": 1.0,
+        "generation_chunk_seconds": 1.0,
+        "flowlet_storage_chunk_size": 65536,
         "mean_packets_per_flowlet": 256,
         "access_data_rate": 1.0
     },

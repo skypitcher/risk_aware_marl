@@ -38,6 +38,8 @@ class SPFAgent(BaseAgent):
         return "backend=numpy"
 
     def act(self, batch: RoutingBatch) -> RoutingDecision:
+        if batch.region_next_hop_tables is not None:
+            return RoutingDecision(next_hop_sat_ids=self._act_vector_batch(batch))
         if batch.region_next_hop_table is None:
             raise ValueError("SPF requires region_next_hop_table in RoutingBatch.")
 
@@ -49,3 +51,22 @@ class SPFAgent(BaseAgent):
                 region_next_hop_table=batch.region_next_hop_table,
             )
         )
+
+    def _act_vector_batch(self, batch: RoutingBatch) -> np.ndarray:
+        actions = np.full(batch.decision_count, -1, dtype=np.int64)
+        env_ids = batch.row_env_ids
+        for env_id in np.unique(env_ids):
+            env_id = int(env_id)
+            if env_id < 0 or env_id >= len(batch.region_next_hop_tables):
+                raise ValueError(f"SPF received out-of-range env_id={env_id}.")
+            table = batch.region_next_hop_tables[env_id]
+            if table is None:
+                raise ValueError(f"SPF requires region_next_hop_table for env_id={env_id}.")
+            rows = np.flatnonzero(env_ids == env_id)
+            actions[rows] = spf_next_hops(
+                current_sat_ids=batch.current_sat_ids[rows],
+                target_region_ids=batch.target_region_ids[rows],
+                target_access_sat_ids=batch.target_access_sat_ids[rows],
+                region_next_hop_table=table,
+            )
+        return actions

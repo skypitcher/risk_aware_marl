@@ -1,4 +1,0 @@
-{
-    "extends": "starlink_world_base.json",
-    "time_limit_seconds": 30
-}

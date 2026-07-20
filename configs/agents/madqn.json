@@ -1,11 +1,11 @@
 {
     "name": "MaDQN",
-    "hidden_dim": 256,
+    "hidden_dim": 512,
     "num_hidden_layers": 2,
     "weight_init": "orthogonal",
     "learning_rate": 0.0001,
     "batch_size": 2048,
-    "buffer_size": 300000,
+    "buffer_size": 10000000,
     "gamma": 0.99,
     "epsilon_start": 0.99,
     "epsilon_end": 0.01,
@@ -20,7 +20,7 @@
     "clip_grad_norm": 0.5,
     "use_layer_norm": true,
     "device": "auto",
-    "inference_device": "cpu",
+    "inference_device": "mps",
     "inference_sync_interval": 64,
     "delay_norm": 100.0,
     "cost_limit": 10.0

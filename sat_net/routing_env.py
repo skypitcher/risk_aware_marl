@@ -18,6 +18,7 @@ from sat_net.sim_kernel import (
     FlowletState,
     LinkState,
     activate_flowlets_at_slot_ids,
+    append_flowlet_state,
     build_routing_batch,
     create_flowlet_state,
     create_link_state,
@@ -64,6 +65,11 @@ class RoutingEnv:
         self.packet_rate_per_ms: float = self.traffic_config.get("packet_rate_per_ms", 1.0)
         self.slot_ms: float = self.traffic_config.get("slot_ms", 5.0)
         self.mean_packets_per_flowlet: float = self.traffic_config.get("mean_packets_per_flowlet", 16.0)
+        self.flowlet_storage_chunk_size: int = int(self.traffic_config.get("flowlet_storage_chunk_size", 65_536))
+        if self.flowlet_storage_chunk_size <= 0:
+            raise ValueError(
+                f"traffic.flowlet_storage_chunk_size must be positive, got {self.flowlet_storage_chunk_size}"
+            )
         self.eager_spf_region_threshold: int = self.traffic_config.get(
             "eager_spf_region_threshold",
             64,
@@ -79,7 +85,7 @@ class RoutingEnv:
         self.start_time = 0.0  # the start timestamp of the simulation. randomize this to init the topology
         self.current_time = 0.0  #  # the current time offset, in milliseconds
         self.topology_update_steps = 0
-        self.time_limit = float(self.config.time_limit_seconds * 1000.0)
+        self.time_limit = np.inf
 
         self.action_dim = ACTION_COUNT  # N, E, S, W - fixed for satellite routing
         self.obs_dim = 94
@@ -87,6 +93,27 @@ class RoutingEnv:
         self.verbose = self.config.verbose
         self.update_interval_ms = self.config.update_interval_ms
         self.progress_interval_seconds = float(self.config.get("progress_interval_seconds", 60.0))
+        self.traffic_lookahead_seconds = float(self.traffic_config.get("lookahead_seconds", 1.0))
+        if self.traffic_lookahead_seconds <= 0:
+            raise ValueError(
+                f"traffic.lookahead_seconds must be positive, got {self.traffic_lookahead_seconds}"
+            )
+        self._traffic_prefetch_slots = max(
+            int(np.ceil(self.traffic_lookahead_seconds * 1000.0 / max(self.slot_ms, 1e-9))),
+            1,
+        )
+        self.traffic_generation_chunk_seconds = float(
+            self.traffic_config.get("generation_chunk_seconds", self.traffic_lookahead_seconds)
+        )
+        if self.traffic_generation_chunk_seconds <= 0:
+            raise ValueError(
+                "traffic.generation_chunk_seconds must be positive, "
+                f"got {self.traffic_generation_chunk_seconds}"
+            )
+        self._traffic_generation_chunk_slots = max(
+            int(np.ceil(self.traffic_generation_chunk_seconds * 1000.0 / max(self.slot_ms, 1e-9))),
+            1,
+        )
 
         self.next_flowlet_id = 0
         self._region_positions = np.array(
@@ -134,6 +161,24 @@ class RoutingEnv:
         self._on_link_id_chunks: list[np.ndarray] = []
         self._creation_event_slots = np.empty(0, dtype=np.int64)
         self._creation_event_cursor = 0
+        self._traffic_generated_until_step = 0
+        self._traffic_schedule_end_step: int | None = None
+
+    def set_duration_seconds(self, seconds: float) -> None:
+        if seconds <= 0:
+            raise ValueError(f"duration_seconds must be positive, got {seconds}")
+        self.time_limit = float(seconds) * 1000.0
+
+    def clear_duration_limit(self) -> None:
+        self.time_limit = np.inf
+
+    def _has_duration_limit(self) -> bool:
+        return bool(np.isfinite(self.time_limit))
+
+    def _duration_to_num_steps(self) -> int:
+        if not self._has_duration_limit():
+            return 0
+        return int(np.ceil(self.time_limit / self.slot_ms))
 
     def _create_network(self):
         """Create the network based on the configuration."""
@@ -198,6 +243,8 @@ class RoutingEnv:
         self._on_link_id_chunks = []
         self._creation_event_slots = np.empty(0, dtype=np.int64)
         self._creation_event_cursor = 0
+        self._traffic_generated_until_step = 0
+        self._traffic_schedule_end_step = None
         self._episode_started = False
         self._episode_done = False
 
@@ -209,17 +256,20 @@ class RoutingEnv:
         self.network.update_topology(self.start_time, None)
         self._refresh_satellite_index_cache()
         self._update_region_access_cache()
-        self._start_episode(include_spf_table=include_spf_table)
+        self._start_episode(
+            include_spf_table=include_spf_table,
+            traffic_until_time_ms=options.get("traffic_until_time_ms", None),
+        )
         return self._pending_routing_batch, self._build_step_info()
 
-    def _start_episode(self, include_spf_table: bool = False):
+    def _start_episode(self, include_spf_table: bool = False, traffic_until_time_ms: float | None = None):
         self._include_spf_table = bool(include_spf_table)
         self._build_link_array_cache()
-        self._generate_flowlet_state()
+        self._flowlets = FlowletState.empty(storage_chunk_size=self.flowlet_storage_chunk_size)
 
-        self._num_steps = int(np.ceil(self.time_limit / self.slot_ms))
+        self._num_steps = self._duration_to_num_steps()
         self._step_index = 0
-        self._end_time = self.start_time + self.time_limit
+        self._end_time = self.start_time + self.time_limit if self._has_duration_limit() else np.inf
         self._next_topology_time = self.start_time + self.update_interval_ms
         self._wall_start_time = time.perf_counter()
         self._progress_interval_ms = max(self.progress_interval_seconds * 1000.0, 0.0)
@@ -229,12 +279,39 @@ class RoutingEnv:
 
         if self.verbose:
             print("Env is in slot-array evaluation mode", flush=True)
-            print(
-                f"Generated {self._flowlets.count:,} flowlets over {self._num_steps:,} slots "
-                f"({self.time_limit / 1000.0:.1f}s simulated)",
-                flush=True,
-            )
+            if self._has_duration_limit():
+                print(
+                    f"Continuing traffic buffer over {self._num_steps:,} slots "
+                    f"({self.time_limit / 1000.0:.3f}s simulated)",
+                    flush=True,
+                )
+            else:
+                print(
+                    "Continuing traffic buffer with no environment horizon "
+                    f"(traffic lookahead={self.traffic_lookahead_seconds:.3f}s, "
+                    f"generation_chunk={self.traffic_generation_chunk_seconds:.3f}s, "
+                    f"storage_chunk={self.flowlet_storage_chunk_size:,})",
+                    flush=True,
+                )
+        if traffic_until_time_ms is not None:
+            self.prefill_traffic_until(float(traffic_until_time_ms), freeze_schedule=True)
+            if self.verbose:
+                print(
+                    f"Prefilled traffic schedule until {ms2str(float(traffic_until_time_ms) - self.start_time)} "
+                    f"({self._traffic_generated_until_step:,} slots, {self._flowlets.count:,} flowlets, "
+                    f"capacity={self._flowlets.capacity:,}, storage_chunks={self._flowlets.storage_chunks:,})",
+                    flush=True,
+                )
         self._pending_routing_batch = self._prepare_step_observation()
+
+    def prefill_traffic_until(self, until_time_ms: float, freeze_schedule: bool = False) -> None:
+        """Generate the demand schedule up to an absolute simulation timestamp."""
+        if self._flowlets is None:
+            raise RuntimeError("Flowlet state has not been initialized.")
+        target_step = self._slot_index_for_time(until_time_ms)
+        if freeze_schedule:
+            self._traffic_schedule_end_step = target_step
+        self._ensure_traffic_until_step(target_step)
 
     def step(self, action=None):
         """
@@ -267,7 +344,7 @@ class RoutingEnv:
             self._apply_routing_actions(batch, act)
 
         self._step_index += 1
-        if self._step_index >= self._num_steps:
+        if self._has_duration_limit() and self._step_index >= self._num_steps:
             self.current_time = self._end_time
             self._episode_done = True
             self._pending_routing_batch = self._empty_routing_batch()
@@ -326,17 +403,43 @@ class RoutingEnv:
         self._links.connected = self.network._link_connected_array
         self._links.delay = self.network._link_delay_array
 
-    def _generate_flowlet_state(self):
-        num_slots = int(np.ceil(self.time_limit / self.slot_ms))
+    def _ensure_traffic_until_step(self, exclusive_step: int) -> None:
+        if self._flowlets is None:
+            return
+        if self._has_duration_limit():
+            exclusive_step = min(int(exclusive_step), self._num_steps)
+        else:
+            exclusive_step = int(exclusive_step)
+        if self._traffic_schedule_end_step is not None:
+            exclusive_step = min(exclusive_step, self._traffic_schedule_end_step)
+        if exclusive_step <= self._traffic_generated_until_step:
+            return
+
+        while self._traffic_generated_until_step < exclusive_step:
+            chunk_slots = min(
+                self._traffic_generation_chunk_slots,
+                exclusive_step - self._traffic_generated_until_step,
+            )
+            self._append_traffic_chunk(chunk_slots)
+
+    def _append_traffic_chunk(self, num_slots: int) -> None:
+        if self._flowlets is None or num_slots <= 0:
+            return
+
+        chunk_start_step = self._traffic_generated_until_step
+        chunk_start_time = self.start_time + chunk_start_step * self.slot_ms
         expected_flowlets_per_slot = (
             self.packet_rate_per_ms * self.slot_ms / max(self.mean_packets_per_flowlet, 1.0)
         )
         slot_counts = self.np_random.poisson(lam=expected_flowlets_per_slot, size=num_slots)
         num_flowlets = int(slot_counts.sum())
-        self.next_flowlet_id = num_flowlets
 
-        source_region_ids = self.traffic_model.sample_source_ids(self.np_random, num_flowlets).astype(np.int64)
-        target_region_ids = self.traffic_model.sample_target_ids(self.np_random, source_region_ids).astype(np.int64)
+        od_sample_time = chunk_start_time + 0.5 * num_slots * self.slot_ms
+        source_region_ids, target_region_ids = self.traffic_model.sample_od_pairs(
+            self.np_random,
+            num_flowlets,
+            time_ms=od_sample_time,
+        )
         is_normal = self.np_random.uniform(size=num_flowlets) < self.prob_normal_packet
         packet_size = np.where(is_normal, self.normal_packet_size, self.small_packet_size).astype(np.float64)
         packet_count = np.maximum(
@@ -344,7 +447,7 @@ class RoutingEnv:
             self.np_random.poisson(lam=self.mean_packets_per_flowlet, size=num_flowlets),
         ).astype(np.int64)
 
-        self._flowlets = create_flowlet_state(
+        new_flowlets = create_flowlet_state(
             slot_counts=slot_counts,
             source_region_ids=source_region_ids,
             target_region_ids=target_region_ids,
@@ -352,11 +455,17 @@ class RoutingEnv:
             packet_size=packet_size,
             packet_count=packet_count,
             default_ttl=self.default_ttl,
-            start_time=self.start_time,
+            start_time=chunk_start_time,
             slot_ms=self.slot_ms,
         )
-        self._creation_event_slots = np.flatnonzero(slot_counts > 0).astype(np.int64, copy=False)
-        self._creation_event_cursor = 0
+        new_flowlets.creation_slot[:] += chunk_start_step
+        append_flowlet_state(self._flowlets, new_flowlets)
+
+        creation_slots = np.flatnonzero(slot_counts > 0).astype(np.int64, copy=False) + chunk_start_step
+        if len(creation_slots) > 0:
+            self._creation_event_slots = np.concatenate((self._creation_event_slots, creation_slots))
+        self._traffic_generated_until_step += int(num_slots)
+        self.next_flowlet_id = self._flowlets.count
 
     def _release_transmitted_flowlets(self):
         if self._flowlets is None or self._links is None:
@@ -397,6 +506,7 @@ class RoutingEnv:
             return np.empty(0, dtype=np.int64)
 
         slot_idx = int(round((self.current_time - self.start_time) / self.slot_ms))
+        self._ensure_traffic_until_step(slot_idx + self._traffic_prefetch_slots)
         return activate_flowlets_at_slot_ids(
             flowlets=self._flowlets,
             slot_idx=slot_idx,
@@ -411,9 +521,12 @@ class RoutingEnv:
     def _prepare_step_observation(self) -> RoutingBatch:
         if self._flowlets is None or self._links is None:
             return self._empty_routing_batch()
-        while self._step_index < self._num_steps:
+        while (not self._has_duration_limit()) or self._step_index < self._num_steps:
             self.current_time = self.start_time + self._step_index * self.slot_ms
-            if self.current_time >= self._end_time:
+            if self._traffic_schedule_end_step is not None and self._step_index >= self._traffic_schedule_end_step:
+                self.current_time = self.start_time + self._traffic_schedule_end_step * self.slot_ms
+                return self._empty_routing_batch()
+            if self._has_duration_limit() and self.current_time >= self._end_time:
                 self._episode_done = True
                 return self._empty_routing_batch()
 
@@ -446,8 +559,9 @@ class RoutingEnv:
                 next_step = self._step_index + 1
             self._step_index = next_step
 
-        self.current_time = self._end_time
-        self._episode_done = True
+        if self._has_duration_limit():
+            self.current_time = self._end_time
+            self._episode_done = True
         return self._empty_routing_batch()
 
     def _maybe_print_progress(self):
@@ -462,9 +576,21 @@ class RoutingEnv:
             self._next_progress_time += self._progress_interval_ms
 
     def _next_activity_step(self, lower_bound: int) -> int:
-        if lower_bound >= self._num_steps:
+        if self._has_duration_limit() and lower_bound >= self._num_steps:
             return self._num_steps
-        candidates = [self._num_steps]
+        if self._traffic_schedule_end_step is not None and lower_bound >= self._traffic_schedule_end_step:
+            return self._traffic_schedule_end_step
+        if self._has_duration_limit():
+            candidates = [self._num_steps]
+            traffic_target_step = min(self._num_steps, lower_bound + self._traffic_prefetch_slots)
+        else:
+            candidates = []
+            traffic_target_step = lower_bound + self._traffic_prefetch_slots
+        if self._traffic_schedule_end_step is not None:
+            candidates.append(self._traffic_schedule_end_step)
+            traffic_target_step = min(traffic_target_step, self._traffic_schedule_end_step)
+
+        self._ensure_traffic_until_step(traffic_target_step)
 
         creation_step = self._peek_creation_step(lower_bound)
         if creation_step is not None:
@@ -478,12 +604,16 @@ class RoutingEnv:
         if release_step is not None:
             candidates.append(release_step)
 
-        if self._next_topology_time < self._end_time:
+        if (not self._has_duration_limit()) or self._next_topology_time < self._end_time:
             candidates.append(self._slot_index_for_time(self._next_topology_time))
 
-        if self.verbose and self._progress_interval_ms > 0 and self._next_progress_time < self._end_time:
+        if self.verbose and self._progress_interval_ms > 0 and (
+            (not self._has_duration_limit()) or self._next_progress_time < self._end_time
+        ):
             candidates.append(self._slot_index_for_time(self._next_progress_time))
 
+        if not candidates:
+            return lower_bound
         return max(lower_bound, min(candidates))
 
     def _build_step_routing_batch(self, at_node_ids: np.ndarray) -> RoutingBatch:
@@ -658,11 +788,29 @@ class RoutingEnv:
         batch = self._pending_routing_batch
         decision_count = 0 if batch is None else batch.decision_count
         active_agent_count = 0 if batch is None else len(batch.active_agent_ids)
+        traffic_generated_until_ms = self.start_time + self._traffic_generated_until_step * self.slot_ms
+        traffic_lookahead_ms = max(float(traffic_generated_until_ms - self.current_time), 0.0)
+        traffic_schedule_end_ms = (
+            None
+            if self._traffic_schedule_end_step is None
+            else self.start_time + self._traffic_schedule_end_step * self.slot_ms
+        )
+        flowlet_rows = 0 if self._flowlets is None else self._flowlets.count
+        flowlet_capacity = 0 if self._flowlets is None else self._flowlets.capacity
+        flowlet_storage_chunks = 0 if self._flowlets is None else self._flowlets.storage_chunks
         return {
             "time_ms": self.current_time,
             "step": self._step_index,
-            "num_steps": self._num_steps,
-            "progress": self._step_index / max(self._num_steps, 1),
+            "num_steps": self._num_steps if self._has_duration_limit() else None,
+            "progress": self._step_index / max(self._num_steps, 1) if self._has_duration_limit() else None,
+            "traffic_schedule_end_ms": traffic_schedule_end_ms,
+            "traffic_generated_until_ms": traffic_generated_until_ms,
+            "traffic_lookahead_ms": traffic_lookahead_ms,
+            "traffic_generated_slots": self._traffic_generated_until_step,
+            "traffic_generation_chunk_slots": self._traffic_generation_chunk_slots,
+            "flowlet_rows": flowlet_rows,
+            "flowlet_capacity": flowlet_capacity,
+            "flowlet_storage_chunks": flowlet_storage_chunks,
             "decision_count": decision_count,
             "active_agent_count": active_agent_count,
             "route_count": decision_count,
@@ -939,11 +1087,15 @@ class RoutingEnv:
 
     def _event_slots_for_time(self, timestamps: np.ndarray) -> np.ndarray:
         slots = np.ceil((timestamps - self.start_time) / self.slot_ms - 1e-9).astype(np.int64)
-        return np.clip(slots, 0, self._num_steps)
+        if self._has_duration_limit():
+            return np.clip(slots, 0, self._num_steps)
+        return np.maximum(slots, 0)
 
     def _slot_index_for_time(self, timestamp: float) -> int:
         slot = int(np.ceil((timestamp - self.start_time) / self.slot_ms - 1e-9))
-        return min(max(slot, 0), self._num_steps)
+        if self._has_duration_limit():
+            return min(max(slot, 0), self._num_steps)
+        return max(slot, 0)
 
     def _add_event_ids(
         self,
@@ -954,7 +1106,9 @@ class RoutingEnv:
     ) -> None:
         if len(flowlet_ids) == 0:
             return
-        valid = (event_slots >= self._step_index) & (event_slots < self._num_steps)
+        valid = event_slots >= self._step_index
+        if self._has_duration_limit():
+            valid &= event_slots < self._num_steps
         if not valid.any():
             return
         slots = event_slots[valid]
@@ -1113,6 +1267,7 @@ class RoutingEnv:
         generated_mask = flowlets.status != FLOWLET_NOT_STARTED
         delivered_mask = flowlets.status == FLOWLET_DELIVERED
         dropped_mask = flowlets.status == FLOWLET_DROPPED
+        pending_mask = generated_mask & ~(delivered_mask | dropped_mask)
         normal_mask = flowlets.is_normal
         small_mask = ~normal_mask
         weights = flowlets.packet_count
@@ -1129,12 +1284,15 @@ class RoutingEnv:
         generated = weighted_sum(generated_mask)
         delivered = weighted_sum(delivered_mask)
         dropped = weighted_sum(dropped_mask)
+        pending = weighted_sum(pending_mask)
         delivered_normal = weighted_sum(delivered_mask & normal_mask)
         delivered_small = weighted_sum(delivered_mask & small_mask)
         generated_normal = weighted_sum(generated_mask & normal_mask)
         generated_small = weighted_sum(generated_mask & small_mask)
         dropped_normal = weighted_sum(dropped_mask & normal_mask)
         dropped_small = weighted_sum(dropped_mask & small_mask)
+        pending_normal = weighted_sum(pending_mask & normal_mask)
+        pending_small = weighted_sum(pending_mask & small_mask)
         ttl_dropped = weighted_sum(dropped_mask & (flowlets.drop_reason == int(NetworkError.TTL_EXPIRED)))
 
         total_delay = weighted_sum(delivered_mask, delivered_delay)
@@ -1168,14 +1326,20 @@ class RoutingEnv:
             dropped_by_ttl=ttl_dropped,
             dropped_normal_packet=dropped_normal,
             dropped_small_packet=dropped_small,
+            pending=pending,
+            pending_normal_packet=pending_normal,
+            pending_small_packet=pending_small,
             throughput=throughput,
             service_rate=delivered / elapsed_seconds,
             delivery_rate=delivered / generated if generated else 0.0,
             drop_rate=dropped / generated if generated else 0.0,
+            pending_rate=pending / generated if generated else 0.0,
             normal_packet_delivery_rate=delivered_normal / generated_normal if generated_normal else 0.0,
             normal_packet_drop_rate=dropped_normal / generated_normal if generated_normal else 0.0,
+            normal_packet_pending_rate=pending_normal / generated_normal if generated_normal else 0.0,
             small_packet_delivery_rate=delivered_small / generated_small if generated_small else 0.0,
             small_packet_drop_rate=dropped_small / generated_small if generated_small else 0.0,
+            small_packet_pending_rate=pending_small / generated_small if generated_small else 0.0,
             e2e_delay_mean=total_delay / delivered if delivered else 0.0,
             queue_delay_mean=queue_delay / delivered if delivered else 0.0,
             transmission_delay_mean=transmission_delay / delivered if delivered else 0.0,
@@ -1219,20 +1383,32 @@ class RoutingEnv:
         active = at_node + on_link
 
         sim_elapsed_ms = min(max(self.current_time - self.start_time, 0.0), self.time_limit)
-        progress = sim_elapsed_ms / max(self.time_limit, 1e-12)
+        progress = sim_elapsed_ms / max(self.time_limit, 1e-12) if self._has_duration_limit() else None
         wall_elapsed = time.perf_counter() - wall_start_time
-        eta = wall_elapsed * (1.0 - progress) / progress if progress > 1e-9 else None
+        eta = (
+            wall_elapsed * (1.0 - progress) / progress
+            if progress is not None and progress > 1e-9
+            else None
+        )
         eta_text = f"{eta:.1f}s" if eta is not None else "n/a"
         rss_mb = self._get_max_rss_mb()
         rss_text = f" max_rss={rss_mb:.0f}MB" if rss_mb is not None else ""
+        traffic_generated_until_ms = self.start_time + self._traffic_generated_until_step * self.slot_ms
+        traffic_lookahead_s = max(float(traffic_generated_until_ms - self.current_time), 0.0) / 1000.0
+
+        if self._has_duration_limit():
+            prefix = f"progress {progress * 100.0:6.2f}% step={min(step, num_steps):,}/{num_steps:,} "
+        else:
+            prefix = f"sim={sim_elapsed_ms / 1000.0:.3f}s step={step:,} "
 
         self._print(
-            f"progress {progress * 100.0:6.2f}% "
-            f"step={min(step, num_steps):,}/{num_steps:,} "
+            f"{prefix}"
             f"wall={wall_elapsed:.1f}s eta={eta_text} "
-            f"flowlets={generated:,}/{flowlets.count:,} "
+            f"flowlets={generated:,}/{flowlets.count:,}/{flowlets.capacity:,} "
             f"active={active:,}(node={at_node:,},link={on_link:,}) "
             f"ok={delivered:,} drop={dropped:,} "
+            f"traffic_ahead={traffic_lookahead_s:.3f}s "
+            f"storage_chunks={flowlets.storage_chunks:,} "
             f"topo={self.topology_update_steps}{rss_text}"
         )
 

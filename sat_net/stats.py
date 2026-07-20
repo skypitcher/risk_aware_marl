@@ -19,16 +19,22 @@ class Metrics:
     dropped_by_ttl: int = 0
     dropped_normal_packet: int = 0
     dropped_small_packet: int = 0
+    pending: int = 0
+    pending_normal_packet: int = 0
+    pending_small_packet: int = 0
 
     # Rates.
     throughput: float = 0.0
     service_rate: float = 0.0
     delivery_rate: float = 0.0
     drop_rate: float = 0.0
+    pending_rate: float = 0.0
     normal_packet_delivery_rate: float = 0.0
     normal_packet_drop_rate: float = 0.0
+    normal_packet_pending_rate: float = 0.0
     small_packet_delivery_rate: float = 0.0
     small_packet_drop_rate: float = 0.0
+    small_packet_pending_rate: float = 0.0
 
     # Mean delays.
     e2e_delay_mean: float = 0.0
@@ -77,6 +83,7 @@ class Metrics:
         return (
             f"TOT: {self.generated:<4} | "
             f"OK: {self.delivered:<4}({self.delivery_rate * 100:5.4f}%) | "
+            f"PEND: {self.pending:<4}({self.pending_rate * 100:5.4f}%) | "
             f"DROP: {self.dropped:<4}({self.drop_rate * 100:5.4f}%) TTL={self.dropped_by_ttl:<4}| "
             f"TH: {self.throughput:6.2f} | "
             f"SR: {self.service_rate:6.2f} | "
@@ -105,6 +112,9 @@ class ContinuingMetricsAccumulator:
     dropped_by_ttl: int = 0
     dropped_normal_packet: int = 0
     dropped_small_packet: int = 0
+    pending: int = 0
+    pending_normal_packet: int = 0
+    pending_small_packet: int = 0
     delivered_mbit: float = 0.0
     e2e_delay_sum: float = 0.0
     queue_delay_sum: float = 0.0
@@ -136,6 +146,9 @@ class ContinuingMetricsAccumulator:
         self.dropped_by_ttl += int(metrics.dropped_by_ttl)
         self.dropped_normal_packet += int(metrics.dropped_normal_packet)
         self.dropped_small_packet += int(metrics.dropped_small_packet)
+        self.pending += int(metrics.pending)
+        self.pending_normal_packet += int(metrics.pending_normal_packet)
+        self.pending_small_packet += int(metrics.pending_small_packet)
         self.delivered_mbit += float(metrics.throughput) * duration_seconds
 
         self.e2e_delay_sum += float(metrics.e2e_delay_mean) * metrics.delivered
@@ -171,21 +184,31 @@ class ContinuingMetricsAccumulator:
             dropped_by_ttl=self.dropped_by_ttl,
             dropped_normal_packet=self.dropped_normal_packet,
             dropped_small_packet=self.dropped_small_packet,
+            pending=self.pending,
+            pending_normal_packet=self.pending_normal_packet,
+            pending_small_packet=self.pending_small_packet,
             throughput=self.delivered_mbit / elapsed_seconds,
             service_rate=self.delivered / elapsed_seconds,
             delivery_rate=self.delivered / self.generated if self.generated else 0.0,
             drop_rate=self.dropped / self.generated if self.generated else 0.0,
+            pending_rate=self.pending / self.generated if self.generated else 0.0,
             normal_packet_delivery_rate=(
                 self.delivered_normal_packet / self.generated_normal_packet if self.generated_normal_packet else 0.0
             ),
             normal_packet_drop_rate=(
                 self.dropped_normal_packet / self.generated_normal_packet if self.generated_normal_packet else 0.0
             ),
+            normal_packet_pending_rate=(
+                self.pending_normal_packet / self.generated_normal_packet if self.generated_normal_packet else 0.0
+            ),
             small_packet_delivery_rate=(
                 self.delivered_small_packet / self.generated_small_packet if self.generated_small_packet else 0.0
             ),
             small_packet_drop_rate=(
                 self.dropped_small_packet / self.generated_small_packet if self.generated_small_packet else 0.0
+            ),
+            small_packet_pending_rate=(
+                self.pending_small_packet / self.generated_small_packet if self.generated_small_packet else 0.0
             ),
             e2e_delay_mean=self.e2e_delay_sum / self.delivered if self.delivered else 0.0,
             queue_delay_mean=self.queue_delay_sum / self.delivered if self.delivered else 0.0,

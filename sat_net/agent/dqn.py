@@ -31,7 +31,7 @@ class DQNAgent:
         self.epsilon_step_count = 0
         self.batch_size = int(config.get("batch_size", 2048))
         self.train_start_size = int(config.get("train_start_size", 1000))
-        self.utd = max(int(config.get("utd", 1)), 1)
+        self.utd = max(float(config.get("utd", 1.0)), 0.0)
         self.update_method = str(config.get("update_method", "soft"))
         self.soft_update_tau = float(config.get("soft_update_tau", 0.05))
         self.target_update_interval = max(int(config.get("target_update_interval", 1)), 1)
@@ -106,11 +106,14 @@ class DQNAgent:
     def add_transition(self, **kwargs) -> None:
         self.replay_buffer.add(**kwargs)
 
-    def learn(self) -> None:
+    def learn(self, updates: int = 1) -> int:
         if len(self.replay_buffer) < max(self.batch_size, self.train_start_size):
-            return
-        for _ in range(self.utd):
+            return 0
+        completed = 0
+        for _ in range(max(int(updates), 0)):
             self._train_step()
+            completed += 1
+        return completed
 
     def _train_step(self) -> None:
         batch = self.replay_buffer.sample(self.batch_size)
@@ -218,8 +221,8 @@ class MaDQN(BatchedRLAgent):
     def _uses_cost_constraint(self) -> bool:
         return False
 
-    def learn(self) -> None:
-        self.global_agent.learn()
+    def learn(self, updates: int = 1) -> int:
+        return self.global_agent.learn(updates=updates)
 
     def get_stats(self) -> str:
         return (

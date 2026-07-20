@@ -49,6 +49,7 @@ def _mps_available() -> bool:
 
 @dataclass(slots=True)
 class PendingTransition:
+    env_id: int
     flowlet_id: int
     agent_id: int
     state: np.ndarray
@@ -82,12 +83,19 @@ class BatchedRLAgent(BaseAgent):
         self.max_ttl = float(config.get("max_ttl", 64.0))
         self.discount_cost = float(config.get("discount_cost", 1.0))
         self.train_freq = max(int(config.get("train_freq", 1)), 1)
+        self.utd = max(float(config.get("utd", 1.0)), 0.0)
+        self.max_updates_per_train_signal = max(int(config.get("max_updates_per_train_signal", 1024)), 1)
         self._train_signal_count = 0
+        self._transitions_since_update_credit = 0
+        self._transitions_added_total = 0
+        self._update_credit = 0.0
+        self._optimizer_update_steps_at_rollout_start = 0
         self.reward_config = RewardConfig.from_config(config)
         self.delay_norm = self.reward_config.delay_norm
         self.cost_limit = self.reward_config.cost_limit
-        self._pending: dict[int, PendingTransition] = {}
-        self._updated_shortest_gcd: dict[int, float] = {}
+        self._pending: dict[tuple[int, int], PendingTransition] = {}
+        self._pending_by_env: dict[int, set[int]] = {}
+        self._updated_shortest_gcd: dict[tuple[int, int], float] = {}
         self._reward_stats = RewardStats()
 
     def set_eval(self):
@@ -133,47 +141,87 @@ class BatchedRLAgent(BaseAgent):
     ) -> None:
         raise NotImplementedError
 
-    def learn(self) -> None:
-        pass
+    def learn(self, updates: int = 1) -> int:
+        return 0
 
-    def on_train_signal(self, force: bool = False) -> None:
+    def on_train_signal(self, force: bool = False, steps: int = 1) -> None:
         if not self.is_train():
             return
-        self._train_signal_count += 1
-        if force or self._train_signal_count % self.train_freq == 0:
-            self.learn()
+        previous_count = self._train_signal_count
+        if not force:
+            self._train_signal_count += max(int(steps), 1)
+            if self._train_signal_count // self.train_freq == previous_count // self.train_freq:
+                return
+        self._schedule_update_credit()
+        self._run_update_budget()
+
+    def _schedule_update_credit(self) -> None:
+        if self._transitions_since_update_credit <= 0:
+            return
+        batch_size = max(self._batch_size(), 1)
+        self._update_credit += float(self._transitions_since_update_credit) * self.utd / float(batch_size)
+        self._transitions_since_update_credit = 0
+
+    def _run_update_budget(self) -> None:
+        update_budget = int(self._update_credit)
+        if update_budget <= 0:
+            return
+        requested_updates = min(update_budget, self.max_updates_per_train_signal)
+        completed_updates = int(self.learn(updates=requested_updates) or 0)
+        if completed_updates <= 0:
+            return
+        self._update_credit = max(self._update_credit - float(completed_updates), 0.0)
+
+    def _record_transition_added(self, count: int = 1) -> None:
+        count = max(int(count), 0)
+        self._transitions_since_update_credit += count
+        self._transitions_added_total += count
+
+    def _batch_size(self) -> int:
+        return int(getattr(getattr(self, "global_agent", None), "batch_size", self.config.get("batch_size", 1)))
+
+    def _training_steps(self) -> int:
+        return int(getattr(getattr(self, "global_agent", None), "training_steps", 0))
 
     def on_rollout_start(self) -> None:
         self._pending.clear()
+        self._pending_by_env.clear()
         self._updated_shortest_gcd.clear()
         self._reward_stats = RewardStats()
         self._train_signal_count = 0
+        self._transitions_since_update_credit = 0
+        self._transitions_added_total = 0
+        self._update_credit = 0.0
+        self._optimizer_update_steps_at_rollout_start = self._training_steps()
 
     def on_rollout_end(self, flowlets, current_time: float) -> None:
         if not self.is_train():
             self._pending.clear()
+            self._pending_by_env.clear()
             return
         self.observe_flowlet_outcomes(flowlets, current_time)
         if not self._pending:
             return
-        pending_ids = list(self._pending.keys())
-        for flowlet_id in pending_ids:
-            if flowlet_id >= flowlets.count:
-                self._pending.pop(flowlet_id, None)
+        pending_keys = list(self._pending.keys())
+        for key in pending_keys:
+            env_id, flowlet_id = key
+            env_flowlets = self._flowlets_for_env(flowlets, env_id)
+            if env_flowlets is None or flowlet_id >= env_flowlets.count:
+                self._pop_pending(key)
                 continue
-            pending = self._pending.pop(flowlet_id, None)
+            pending = self._pop_pending(key)
             if pending is None:
                 continue
             transition_reward = self._compute_reward(
                 pending=pending,
-                current_distance=float(flowlets.remaining_gcd[flowlet_id]),
+                current_distance=float(env_flowlets.remaining_gcd[flowlet_id]),
                 total_delay=float(
-                    flowlets.queue_delay[flowlet_id]
-                    + flowlets.transmission_delay[flowlet_id]
-                    + flowlets.propagation_delay[flowlet_id]
+                    env_flowlets.queue_delay[flowlet_id]
+                    + env_flowlets.transmission_delay[flowlet_id]
+                    + env_flowlets.propagation_delay[flowlet_id]
                 ),
-                queue_cost=float(flowlets.total_queue_cost[flowlet_id]),
-                ttl_remaining=float(flowlets.ttl[flowlet_id]),
+                queue_cost=float(env_flowlets.total_queue_cost[flowlet_id]),
+                ttl_remaining=float(env_flowlets.ttl[flowlet_id]),
                 terminal_status=None,
                 truncated=True,
             )
@@ -193,6 +241,7 @@ class BatchedRLAgent(BaseAgent):
                 agent_id=pending.agent_id,
                 next_agent_id=-1,
             )
+            self._record_transition_added()
 
     def build_states(self, batch: RoutingBatch) -> np.ndarray:
         n = len(batch.flowlet_ids)
@@ -209,7 +258,21 @@ class BatchedRLAgent(BaseAgent):
             return
         if not self._pending:
             return
-        pending_ids = np.fromiter(self._pending.keys(), dtype=np.int64)
+        if hasattr(flowlets, "env_flowlets"):
+            for env_id, env_flowlets in enumerate(flowlets.env_flowlets):
+                self._observe_single_env_flowlet_outcomes(env_id=env_id, flowlets=env_flowlets)
+            return
+        self._observe_single_env_flowlet_outcomes(env_id=0, flowlets=flowlets)
+
+    def _observe_single_env_flowlet_outcomes(self, env_id: int, flowlets) -> None:
+        env_pending = self._pending_by_env.get(int(env_id))
+        if not env_pending:
+            return
+        pending_ids = np.fromiter(
+            env_pending,
+            dtype=np.int64,
+            count=len(env_pending),
+        )
         pending_ids = pending_ids[pending_ids < flowlets.count]
         if len(pending_ids) == 0:
             return
@@ -217,7 +280,8 @@ class BatchedRLAgent(BaseAgent):
             flowlets.status[pending_ids] == FLOWLET_DROPPED
         )
         for flowlet_id in pending_ids[terminal_mask]:
-            pending = self._pending.pop(int(flowlet_id), None)
+            key = (int(env_id), int(flowlet_id))
+            pending = self._pop_pending(key)
             if pending is None:
                 continue
             terminal_status = int(flowlets.status[flowlet_id])
@@ -250,13 +314,16 @@ class BatchedRLAgent(BaseAgent):
                 agent_id=pending.agent_id,
                 next_agent_id=-1,
             )
+            self._record_transition_added()
 
     def _finalize_revisited(self, batch: RoutingBatch, states: np.ndarray, action_masks: np.ndarray) -> None:
         total_delay = self._total_delay(batch)
         queue_cost = self._optional(batch.total_queue_cost, len(batch.flowlet_ids))
         remaining_gcd = self._optional(batch.remaining_gcd, len(batch.flowlet_ids))
+        env_ids = batch.row_env_ids
         for row, flowlet_id in enumerate(batch.flowlet_ids):
-            pending = self._pending.pop(int(flowlet_id), None)
+            key = (int(env_ids[row]), int(flowlet_id))
+            pending = self._pop_pending(key)
             if pending is None:
                 continue
             transition_reward = self._compute_reward(
@@ -268,7 +335,7 @@ class BatchedRLAgent(BaseAgent):
                 terminal_status=None,
                 truncated=False,
             )
-            self._updated_shortest_gcd[int(flowlet_id)] = min(
+            self._updated_shortest_gcd[key] = min(
                 pending.shortest_gcd,
                 float(remaining_gcd[row]),
             )
@@ -288,6 +355,7 @@ class BatchedRLAgent(BaseAgent):
                 agent_id=pending.agent_id,
                 next_agent_id=int(batch.current_sat_ids[row]),
             )
+            self._record_transition_added()
 
     def _remember_pending(
         self,
@@ -301,27 +369,49 @@ class BatchedRLAgent(BaseAgent):
         shortest_gcd = self._optional(batch.shortest_gcd, len(batch.flowlet_ids))
         initial_gcd = np.maximum(self._optional(batch.initial_gcd, len(batch.flowlet_ids)), 1e-6)
         packet_count = self._optional(batch.packet_count, len(batch.flowlet_ids))
+        env_ids = batch.row_env_ids
         for row, action in enumerate(actions):
             if action < 0 or not action_masks[row, action]:
                 continue
+            env_id = int(env_ids[row])
             flowlet_id = int(batch.flowlet_ids[row])
-            updated_shortest = self._updated_shortest_gcd.pop(flowlet_id, float(shortest_gcd[row]))
-            self._pending[flowlet_id] = PendingTransition(
-                flowlet_id=flowlet_id,
-                agent_id=int(batch.agent_ids[row]),
-                state=states[row].copy(),
-                action=int(action),
-                action_mask=action_masks[row].copy(),
-                total_delay=float(total_delay[row]),
-                queue_cost=float(queue_cost[row]),
-                shortest_gcd=float(updated_shortest),
-                initial_gcd=float(initial_gcd[row]),
-                flowlet_size=float(batch.flowlet_size[row]),
-                ttl=float(batch.ttl[row]),
-                delay_norm=self.reward_config.delay_norm,
-                target_cost=self._target_cost(),
-                weight=max(float(packet_count[row]), 1.0),
+            key = (env_id, flowlet_id)
+            updated_shortest = self._updated_shortest_gcd.pop(key, float(shortest_gcd[row]))
+            self._set_pending(
+                key,
+                PendingTransition(
+                    env_id=env_id,
+                    flowlet_id=flowlet_id,
+                    agent_id=int(batch.agent_ids[row]),
+                    state=states[row].copy(),
+                    action=int(action),
+                    action_mask=action_masks[row].copy(),
+                    total_delay=float(total_delay[row]),
+                    queue_cost=float(queue_cost[row]),
+                    shortest_gcd=float(updated_shortest),
+                    initial_gcd=float(initial_gcd[row]),
+                    flowlet_size=float(batch.flowlet_size[row]),
+                    ttl=float(batch.ttl[row]),
+                    delay_norm=self.reward_config.delay_norm,
+                    target_cost=self._target_cost(),
+                    weight=max(float(packet_count[row]), 1.0),
+                ),
             )
+
+    def _set_pending(self, key: tuple[int, int], pending: PendingTransition) -> None:
+        env_id, flowlet_id = int(key[0]), int(key[1])
+        self._pending[(env_id, flowlet_id)] = pending
+        self._pending_by_env.setdefault(env_id, set()).add(flowlet_id)
+
+    def _pop_pending(self, key: tuple[int, int]) -> PendingTransition | None:
+        env_id, flowlet_id = int(key[0]), int(key[1])
+        pending = self._pending.pop((env_id, flowlet_id), None)
+        env_pending = self._pending_by_env.get(env_id)
+        if env_pending is not None:
+            env_pending.discard(flowlet_id)
+            if not env_pending:
+                self._pending_by_env.pop(env_id, None)
+        return pending
 
     def _compute_reward(
         self,
@@ -387,6 +477,14 @@ class BatchedRLAgent(BaseAgent):
             + self._optional(batch.propagation_delay, len(batch.flowlet_ids))
         )
 
+    @staticmethod
+    def _flowlets_for_env(flowlets, env_id: int):
+        if hasattr(flowlets, "env_flowlets"):
+            if env_id < 0 or env_id >= len(flowlets.env_flowlets):
+                return None
+            return flowlets.env_flowlets[env_id]
+        return flowlets if env_id == 0 else None
+
     def _valid_random_actions(self, action_masks: np.ndarray) -> np.ndarray:
         actions = np.full(len(action_masks), -1, dtype=np.int64)
         for row, mask in enumerate(action_masks):
@@ -400,6 +498,24 @@ class BatchedRLAgent(BaseAgent):
         stats["pending_transitions"] = len(self._pending)
         stats["train_freq"] = self.train_freq
         stats["train_signals"] = self._train_signal_count
+        stats["utd"] = self.utd
+        stats["utd_definition"] = "replay_samples_per_transition"
+        optimizer_update_steps = self._training_steps()
+        optimizer_update_steps_since_rollout_start = max(
+            optimizer_update_steps - self._optimizer_update_steps_at_rollout_start,
+            0,
+        )
+        stats["optimizer_update_steps"] = optimizer_update_steps
+        stats["optimizer_update_steps_since_rollout_start"] = optimizer_update_steps_since_rollout_start
+        stats["max_updates_per_train_signal"] = self.max_updates_per_train_signal
+        stats["update_credit"] = self._update_credit
+        stats["transitions_added_total"] = self._transitions_added_total
+        stats["transitions_since_update_credit"] = self._transitions_since_update_credit
+        stats["effective_utd"] = (
+            optimizer_update_steps_since_rollout_start * self._batch_size() / self._transitions_added_total
+            if self._transitions_added_total
+            else 0.0
+        )
         stats["reward_config"] = self.reward_config.to_dict()
         replay_buffer = getattr(getattr(self, "global_agent", None), "replay_buffer", None)
         if replay_buffer is not None and hasattr(replay_buffer, "metadata_summary"):

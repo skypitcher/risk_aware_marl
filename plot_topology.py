@@ -145,7 +145,7 @@ def main():
     parser = argparse.ArgumentParser(description="Simple satellite network topology visualization (ISL_N only)")
     parser.add_argument(
         "--config",
-        default="configs/env/starlink_world_eval.json",
+        default="configs/env/starlink_world.json",
         help="Configuration file path",
     )
     parser.add_argument("--timestamp", type=int, default=0, help="Timestamp in milliseconds")

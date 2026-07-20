@@ -37,6 +37,8 @@ class RoutingBatch:
     current_time: float
     region_next_hop_table: np.ndarray | None = None
     region_next_hop_version: int = 0
+    region_next_hop_tables: tuple[np.ndarray | None, ...] | None = None
+    region_next_hop_versions: np.ndarray | None = None
     observations: np.ndarray | None = None
     hops: np.ndarray | None = None
     queue_delay: np.ndarray | None = None
@@ -50,11 +52,25 @@ class RoutingBatch:
     last_action2: np.ndarray | None = None
     last_node1: np.ndarray | None = None
     last_node2: np.ndarray | None = None
+    env_ids: np.ndarray | None = None
+    current_times: np.ndarray | None = None
 
     @property
     def agent_ids(self) -> np.ndarray:
         """Satellite-agent id for each row in this decision batch."""
         return self.current_sat_ids
+
+    @property
+    def row_env_ids(self) -> np.ndarray:
+        if self.env_ids is None:
+            return np.zeros(len(self.flowlet_ids), dtype=np.int64)
+        return self.env_ids
+
+    @property
+    def row_current_times(self) -> np.ndarray:
+        if self.current_times is None:
+            return np.full(len(self.flowlet_ids), float(self.current_time), dtype=np.float64)
+        return self.current_times
 
     @property
     def decision_count(self) -> int:
@@ -64,6 +80,9 @@ class RoutingBatch:
     def active_agent_ids(self) -> np.ndarray:
         if len(self.current_sat_ids) == 0:
             return np.empty(0, dtype=np.int64)
+        if self.env_ids is not None:
+            env_agent_pairs = np.column_stack((self.env_ids, self.current_sat_ids))
+            return np.unique(env_agent_pairs, axis=0)
         return np.unique(self.current_sat_ids)
 
 
@@ -103,7 +122,7 @@ class BaseAgent(ABC):
     def is_eval(self) -> bool:
         return getattr(self, "_is_eval", True)
 
-    def on_train_signal(self, force: bool = False):
+    def on_train_signal(self, force: bool = False, steps: int = 1):
         pass
 
     def observe_flowlet_outcomes(self, flowlets, current_time: float):

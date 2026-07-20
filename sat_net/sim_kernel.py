@@ -15,93 +15,341 @@ FLOWLET_DELIVERED = 3
 FLOWLET_DROPPED = 4
 
 
+FLOWLET_ARRAY_FIELDS = (
+    "status",
+    "creation_slot",
+    "creation_time",
+    "source_region_id",
+    "target_region_id",
+    "source_id",
+    "current_sat",
+    "next_sat",
+    "link_id",
+    "packet_count",
+    "packet_size",
+    "is_normal",
+    "size",
+    "ttl",
+    "hops",
+    "queue_delay",
+    "transmission_delay",
+    "propagation_delay",
+    "total_queue_cost",
+    "first_access_delay",
+    "final_access_delay",
+    "delivery_time",
+    "drop_time",
+    "drop_reason",
+    "transmit_end_time",
+    "arrival_time",
+    "link_released",
+    "scheduled_prop_delay",
+    "remaining_gcd",
+    "shortest_gcd",
+    "initial_gcd",
+    "last_action1",
+    "last_action2",
+    "last_node1",
+    "last_node2",
+)
+
+
+FLOWLET_ARRAY_DTYPES = {
+    "status": np.dtype(np.int8),
+    "creation_slot": np.dtype(np.int64),
+    "creation_time": np.dtype(np.float64),
+    "source_region_id": np.dtype(np.int64),
+    "target_region_id": np.dtype(np.int64),
+    "source_id": np.dtype(np.int64),
+    "current_sat": np.dtype(np.int64),
+    "next_sat": np.dtype(np.int64),
+    "link_id": np.dtype(np.int32),
+    "packet_count": np.dtype(np.int64),
+    "packet_size": np.dtype(np.float64),
+    "is_normal": np.dtype(bool),
+    "size": np.dtype(np.float64),
+    "ttl": np.dtype(np.int16),
+    "hops": np.dtype(np.int16),
+    "queue_delay": np.dtype(np.float64),
+    "transmission_delay": np.dtype(np.float64),
+    "propagation_delay": np.dtype(np.float64),
+    "total_queue_cost": np.dtype(np.float64),
+    "first_access_delay": np.dtype(np.float64),
+    "final_access_delay": np.dtype(np.float64),
+    "delivery_time": np.dtype(np.float64),
+    "drop_time": np.dtype(np.float64),
+    "drop_reason": np.dtype(np.int16),
+    "transmit_end_time": np.dtype(np.float64),
+    "arrival_time": np.dtype(np.float64),
+    "link_released": np.dtype(bool),
+    "scheduled_prop_delay": np.dtype(np.float64),
+    "remaining_gcd": np.dtype(np.float64),
+    "shortest_gcd": np.dtype(np.float64),
+    "initial_gcd": np.dtype(np.float64),
+    "last_action1": np.dtype(np.int64),
+    "last_action2": np.dtype(np.int64),
+    "last_node1": np.dtype(np.int64),
+    "last_node2": np.dtype(np.int64),
+}
+
+
+class FlowletField:
+    """Array-like view over one segmented flowlet field."""
+
+    __array_priority__ = 1000
+
+    def __init__(self, parent: "FlowletState", name: str):
+        self.parent = parent
+        self.name = name
+
+    @property
+    def dtype(self) -> np.dtype:
+        return FLOWLET_ARRAY_DTYPES[self.name]
+
+    @property
+    def shape(self) -> tuple[int]:
+        return (self.parent.count,)
+
+    def __len__(self) -> int:
+        return self.parent.count
+
+    def __array__(self, dtype=None, copy=None) -> np.ndarray:
+        array = self.parent.field_array(self.name)
+        if dtype is not None:
+            return array.astype(dtype, copy=False)
+        if copy:
+            return array.copy()
+        return array
+
+    def __getitem__(self, key):
+        return self.parent.take_field(self.name, key)
+
+    def __setitem__(self, key, value) -> None:
+        self.parent.put_field(self.name, key, value)
+
+    def copy(self) -> np.ndarray:
+        return self.parent.field_array(self.name).copy()
+
+    def astype(self, dtype, copy: bool = True) -> np.ndarray:
+        return self.parent.field_array(self.name).astype(dtype, copy=copy)
+
+    def sum(self, *args, **kwargs):
+        return self.parent.field_array(self.name).sum(*args, **kwargs)
+
+    def any(self, *args, **kwargs):
+        return self.parent.field_array(self.name).any(*args, **kwargs)
+
+    def all(self, *args, **kwargs):
+        return self.parent.field_array(self.name).all(*args, **kwargs)
+
+    def _coerce(self, other):
+        if isinstance(other, FlowletField):
+            return np.asarray(other)
+        return other
+
+    def _binary(self, other, op):
+        return op(np.asarray(self), self._coerce(other))
+
+    def _rbinary(self, other, op):
+        return op(self._coerce(other), np.asarray(self))
+
+    def __eq__(self, other):
+        return self._binary(other, np.equal)
+
+    def __ne__(self, other):
+        return self._binary(other, np.not_equal)
+
+    def __lt__(self, other):
+        return self._binary(other, np.less)
+
+    def __le__(self, other):
+        return self._binary(other, np.less_equal)
+
+    def __gt__(self, other):
+        return self._binary(other, np.greater)
+
+    def __ge__(self, other):
+        return self._binary(other, np.greater_equal)
+
+    def __add__(self, other):
+        return self._binary(other, np.add)
+
+    def __radd__(self, other):
+        return self._rbinary(other, np.add)
+
+    def __sub__(self, other):
+        return self._binary(other, np.subtract)
+
+    def __rsub__(self, other):
+        return self._rbinary(other, np.subtract)
+
+    def __mul__(self, other):
+        return self._binary(other, np.multiply)
+
+    def __rmul__(self, other):
+        return self._rbinary(other, np.multiply)
+
+    def __truediv__(self, other):
+        return self._binary(other, np.divide)
+
+    def __rtruediv__(self, other):
+        return self._rbinary(other, np.divide)
+
+    def __and__(self, other):
+        return self._binary(other, np.bitwise_and)
+
+    def __rand__(self, other):
+        return self._rbinary(other, np.bitwise_and)
+
+    def __or__(self, other):
+        return self._binary(other, np.bitwise_or)
+
+    def __ror__(self, other):
+        return self._rbinary(other, np.bitwise_or)
+
+    def __invert__(self):
+        return np.bitwise_not(np.asarray(self))
+
+    def __neg__(self):
+        return np.negative(np.asarray(self))
+
+
 @dataclass(slots=True)
 class FlowletState:
-    """Array state for all generated flowlets."""
+    """Segmented array state for generated flowlets."""
 
     slot_offsets: np.ndarray
-    status: np.ndarray
-    creation_slot: np.ndarray
-    creation_time: np.ndarray
-    source_region_id: np.ndarray
-    target_region_id: np.ndarray
-    source_id: np.ndarray
-    current_sat: np.ndarray
-    next_sat: np.ndarray
-    link_id: np.ndarray
-    packet_count: np.ndarray
-    packet_size: np.ndarray
-    is_normal: np.ndarray
-    size: np.ndarray
-    ttl: np.ndarray
-    hops: np.ndarray
-    queue_delay: np.ndarray
-    transmission_delay: np.ndarray
-    propagation_delay: np.ndarray
-    total_queue_cost: np.ndarray
-    first_access_delay: np.ndarray
-    final_access_delay: np.ndarray
-    delivery_time: np.ndarray
-    drop_time: np.ndarray
-    drop_reason: np.ndarray
-    transmit_end_time: np.ndarray
-    arrival_time: np.ndarray
-    link_released: np.ndarray
-    scheduled_prop_delay: np.ndarray
-    remaining_gcd: np.ndarray
-    shortest_gcd: np.ndarray
-    initial_gcd: np.ndarray
-    last_action1: np.ndarray
-    last_action2: np.ndarray
-    last_node1: np.ndarray
-    last_node2: np.ndarray
+    storage_chunk_size: int
+    _count: int
+    _chunks: dict[str, list[np.ndarray]]
 
     @property
     def count(self) -> int:
-        return len(self.status)
+        return int(self._count)
+
+    @property
+    def capacity(self) -> int:
+        return int(self.storage_chunks * self.storage_chunk_size)
+
+    @property
+    def storage_chunks(self) -> int:
+        return len(self._chunks["status"])
+
+    def __getattr__(self, name: str):
+        if name in FLOWLET_ARRAY_FIELDS:
+            return FlowletField(self, name)
+        raise AttributeError(name)
 
     @classmethod
-    def empty(cls, slot_offsets: np.ndarray | None = None) -> "FlowletState":
-        empty_i64 = np.empty(0, dtype=np.int64)
-        empty_f64 = np.empty(0, dtype=np.float64)
+    def empty(
+        cls,
+        slot_offsets: np.ndarray | None = None,
+        storage_chunk_size: int = 65_536,
+    ) -> "FlowletState":
+        storage_chunk_size = max(int(storage_chunk_size), 1)
         return cls(
             slot_offsets=np.zeros(1, dtype=np.int64) if slot_offsets is None else slot_offsets,
-            status=np.empty(0, dtype=np.int8),
-            creation_slot=empty_i64.copy(),
-            creation_time=empty_f64.copy(),
-            source_region_id=empty_i64.copy(),
-            target_region_id=empty_i64.copy(),
-            source_id=empty_i64.copy(),
-            current_sat=empty_i64.copy(),
-            next_sat=empty_i64.copy(),
-            link_id=np.empty(0, dtype=np.int32),
-            packet_count=empty_i64.copy(),
-            packet_size=empty_f64.copy(),
-            is_normal=np.empty(0, dtype=bool),
-            size=empty_f64.copy(),
-            ttl=np.empty(0, dtype=np.int16),
-            hops=np.empty(0, dtype=np.int16),
-            queue_delay=empty_f64.copy(),
-            transmission_delay=empty_f64.copy(),
-            propagation_delay=empty_f64.copy(),
-            total_queue_cost=empty_f64.copy(),
-            first_access_delay=empty_f64.copy(),
-            final_access_delay=empty_f64.copy(),
-            delivery_time=empty_f64.copy(),
-            drop_time=empty_f64.copy(),
-            drop_reason=np.empty(0, dtype=np.int16),
-            transmit_end_time=empty_f64.copy(),
-            arrival_time=empty_f64.copy(),
-            link_released=np.empty(0, dtype=bool),
-            scheduled_prop_delay=empty_f64.copy(),
-            remaining_gcd=empty_f64.copy(),
-            shortest_gcd=empty_f64.copy(),
-            initial_gcd=empty_f64.copy(),
-            last_action1=empty_i64.copy(),
-            last_action2=empty_i64.copy(),
-            last_node1=empty_i64.copy(),
-            last_node2=empty_i64.copy(),
+            storage_chunk_size=storage_chunk_size,
+            _count=0,
+            _chunks={name: [] for name in FLOWLET_ARRAY_FIELDS},
         )
+
+    def reserve(self, required_count: int) -> None:
+        required_count = int(required_count)
+        chunk_size = max(int(self.storage_chunk_size), 1)
+        while required_count > self.capacity:
+            for name in FLOWLET_ARRAY_FIELDS:
+                self._chunks[name].append(np.empty(chunk_size, dtype=FLOWLET_ARRAY_DTYPES[name]))
+
+    def append(self, new_flowlets: "FlowletState") -> np.ndarray:
+        old_count = self.count
+        new_count = new_flowlets.count
+        self.slot_offsets = np.concatenate((self.slot_offsets, self.slot_offsets[-1] + new_flowlets.slot_offsets[1:]))
+        if new_count == 0:
+            return np.empty(0, dtype=np.int64)
+
+        self.reserve(old_count + new_count)
+        row_slice = slice(old_count, old_count + new_count)
+        self._count = old_count + new_count
+        for name in FLOWLET_ARRAY_FIELDS:
+            self.put_field(name, row_slice, np.asarray(getattr(new_flowlets, name)))
+        return np.arange(old_count, old_count + new_count, dtype=np.int64)
+
+    def field_array(self, name: str) -> np.ndarray:
+        count = self.count
+        if count == 0:
+            return np.empty(0, dtype=FLOWLET_ARRAY_DTYPES[name])
+
+        chunk_size = self.storage_chunk_size
+        full_chunks, tail = divmod(count, chunk_size)
+        chunks = self._chunks[name]
+        if full_chunks == 0:
+            return chunks[0][:tail]
+        arrays = list(chunks[:full_chunks])
+        if tail:
+            arrays.append(chunks[full_chunks][:tail])
+        if len(arrays) == 1:
+            return arrays[0]
+        return np.concatenate(arrays)
+
+    def take_field(self, name: str, key):
+        scalar, ids = self._ids_from_key(key)
+        if scalar:
+            idx = int(ids)
+            return self._chunks[name][idx // self.storage_chunk_size][idx % self.storage_chunk_size]
+
+        ids = np.asarray(ids, dtype=np.int64)
+        out = np.empty(ids.size, dtype=FLOWLET_ARRAY_DTYPES[name])
+        if ids.size == 0:
+            return out.reshape(ids.shape)
+
+        flat_ids = ids.ravel()
+        chunk_ids = flat_ids // self.storage_chunk_size
+        local_ids = flat_ids % self.storage_chunk_size
+        for chunk_id in np.unique(chunk_ids):
+            mask = chunk_ids == chunk_id
+            out[mask] = self._chunks[name][int(chunk_id)][local_ids[mask]]
+        return out.reshape(ids.shape)
+
+    def put_field(self, name: str, key, value) -> None:
+        scalar, ids = self._ids_from_key(key)
+        if scalar:
+            idx = int(ids)
+            self._chunks[name][idx // self.storage_chunk_size][idx % self.storage_chunk_size] = value
+            return
+
+        ids = np.asarray(ids, dtype=np.int64)
+        if ids.size == 0:
+            return
+        flat_ids = ids.ravel()
+        values = np.asarray(value, dtype=FLOWLET_ARRAY_DTYPES[name])
+        if values.shape == ():
+            flat_values = np.full(flat_ids.shape, values.item(), dtype=FLOWLET_ARRAY_DTYPES[name])
+        else:
+            flat_values = np.broadcast_to(values, ids.shape).ravel()
+
+        chunk_ids = flat_ids // self.storage_chunk_size
+        local_ids = flat_ids % self.storage_chunk_size
+        for chunk_id in np.unique(chunk_ids):
+            mask = chunk_ids == chunk_id
+            self._chunks[name][int(chunk_id)][local_ids[mask]] = flat_values[mask]
+
+    def _ids_from_key(self, key) -> tuple[bool, int | np.ndarray]:
+        if isinstance(key, slice):
+            return False, np.arange(self.count, dtype=np.int64)[key]
+
+        if np.isscalar(key):
+            idx = int(key)
+            if idx < 0:
+                idx += self.count
+            return True, idx
+
+        ids = np.asarray(key)
+        if ids.dtype == bool:
+            if ids.size != self.count:
+                raise IndexError(f"Boolean index has size {ids.size}, expected {self.count}")
+            return False, np.flatnonzero(ids)
+        return False, ids.astype(np.int64, copy=False)
 
 
 def create_flowlet_state(
@@ -127,45 +375,56 @@ def create_flowlet_state(
     creation_slots = np.repeat(np.arange(num_slots, dtype=np.int64), slot_counts)
     creation_times = start_time + creation_slots.astype(np.float64) * slot_ms
     size = packet_size * packet_count
+    storage_chunk_size = max(num_flowlets, 1)
+    chunks = {
+        "status": [np.full(num_flowlets, FLOWLET_NOT_STARTED, dtype=np.int8)],
+        "creation_slot": [creation_slots],
+        "creation_time": [creation_times],
+        "source_region_id": [source_region_ids.astype(np.int64, copy=False)],
+        "target_region_id": [target_region_ids.astype(np.int64, copy=False)],
+        "source_id": [np.full(num_flowlets, -1, dtype=np.int64)],
+        "current_sat": [np.full(num_flowlets, -1, dtype=np.int64)],
+        "next_sat": [np.full(num_flowlets, -1, dtype=np.int64)],
+        "link_id": [np.full(num_flowlets, -1, dtype=np.int32)],
+        "packet_count": [packet_count.astype(np.int64, copy=False)],
+        "packet_size": [packet_size.astype(np.float64, copy=False)],
+        "is_normal": [is_normal.astype(bool, copy=False)],
+        "size": [size.astype(np.float64, copy=False)],
+        "ttl": [np.full(num_flowlets, default_ttl, dtype=np.int16)],
+        "hops": [np.zeros(num_flowlets, dtype=np.int16)],
+        "queue_delay": [np.zeros(num_flowlets, dtype=np.float64)],
+        "transmission_delay": [np.zeros(num_flowlets, dtype=np.float64)],
+        "propagation_delay": [np.zeros(num_flowlets, dtype=np.float64)],
+        "total_queue_cost": [np.zeros(num_flowlets, dtype=np.float64)],
+        "first_access_delay": [np.zeros(num_flowlets, dtype=np.float64)],
+        "final_access_delay": [np.zeros(num_flowlets, dtype=np.float64)],
+        "delivery_time": [np.full(num_flowlets, np.nan, dtype=np.float64)],
+        "drop_time": [np.full(num_flowlets, np.nan, dtype=np.float64)],
+        "drop_reason": [np.full(num_flowlets, -1, dtype=np.int16)],
+        "transmit_end_time": [np.full(num_flowlets, np.inf, dtype=np.float64)],
+        "arrival_time": [np.full(num_flowlets, np.inf, dtype=np.float64)],
+        "link_released": [np.ones(num_flowlets, dtype=bool)],
+        "scheduled_prop_delay": [np.zeros(num_flowlets, dtype=np.float64)],
+        "remaining_gcd": [np.full(num_flowlets, np.inf, dtype=np.float64)],
+        "shortest_gcd": [np.full(num_flowlets, np.inf, dtype=np.float64)],
+        "initial_gcd": [np.ones(num_flowlets, dtype=np.float64)],
+        "last_action1": [np.full(num_flowlets, -1, dtype=np.int64)],
+        "last_action2": [np.full(num_flowlets, -1, dtype=np.int64)],
+        "last_node1": [np.full(num_flowlets, -1, dtype=np.int64)],
+        "last_node2": [np.full(num_flowlets, -1, dtype=np.int64)],
+    }
 
     return FlowletState(
         slot_offsets=slot_offsets,
-        status=np.full(num_flowlets, FLOWLET_NOT_STARTED, dtype=np.int8),
-        creation_slot=creation_slots,
-        creation_time=creation_times,
-        source_region_id=source_region_ids.astype(np.int64, copy=False),
-        target_region_id=target_region_ids.astype(np.int64, copy=False),
-        source_id=np.full(num_flowlets, -1, dtype=np.int64),
-        current_sat=np.full(num_flowlets, -1, dtype=np.int64),
-        next_sat=np.full(num_flowlets, -1, dtype=np.int64),
-        link_id=np.full(num_flowlets, -1, dtype=np.int32),
-        packet_count=packet_count.astype(np.int64, copy=False),
-        packet_size=packet_size.astype(np.float64, copy=False),
-        is_normal=is_normal.astype(bool, copy=False),
-        size=size.astype(np.float64, copy=False),
-        ttl=np.full(num_flowlets, default_ttl, dtype=np.int16),
-        hops=np.zeros(num_flowlets, dtype=np.int16),
-        queue_delay=np.zeros(num_flowlets, dtype=np.float64),
-        transmission_delay=np.zeros(num_flowlets, dtype=np.float64),
-        propagation_delay=np.zeros(num_flowlets, dtype=np.float64),
-        total_queue_cost=np.zeros(num_flowlets, dtype=np.float64),
-        first_access_delay=np.zeros(num_flowlets, dtype=np.float64),
-        final_access_delay=np.zeros(num_flowlets, dtype=np.float64),
-        delivery_time=np.full(num_flowlets, np.nan, dtype=np.float64),
-        drop_time=np.full(num_flowlets, np.nan, dtype=np.float64),
-        drop_reason=np.full(num_flowlets, -1, dtype=np.int16),
-        transmit_end_time=np.full(num_flowlets, np.inf, dtype=np.float64),
-        arrival_time=np.full(num_flowlets, np.inf, dtype=np.float64),
-        link_released=np.ones(num_flowlets, dtype=bool),
-        scheduled_prop_delay=np.zeros(num_flowlets, dtype=np.float64),
-        remaining_gcd=np.full(num_flowlets, np.inf, dtype=np.float64),
-        shortest_gcd=np.full(num_flowlets, np.inf, dtype=np.float64),
-        initial_gcd=np.ones(num_flowlets, dtype=np.float64),
-        last_action1=np.full(num_flowlets, -1, dtype=np.int64),
-        last_action2=np.full(num_flowlets, -1, dtype=np.int64),
-        last_node1=np.full(num_flowlets, -1, dtype=np.int64),
-        last_node2=np.full(num_flowlets, -1, dtype=np.int64),
+        storage_chunk_size=storage_chunk_size,
+        _count=num_flowlets,
+        _chunks=chunks,
     )
+
+
+def append_flowlet_state(flowlets: FlowletState, new_flowlets: FlowletState) -> np.ndarray:
+    """Append a generated traffic chunk and return the new row ids."""
+    return flowlets.append(new_flowlets)
 
 
 @dataclass(slots=True)
@@ -420,6 +679,31 @@ def activate_flowlets_at_slot_ids(
         return np.empty(0, dtype=np.int64)
 
     flowlet_ids = np.arange(start, end, dtype=np.int64)
+    return activate_flowlet_ids(
+        flowlets=flowlets,
+        flowlet_ids=flowlet_ids,
+        current_time=current_time,
+        nearest_region_sat_ids=nearest_region_sat_ids,
+        nearest_region_sat_distances=nearest_region_sat_distances,
+        region_distance_matrix=region_distance_matrix,
+        access_data_rate=access_data_rate,
+        no_available_sat_reason=no_available_sat_reason,
+    )
+
+
+def activate_flowlet_ids(
+    flowlets: FlowletState,
+    flowlet_ids: np.ndarray,
+    current_time: float,
+    nearest_region_sat_ids: np.ndarray,
+    nearest_region_sat_distances: np.ndarray,
+    region_distance_matrix: np.ndarray,
+    access_data_rate: float,
+    no_available_sat_reason: int,
+) -> np.ndarray:
+    if len(flowlet_ids) == 0:
+        return np.empty(0, dtype=np.int64)
+
     source_regions = flowlets.source_region_id[flowlet_ids]
     source_sat_ids = nearest_region_sat_ids[source_regions]
     visible = source_sat_ids >= 0
