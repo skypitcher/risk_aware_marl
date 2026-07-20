@@ -80,28 +80,37 @@ class DQNAgent:
             device=device,
         )
 
-    def act(self, states: np.ndarray, action_masks: np.ndarray, eval_mode: bool) -> np.ndarray:
+    def act(self, states, action_masks, eval_mode: bool):
         if len(states) == 0:
+            if isinstance(states, torch.Tensor):
+                return torch.empty(0, dtype=torch.long, device=states.device)
             return np.empty(0, dtype=np.int64)
+        return_tensor = isinstance(states, torch.Tensor) or isinstance(action_masks, torch.Tensor)
+        output_device = states.device if isinstance(states, torch.Tensor) else (
+            action_masks.device if isinstance(action_masks, torch.Tensor) else self.inference_device
+        )
+        mask_tensor = torch.as_tensor(action_masks, dtype=torch.bool, device=self.inference_device)
         if not eval_mode:
-            explore = np.random.random(len(states)) < self.epsilon_train
-            random_actions = self._random_actions(action_masks)
+            explore = torch.rand(len(states), device=self.inference_device) < self.epsilon_train
+            random_actions = self._random_actions(mask_tensor)
         else:
-            explore = np.zeros(len(states), dtype=bool)
-            random_actions = np.full(len(states), -1, dtype=np.int64)
+            explore = torch.zeros(len(states), dtype=torch.bool, device=self.inference_device)
+            random_actions = torch.full((len(states),), -1, dtype=torch.long, device=self.inference_device)
 
         with torch.inference_mode():
             self.Q_inference.eval()
             state_tensor = torch.as_tensor(states, dtype=torch.float32, device=self.inference_device)
             q_values = self.Q_inference(state_tensor)
-            mask = torch.as_tensor(action_masks, dtype=torch.bool, device=self.inference_device)
-            greedy_actions = torch.argmax(q_values.masked_fill(~mask, -1e9), dim=1).cpu().numpy()
+            greedy_actions = torch.argmax(q_values.masked_fill(~mask_tensor, -1e9), dim=1)
 
-        actions = np.where(explore, random_actions, greedy_actions).astype(np.int64, copy=False)
-        actions[~action_masks.any(axis=1)] = -1
+        actions = torch.where(explore, random_actions, greedy_actions)
+        actions = torch.where(mask_tensor.any(dim=1), actions, torch.full_like(actions, -1))
         if not eval_mode:
             self._update_epsilon(len(states))
-        return actions
+        actions = actions.to(output_device)
+        if return_tensor:
+            return actions
+        return actions.cpu().numpy().astype(np.int64, copy=False)
 
     def add_transition(self, **kwargs) -> None:
         self.replay_buffer.add(**kwargs)
@@ -172,7 +181,12 @@ class DQNAgent:
         self._sync_q_inference(force=force)
 
     @staticmethod
-    def _random_actions(action_masks: np.ndarray) -> np.ndarray:
+    def _random_actions(action_masks):
+        if isinstance(action_masks, torch.Tensor):
+            scores = torch.rand(action_masks.shape, device=action_masks.device)
+            scores = scores.masked_fill(~action_masks, -1.0)
+            actions = torch.argmax(scores, dim=1)
+            return torch.where(action_masks.any(dim=1), actions, torch.full_like(actions, -1))
         actions = np.full(len(action_masks), -1, dtype=np.int64)
         for row, mask in enumerate(action_masks):
             valid = np.flatnonzero(mask)
@@ -209,7 +223,7 @@ class MaDQN(BatchedRLAgent):
     def name(self) -> str:
         return "MaDQN"
 
-    def select_actions(self, states: np.ndarray, action_masks: np.ndarray) -> np.ndarray:
+    def select_actions(self, states, action_masks):
         return self.global_agent.act(states, action_masks, eval_mode=self.is_eval())
 
     def add_transition(self, **kwargs) -> None:

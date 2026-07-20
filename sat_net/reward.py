@@ -5,7 +5,7 @@ from typing import Any
 
 import numpy as np
 
-from sat_net.sim_kernel import FLOWLET_DELIVERED, FLOWLET_DROPPED
+from sat_net.flowlet_status import FLOWLET_DELIVERED, FLOWLET_DROPPED
 
 
 @dataclass(slots=True)

@@ -18,17 +18,17 @@ This repository presents **PRIMAL** (Principled Risk-aware Independent Multi-Age
 
 ### Slot-Array Simulator
 
-The simulator has been refactored from an event-queue packet model into a data-oriented slot-array kernel:
+The simulator has been refactored from an event-queue packet model into a NumPy slot-array kernel:
 
 1. **Region traffic**: Flowlets are sampled from population/region weights and bind to the currently visible access satellite.
 2. **Flowlet batches**: A flowlet represents a batch of packets with common source/target regions.
-3. **Array network state**: Satellite positions, neighbor/link matrices, link delays, connectivity, queues, and flowlet state are stored in NumPy arrays.
-4. **Mask-first slot kernels**: `sat_net/sim_kernel.py` owns flowlet/link state transitions and returns full-length masks before NumPy compression.
-5. **MARL env API**: `RoutingEnv.reset()` returns a batched multi-agent `RoutingBatch`; every row is one satellite-agent decision for one flowlet.
+3. **Array network state**: Satellite, link, node, region-access, and flowlet state are stored as fixed-size batched NumPy arrays such as `[num_envs, num_links, features]` and `[num_envs, num_nodes, features]`.
+4. **NumPy array env**: `sat_net/array_vector_env.py` is the active environment implementation.
+5. **MARL env API**: `ArrayVectorRoutingEnv.reset()` returns a fixed-slot multi-agent `RoutingBatch`; `decision_mask` marks rows that currently need routing.
 6. **MARL training pipeline**: `sat_net/pipeline.py` samples finite rollout windows from a continuing process and runs `reset(start_time) -> agent.act -> env.step -> observe outcomes -> train update`.
-7. **Legacy RL signals**: `sat_net/routing_env.py` emits the 94-dimensional routing observation used by the original agents, and `sat_net/reward.py` preserves the proven MaDQN/PRIMAL reward and cost scale.
+7. **Legacy-compatible RL signals**: `sat_net/array_vector_env.py` emits the 94-dimensional routing observation used by the original agents, and `sat_net/reward.py` preserves the proven MaDQN/PRIMAL reward and cost scale.
 8. **SPF baseline**: Shortest-path next-hop rows are computed from sparse arrays, cached in a dense matrix, and refreshed with topology updates.
-9. **Torch RL on NumPy kernels**: The default path is NumPy/SciPy simulation plus PyTorch MaDQN/PRIMAL training.
+9. **NumPy simulation and PyTorch RL**: The simulator runs on NumPy arrays; MaDQN/PRIMAL training remains PyTorch-based.
 
 The default Starlink configs use a downsampled WorldPop 2020 total-population grid at `assets/population/worldpop_total_population_2020_1440x720.npy`; regenerate it with `python scripts/fetch_worldpop_population.py`.
 
@@ -95,11 +95,11 @@ brew install proj geos
 ```
 risk_aware_marl/
 ├── sat_net/                    # Core simulation framework
-│   ├── routing_env.py          # Slot-array routing environment
+│   ├── array_vector_env.py     # NumPy fixed-slot vector routing environment
+│   ├── flowlet_status.py       # Shared flowlet status constants
 │   ├── pipeline.py             # MARL train/eval rollout pipeline
 │   ├── reward.py               # Legacy MaDQN/PRIMAL transition reward and cost
 │   ├── experiment.py           # Run manifests, metrics, and checkpoints
-│   ├── sim_kernel.py           # Flowlet/link array transition kernels
 │   ├── network.py              # Array-oriented satellite network topology
 │   ├── traffic_region.py       # Region/population traffic model
 │   └── agent/                  # Batched MARL routing-agent API
@@ -107,7 +107,6 @@ risk_aware_marl/
 │       └── spf.py              # Shortest-path baseline
 ├── configs/                    # Configuration files
 │   ├── main.json               # Active experiment entry point
-│   ├── env/                    # Scenario and traffic configurations
 │   └── agents/                 # SPF, MaDQN, and PRIMAL configs
 ├── assets/population/          # Downsampled WorldPop population grid
 ├── figs/                       # Figures and plots
@@ -128,7 +127,7 @@ python run_eval.py
 
 ### RL Training Status
 
-`run_train.py` resets the continuing routing environment once and advances it until `max_sampling_steps` env interaction steps are reached. Traffic is generated online with `traffic.lookahead_seconds` and `traffic.generation_chunk_seconds`; flowlet state grows in fixed `traffic.flowlet_storage_chunk_size` chunks. Logs and metrics use env interaction `step` as the RL sample-efficiency axis. `configs/main.json` selects the scenario, while `configs/agents/*.json` selects the algorithm. Use `configs/agents/madqn.json`, `configs/agents/primal_avg.json`, or `configs/agents/primal_cvar.json` to train the rebuilt MaDQN/PRIMAL baselines.
+`run_train.py` resets the continuing routing environment once and advances it until `max_sampling_steps` env interaction steps are reached. The NumPy backend uses a closed-loop workload: `traffic.concurrent_flowlets_per_env` fixes the number of active flowlets per vector environment, and delivered or dropped flowlets are replaced from the region-to-region OD distribution. Logs and metrics use env interaction `step` as the RL sample-efficiency axis. `configs/main.json` selects the scenario, while `configs/agents/*.json` selects the algorithm. Use `configs/agents/madqn.json`, `configs/agents/primal_avg.json`, or `configs/agents/primal_cvar.json` to train the rebuilt MaDQN/PRIMAL baselines.
 
 ```bash
 python run_train.py --config configs/main.json --agent configs/agents/madqn.json --max_sampling_steps 1000000 --eval_duration_seconds 60

@@ -4,6 +4,8 @@ It plots satellites and inter-satellite links (ISL_N) on a world map.
 """
 
 import argparse
+import os
+
 import matplotlib.pyplot as plt
 import cartopy.crs as ccrs
 import cartopy.feature as cfeature
@@ -145,7 +147,7 @@ def main():
     parser = argparse.ArgumentParser(description="Simple satellite network topology visualization (ISL_N only)")
     parser.add_argument(
         "--config",
-        default="configs/env/starlink_world.json",
+        default="configs/main.json",
         help="Configuration file path",
     )
     parser.add_argument("--timestamp", type=int, default=0, help="Timestamp in milliseconds")

@@ -2,7 +2,7 @@
 
 ## Project Structure & Module Organization
 
-`sat_net/` contains the data-oriented satellite routing simulator. Key modules are `routing_env.py` for environment orchestration, `sim_kernel.py` for flowlet/link array transitions, `network.py` for topology and SPF tables, `traffic_region.py` for population-driven traffic, and `sat_net/agent/` for SPFAgent, MaDQN, PRIMAL-Avg, and PRIMAL-CVaR. Entry points are `run_train.py`, `run_eval.py`, and `run_spf.py`. Configs are under `configs/`, population assets under `assets/population/`, figures under `figs/`, and run outputs under `runs_*`.
+`sat_net/` contains the NumPy slot-array satellite routing simulator. Key modules are `array_vector_env.py` for fixed-slot vector environment orchestration, `flowlet_status.py` for shared state constants, `network.py` for topology and SPF tables, `traffic_region.py` for population-driven traffic, and `sat_net/agent/` for SPFAgent, MaDQN, PRIMAL-Avg, and PRIMAL-CVaR. Entry points are `run_train.py`, `run_eval.py`, and `run_spf.py`. Configs are under `configs/`, population assets under `assets/population/`, figures under `figs/`, and run outputs under `runs_*`.
 
 ## Build, Test, and Development Commands
 
@@ -26,7 +26,7 @@ Use `python -m compileall sat_net run_train.py run_eval.py run_spf.py` before lo
 
 ## Coding Style & Naming Conventions
 
-Use Python with 4-space indentation and useful type hints. Keep changes inside existing boundaries: environment logic in `routing_env.py`, topology in `network.py`, array kernels in `sim_kernel.py`, and agents under `sat_net/agent/`. Classes use `PascalCase`; functions, variables, and config keys use `snake_case`. Config files should be descriptive lowercase names such as `configs/agents/spf.json`.
+Use Python with 4-space indentation and useful type hints. Keep changes inside existing boundaries: environment logic and array kernels in `array_vector_env.py`, topology in `network.py`, traffic generation in `traffic_region.py`, and agents under `sat_net/agent/`. Classes use `PascalCase`; functions, variables, and config keys use `snake_case`. Config files should be descriptive lowercase names such as `configs/agents/spf.json`.
 
 ## Testing Guidelines
 

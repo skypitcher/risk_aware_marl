@@ -2,12 +2,11 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass
-from typing import Callable, Iterable
+from typing import Any, Callable, Iterable
 
 import numpy as np
 
 from sat_net.agent.base_agent import BaseAgent, RoutingBatch
-from sat_net.routing_env import RoutingEnv
 from sat_net.stats import Metrics
 
 
@@ -43,7 +42,7 @@ class EvaluationResult:
 
 
 def run_marl_rollout(
-    env: RoutingEnv,
+    env: Any,
     agent: BaseAgent,
     seed: int | Iterable[int] | None = None,
     start_time: float | None = None,
@@ -96,11 +95,11 @@ def run_marl_rollout(
         max_steps is None or _env_interaction_steps(step_count, num_envs) < max_steps
     ):
         if not _is_empty_observation(observation):
-            decision_count += observation.decision_count
-            decision_batches += 1
-            active_agents = len(observation.active_agent_ids)
-            active_agent_sum += active_agents
-            max_active_agents = max(max_active_agents, active_agents)
+            active_decisions = _active_decision_count(observation)
+            decision_count += active_decisions
+            decision_batches += int(active_decisions > 0)
+            active_agent_sum += active_decisions
+            max_active_agents = max(max_active_agents, active_decisions)
         action = _empty_action() if _is_empty_observation(observation) else agent.act(observation)
         observation, _reward, terminated, truncated, info = env.step(action)
         step_count += 1
@@ -147,7 +146,7 @@ def run_marl_rollout(
 
 
 def run_marl_steps(
-    env: RoutingEnv,
+    env: Any,
     agent: BaseAgent,
     train: bool = False,
     max_steps: int | None = None,
@@ -182,11 +181,11 @@ def run_marl_steps(
 
         observation = env.observation
         if not _is_empty_observation(observation):
-            decision_count += observation.decision_count
-            decision_batches += 1
-            active_agents = len(observation.active_agent_ids)
-            active_agent_sum += active_agents
-            max_active_agents = max(max_active_agents, active_agents)
+            active_decisions = _active_decision_count(observation)
+            decision_count += active_decisions
+            decision_batches += int(active_decisions > 0)
+            active_agent_sum += active_decisions
+            max_active_agents = max(max_active_agents, active_decisions)
         action = _empty_action() if _is_empty_observation(observation) else agent.act(observation)
         _observation, _reward, terminated, truncated, info = env.step(action)
         step_count += 1
@@ -232,7 +231,7 @@ def run_marl_steps(
 
 
 def evaluate_agent(
-    env: RoutingEnv,
+    env: Any,
     agent: BaseAgent,
     seeds: Iterable[int],
     start_time: float | None = 0,
@@ -278,10 +277,14 @@ def _empty_action() -> np.ndarray:
 
 
 def _is_empty_observation(observation: RoutingBatch | None) -> bool:
-    return observation is None or observation.decision_count == 0
+    return observation is None or observation.batch_size == 0
 
 
-def _num_envs(env: RoutingEnv) -> int:
+def _active_decision_count(observation: RoutingBatch) -> int:
+    return int(getattr(observation, "active_decision_count", observation.decision_count))
+
+
+def _num_envs(env: Any) -> int:
     return max(int(getattr(env, "num_envs", 1)), 1)
 
 

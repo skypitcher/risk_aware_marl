@@ -125,9 +125,15 @@ class PrimalCVaRAgent:
     def lambdar(self) -> torch.Tensor:
         return F.softplus(self.log_lambda)
 
-    def act(self, states: np.ndarray, action_masks: np.ndarray, eval_mode: bool) -> np.ndarray:
+    def act(self, states, action_masks, eval_mode: bool):
         if len(states) == 0:
+            if isinstance(states, torch.Tensor):
+                return torch.empty(0, dtype=torch.long, device=states.device)
             return np.empty(0, dtype=np.int64)
+        return_tensor = isinstance(states, torch.Tensor) or isinstance(action_masks, torch.Tensor)
+        output_device = states.device if isinstance(states, torch.Tensor) else (
+            action_masks.device if isinstance(action_masks, torch.Tensor) else self.inference_device
+        )
         with torch.inference_mode():
             self.actor_inference.eval()
             state_tensor = torch.as_tensor(states, dtype=torch.float32, device=self.inference_device)
@@ -137,9 +143,11 @@ class PrimalCVaRAgent:
                 actions = torch.argmax(logits, dim=-1)
             else:
                 actions = torch.multinomial(F.softmax(logits, dim=-1), 1).squeeze(-1)
-        out = actions.cpu().numpy().astype(np.int64)
-        out[~action_masks.any(axis=1)] = -1
-        return out
+        actions = torch.where(mask_tensor.any(dim=1), actions, torch.full_like(actions, -1))
+        actions = actions.to(output_device)
+        if return_tensor:
+            return actions
+        return actions.cpu().numpy().astype(np.int64, copy=False)
 
     def add_transition(self, **kwargs) -> None:
         self.replay_buffer.add(**kwargs)
@@ -291,7 +299,7 @@ class PrimalCVaR(BatchedRLAgent):
     def name(self) -> str:
         return "PrimalCVaR"
 
-    def select_actions(self, states: np.ndarray, action_masks: np.ndarray) -> np.ndarray:
+    def select_actions(self, states, action_masks):
         return self.global_agent.act(states, action_masks, eval_mode=self.is_eval())
 
     def add_transition(self, **kwargs) -> None:

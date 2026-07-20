@@ -14,8 +14,7 @@ from pathlib import Path
 
 import numpy as np
 
-from sat_net.routing_env import RoutingEnv
-from sat_net.vector_env import DAY_MS, VectorRoutingEnv, seeded_start_offsets_ms
+from sat_net.array_vector_env import DAY_MS, ArrayVectorRoutingEnv, seeded_start_offsets_ms
 from sat_net.pipeline import EvaluationResult, run_marl_rollout, run_marl_steps
 from sat_net.agent import BaseAgent, create_agent
 from sat_net.config import DEFAULT_MAIN_CONFIG, load_agent_config, load_config, load_env_config, merge_section
@@ -116,9 +115,11 @@ def create_training_env(env_config: NamedDict, args: NamedDict, tf_writer):
     num_envs = max(int(args.get("num_envs", 1)), 1)
     env_config = NamedDict(env_config.to_dict())
     env_config.verbose = bool(args.get("env_verbose", False))
-    if num_envs <= 1:
-        return RoutingEnv(env_config, tf_writer=tf_writer)
-    return VectorRoutingEnv(
+    if args.get("concurrent_flowlets_per_env", None) is not None:
+        env_config.traffic.concurrent_flowlets_per_env = int(args.concurrent_flowlets_per_env)
+    if args.get("region_chunk_size", None) is not None:
+        env_config.traffic.region_chunk_size = int(args.region_chunk_size)
+    return ArrayVectorRoutingEnv(
         env_config,
         num_envs=num_envs,
         utc_offset_span_ms=float(args.get("vector_utc_span_seconds", 5400.0)) * 1000.0,
@@ -127,13 +128,16 @@ def create_training_env(env_config: NamedDict, args: NamedDict, tf_writer):
     )
 
 
-def create_evaluation_env(env_config: NamedDict, eval_seeds: list[int], tf_writer):
+def create_evaluation_env(env_config: NamedDict, eval_seeds: list[int], tf_writer, args: NamedDict | None = None):
     env_config = NamedDict(env_config.to_dict())
     env_config.verbose = False
+    if args is not None:
+        if args.get("concurrent_flowlets_per_env", None) is not None:
+            env_config.traffic.concurrent_flowlets_per_env = int(args.concurrent_flowlets_per_env)
+        if args.get("region_chunk_size", None) is not None:
+            env_config.traffic.region_chunk_size = int(args.region_chunk_size)
     num_envs = max(len(eval_seeds), 1)
-    if num_envs <= 1:
-        return RoutingEnv(env_config, tf_writer=tf_writer)
-    return VectorRoutingEnv(
+    return ArrayVectorRoutingEnv(
         env_config,
         num_envs=num_envs,
         utc_offset_span_ms=0.0,
@@ -142,33 +146,21 @@ def create_evaluation_env(env_config: NamedDict, eval_seeds: list[int], tf_write
     )
 
 
-def assert_separate_train_eval_envs(train_env: RoutingEnv, eval_env: RoutingEnv) -> None:
+def assert_separate_train_eval_envs(train_env: ArrayVectorRoutingEnv, eval_env: ArrayVectorRoutingEnv) -> None:
     if train_env is eval_env:
         raise RuntimeError("Train and eval must use separate environment instances.")
-    train_leaf_envs = _leaf_envs(train_env)
-    eval_leaf_envs = _leaf_envs(eval_env)
-    shared_env_ids = {id(env) for env in train_leaf_envs} & {id(env) for env in eval_leaf_envs}
-    if shared_env_ids:
-        raise RuntimeError("Train and eval vector environments share sub-environment instances.")
-    train_network_ids = {id(env.network) for env in train_leaf_envs if getattr(env, "network", None) is not None}
-    eval_network_ids = {id(env.network) for env in eval_leaf_envs if getattr(env, "network", None) is not None}
-    if train_network_ids & eval_network_ids:
+    if id(getattr(train_env, "network", None)) == id(getattr(eval_env, "network", None)):
         raise RuntimeError("Train and eval environments share mutable network instances.")
 
 
-def log_env_split(train_env: RoutingEnv, eval_env: RoutingEnv, eval_seeds: list[int]) -> None:
+def log_env_split(train_env: ArrayVectorRoutingEnv, eval_env: ArrayVectorRoutingEnv, eval_seeds: list[int]) -> None:
     assert_separate_train_eval_envs(train_env, eval_env)
     logging.info(
         "ENV_SPLIT train_envs=%d eval_envs=%d shared_state=false eval_seeds=%s",
-        len(_leaf_envs(train_env)),
-        len(_leaf_envs(eval_env)),
+        max(int(getattr(train_env, "num_envs", 1)), 1),
+        max(int(getattr(eval_env, "num_envs", 1)), 1),
         ",".join(str(seed) for seed in eval_seeds),
     )
-
-
-def _leaf_envs(env: RoutingEnv) -> list[RoutingEnv]:
-    envs = getattr(env, "envs", None)
-    return list(envs) if envs else [env]
 
 
 def parse_seed_list(seed_text: str) -> list[int]:
@@ -185,7 +177,7 @@ def log_run_setup(
     main_config: NamedDict,
     env_config: NamedDict,
     agent_config: NamedDict,
-    env: RoutingEnv,
+    env: ArrayVectorRoutingEnv,
     recovered: bool = False,
 ) -> None:
     base_env = _base_env(env)
@@ -196,7 +188,7 @@ def log_run_setup(
     logging.info(
         (
             "RUN %srun_id=%s agent=%s env=%s seed=%s max_steps=%s "
-            "num_envs=%d eval_every=%s eval_after=%s log_dir=%s"
+            "num_envs=%d backend=%s device=%s eval_every=%s eval_after=%s log_dir=%s"
         ),
         "resume " if recovered else "",
         run_id,
@@ -205,20 +197,24 @@ def log_run_setup(
         args.seed,
         _format_optional(args.max_sampling_steps),
         max(int(getattr(env, "num_envs", 1)), 1),
+        "numpy_array",
+        str(getattr(env, "device", "cpu")),
         _format_optional(args.eval_interval_steps),
         _format_optional(args.eval_after_steps),
         log_dir,
     )
     logging.info(
         (
-            "SIM sats=%d regions=%d slot=%.3fms start_ms=%.3f traffic=%.1f pkt/ms "
-            "mean_flowlet=%.1f pkts access=%.2fGbps isl=%.2fGbps buffer=%.1fMb"
+            "SIM sats=%d regions=%d slot=%.3fms start_ms=%.3f traffic=closed_loop "
+            "concurrent_flowlets/env=%d total_flowlet_slots=%d mean_flowlet=%.1f pkts "
+            "access=%.2fGbps isl=%.2fGbps buffer=%.1fMb"
         ),
         int(getattr(base_env.network, "num_satellites", 0)),
         len(base_env.traffic_model.regions),
         float(traffic.get("slot_ms", base_env.slot_ms)),
         float(args.start_time_ms),
-        float(traffic.get("packet_rate_per_ms", base_env.packet_rate_per_ms)),
+        int(getattr(env, "concurrent_flowlets_per_env", getattr(env, "capacity", 0))),
+        int(getattr(env, "capacity", 0)) * max(int(getattr(env, "num_envs", 1)), 1),
         float(traffic.get("mean_packets_per_flowlet", base_env.mean_packets_per_flowlet)),
         float(traffic.get("access_data_rate", base_env.access_data_rate)),
         float(network.get("isl_data_rate", 0.0)),
@@ -227,7 +223,7 @@ def log_run_setup(
 
 
 def eval_performance(
-    eval_env: RoutingEnv,
+    eval_env: ArrayVectorRoutingEnv,
     agent: BaseAgent,
     sampling_step: int,
     rollout: int,
@@ -246,11 +242,7 @@ def eval_performance(
     progress_printer = TrainingProgressPrinter(enabled=progress_enabled)
     start_offsets_ms = seeded_start_offsets_ms(eval_seeds, span_ms=DAY_MS)
     rollout_start_time_ms = float(eval_start_time_ms)
-    reset_options = {}
-    if isinstance(eval_env, VectorRoutingEnv):
-        reset_options["env_start_offsets_ms"] = start_offsets_ms
-    else:
-        rollout_start_time_ms += float(start_offsets_ms[0])
+    reset_options = {"env_start_offsets_ms": start_offsets_ms}
 
     def progress_callback(vector_steps: int) -> None:
         elapsed_ms = max(float(eval_env.current_time - eval_env.start_time), 0.0)
@@ -262,11 +254,10 @@ def eval_performance(
         )
 
     try:
-        seed_arg = list(eval_seeds) if isinstance(eval_env, VectorRoutingEnv) else int(eval_seeds[0])
         item = run_marl_rollout(
             env=eval_env,
             agent=agent,
-            seed=seed_arg,
+            seed=list(eval_seeds),
             start_time=rollout_start_time_ms,
             train=False,
             duration_seconds=duration_seconds,
@@ -414,8 +405,8 @@ def eval_performance(
 
 
 def train(
-    env: RoutingEnv,
-    eval_env: RoutingEnv,
+    env: ArrayVectorRoutingEnv,
+    eval_env: ArrayVectorRoutingEnv,
     agent: BaseAgent,
     start_sampling_step: int,
     start_rollout: int,
@@ -842,22 +833,23 @@ def _aggregate_eval_metrics(rollout, metrics: list[Metrics]) -> EvaluationResult
     )
 
 
-def _eval_seed_metrics(eval_env: RoutingEnv, fallback: Metrics) -> list[Metrics]:
-    envs = getattr(eval_env, "envs", None)
-    if not envs:
+def _eval_seed_metrics(eval_env: ArrayVectorRoutingEnv, fallback: Metrics) -> list[Metrics]:
+    num_envs = max(int(getattr(eval_env, "num_envs", 1)), 1)
+    if num_envs <= 1:
         return [fallback]
-    return [env.calc_metrics() for env in envs]
+    return [eval_env.calc_metrics(env_id=env_id) for env_id in range(num_envs)]
 
 
-def _base_env(env: RoutingEnv):
-    envs = getattr(env, "envs", None)
-    return envs[0] if envs else env
+def _base_env(env: ArrayVectorRoutingEnv):
+    return env
 
 
-def _metric_elapsed_ms(env: RoutingEnv) -> float:
-    envs = getattr(env, "envs", None)
-    if envs:
-        return sum(max(float(item.current_time - item.start_time), 0.0) for item in envs)
+def _metric_elapsed_ms(env: ArrayVectorRoutingEnv) -> float:
+    if hasattr(env, "_elapsed_ms"):
+        elapsed = env._elapsed_ms()
+        if hasattr(elapsed, "detach"):
+            return float(elapsed.sum().detach().cpu().item())
+        return float(np.asarray(elapsed, dtype=np.float64).sum())
     return max(float(env.current_time - env.start_time), 0.0)
 
 
@@ -1444,11 +1436,12 @@ def main():
     train_defaults = {
         "config": DEFAULT_MAIN_CONFIG,
         "recover_runid": None,
-        "env": None,
         "agent": None,
         "runs_dir": "runs_train",
         "max_sampling_steps": 1_000_000,
         "num_envs": 1,
+        "concurrent_flowlets_per_env": None,
+        "region_chunk_size": 32,
         "vector_utc_span_seconds": 5400.0,
         "vector_seed_stride": 100000,
         "start_time_ms": 0.0,
@@ -1471,10 +1464,11 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", type=str, default=DEFAULT_MAIN_CONFIG)
     parser.add_argument("--recover_runid", type=str, default=None)
-    parser.add_argument("--env", type=str, default=None)
     parser.add_argument("--agent", type=str, default=None)
     parser.add_argument("--max_sampling_steps", type=int, default=None)
     parser.add_argument("--num_envs", type=int, default=None)
+    parser.add_argument("--concurrent_flowlets_per_env", type=int, default=None)
+    parser.add_argument("--region_chunk_size", type=int, default=None)
     parser.add_argument("--vector_utc_span_seconds", type=float, default=None)
     parser.add_argument("--vector_seed_stride", type=int, default=None)
     parser.add_argument("--start_time_ms", type=float, default=None)
@@ -1522,6 +1516,8 @@ def main():
                 "recover_runid",
                 "duration_seconds",
                 "max_sampling_steps",
+                "concurrent_flowlets_per_env",
+                "region_chunk_size",
                 "eval_duration_seconds",
                 "log_interval_steps",
                 "eval_interval_steps",
@@ -1545,7 +1541,7 @@ def main():
 
         eval_seeds = parse_seed_list(args.eval_seeds)
         env = create_training_env(env_config, args, tf_writer=tf_writer)
-        eval_env = create_evaluation_env(env_config, eval_seeds, tf_writer=tf_writer)
+        eval_env = create_evaluation_env(env_config, eval_seeds, tf_writer=tf_writer, args=args)
         log_env_split(env, eval_env, eval_seeds)
         agent = create_agent(
             agent_config,
@@ -1578,7 +1574,7 @@ def main():
             start_simulated_time_ms,
         )
     else:
-        env_config = load_env_config(main_config, override_path=args.env)
+        env_config = load_env_config(main_config)
         agent_config = load_agent_config(main_config, override_path=args.agent)
 
         date_str = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
@@ -1595,7 +1591,7 @@ def main():
 
         eval_seeds = parse_seed_list(args.eval_seeds)
         env = create_training_env(env_config, args, tf_writer=tf_writer)
-        eval_env = create_evaluation_env(env_config, eval_seeds, tf_writer=tf_writer)
+        eval_env = create_evaluation_env(env_config, eval_seeds, tf_writer=tf_writer, args=args)
         log_env_split(env, eval_env, eval_seeds)
         agent = create_agent(
             agent_config,

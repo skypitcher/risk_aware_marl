@@ -12,9 +12,8 @@ import pandas as pd
 
 from sat_net.agent import BaseAgent, create_agent
 from sat_net.config import DEFAULT_MAIN_CONFIG, eval_agent_paths, load_config, load_env_config, merge_section
+from sat_net.array_vector_env import DAY_MS, ArrayVectorRoutingEnv, seeded_start_offsets_ms
 from sat_net.pipeline import run_marl_rollout
-from sat_net.routing_env import RoutingEnv
-from sat_net.vector_env import DAY_MS, VectorRoutingEnv, seeded_start_offsets_ms
 from sat_net.util import NamedDict
 
 PROJECT_ROOT = str(os.path.dirname(os.path.abspath(__file__)))
@@ -31,13 +30,15 @@ def setup_logging(log_dir: str):
     )
 
 
-def create_eval_env(env_config: NamedDict, num_envs: int):
+def create_eval_env(env_config: NamedDict, num_envs: int, args: NamedDict):
     env_config = NamedDict(env_config.to_dict())
     env_config.verbose = False
+    if args.get("concurrent_flowlets_per_env", None) is not None:
+        env_config.traffic.concurrent_flowlets_per_env = int(args.concurrent_flowlets_per_env)
+    if args.get("region_chunk_size", None) is not None:
+        env_config.traffic.region_chunk_size = int(args.region_chunk_size)
     num_envs = max(int(num_envs), 1)
-    if num_envs <= 1:
-        return RoutingEnv(env_config, tf_writer=None)
-    return VectorRoutingEnv(
+    return ArrayVectorRoutingEnv(
         env_config,
         num_envs=num_envs,
         utc_offset_span_ms=0.0,
@@ -58,7 +59,7 @@ def evaluate_multi_seed(
     metric_records: list[dict[str, object]] = []
     for agent in agents:
         eval_seeds = [base_seed + seed_idx * 1000 for seed_idx in range(num_seeds)]
-        env = create_eval_env(env_config, num_envs=len(eval_seeds))
+        env = create_eval_env(env_config, num_envs=len(eval_seeds), args=args)
         actual_envs = max(int(getattr(env, "num_envs", 1)), 1)
         logging.info(
             "Agent %s eval_start seeds=%d duration_env=%.3fs vector_envs=%d",
@@ -70,17 +71,12 @@ def evaluate_multi_seed(
         all_flowlet_frames = []
         try:
             start_offsets_ms = seeded_start_offsets_ms(eval_seeds, span_ms=DAY_MS)
-            reset_options = {}
-            start_time_ms = 0.0
-            if actual_envs > 1:
-                reset_options["env_start_offsets_ms"] = start_offsets_ms
-            else:
-                start_time_ms = float(start_offsets_ms[0])
+            reset_options = {"env_start_offsets_ms": start_offsets_ms}
             result = run_marl_rollout(
                 env=env,
                 agent=agent,
-                seed=eval_seeds if actual_envs > 1 else eval_seeds[0],
-                start_time=start_time_ms,
+                seed=eval_seeds,
+                start_time=0.0,
                 train=False,
                 duration_seconds=duration_seconds,
                 reset_options=reset_options,
@@ -153,11 +149,11 @@ def evaluate_multi_seed(
         logging.info("Evaluation metrics saved to %s and %s", metrics_csv_path, metrics_jsonl_path)
 
 
-def _eval_seed_metrics(env: RoutingEnv, fallback):
-    envs = getattr(env, "envs", None)
-    if not envs:
+def _eval_seed_metrics(env: ArrayVectorRoutingEnv, fallback):
+    num_envs = max(int(getattr(env, "num_envs", 1)), 1)
+    if num_envs <= 1:
         return [fallback]
-    return [item.calc_metrics() for item in envs]
+    return [env.calc_metrics(env_id=env_id) for env_id in range(num_envs)]
 
 
 def _metric_record(
@@ -181,7 +177,7 @@ def _metric_record(
     }
 
 
-def load_agent_from(env: RoutingEnv, saved_path: str):
+def load_agent_from(env: ArrayVectorRoutingEnv, saved_path: str):
     agent_config = NamedDict.load(f"{saved_path}/agent_config.json")
     agent = create_agent(
         agent_config,
@@ -196,28 +192,28 @@ def load_agent_from(env: RoutingEnv, saved_path: str):
 def main():
     eval_defaults = {
         "config": DEFAULT_MAIN_CONFIG,
-        "env": None,
         "agent": None,
         "model": [],
         "eval_seed": 3333,
         "duration_seconds": 60.0,
         "num_eval_seeds": 5,
-        "num_envs": 1,
         "vector_utc_span_seconds": 5400.0,
         "vector_seed_stride": 100000,
+        "concurrent_flowlets_per_env": None,
+        "region_chunk_size": 32,
         "runs_dir": "runs_eval",
     }
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", type=str, default=DEFAULT_MAIN_CONFIG)
-    parser.add_argument("--env", type=str, default=None)
     parser.add_argument("--agent", action="append", default=None)
     parser.add_argument("--model", action="append", default=[])
     parser.add_argument("--eval_seed", type=int, default=None)
     parser.add_argument("--duration_seconds", type=float, default=None)
     parser.add_argument("--num_eval_seeds", type=int, default=None)
-    parser.add_argument("--num_envs", type=int, default=None)
     parser.add_argument("--vector_utc_span_seconds", type=float, default=None)
     parser.add_argument("--vector_seed_stride", type=int, default=None)
+    parser.add_argument("--concurrent_flowlets_per_env", type=int, default=None)
+    parser.add_argument("--region_chunk_size", type=int, default=None)
     parser.add_argument("--runs_dir", type=str, default=None)
     parsed_args = parser.parse_args()
     main_config = load_config(parsed_args.config)
@@ -228,10 +224,10 @@ def main():
     log_dir = os.path.join(runs_dir, run_id)
     setup_logging(log_dir)
 
-    env_config = load_env_config(main_config, override_path=args.env)
+    env_config = load_env_config(main_config)
     main_config.save(os.path.join(log_dir, "main_config.json"))
     env_config.save(os.path.join(log_dir, "env_config.json"))
-    prototype_env = RoutingEnv(env_config, tf_writer=None)
+    prototype_env = create_eval_env(env_config, num_envs=1, args=args)
     logging.info(
         (
             "RUN_EVAL env=%s seeds=%d vector_envs=%d duration_env=%.3fs "

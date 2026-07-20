@@ -6,7 +6,7 @@ from typing import Any
 import numpy as np
 import torch
 
-from sat_net.sim_kernel import FLOWLET_DELIVERED, FLOWLET_DROPPED
+from sat_net.flowlet_status import FLOWLET_DELIVERED, FLOWLET_DROPPED
 from sat_net.agent.base_agent import ACTION_COUNT, BaseAgent, RoutingBatch, RoutingDecision
 from sat_net.reward import RewardConfig, RewardStats, compute_transition_reward
 from sat_net.util import NamedDict
@@ -106,20 +106,30 @@ class BatchedRLAgent(BaseAgent):
 
     def act(self, batch: RoutingBatch) -> RoutingDecision:
         states = self.build_states(batch)
-        action_masks = batch.action_mask.astype(bool, copy=False)
+        action_masks = self._as_bool_mask(batch.action_mask, states)
+        decision_mask = self._as_decision_mask(batch, action_masks)
+        action_masks = action_masks & decision_mask[:, None]
+        decision_rows = self._decision_rows_numpy(batch, len(batch.flowlet_ids))
         if self.is_train():
-            self._finalize_revisited(batch, states, action_masks)
-        actions = self.select_actions(states, action_masks)
-        rows = np.arange(len(actions))
-        valid = (actions >= 0) & action_masks[rows, np.maximum(actions, 0)]
-        act = np.full(len(actions), -1, dtype=np.int64)
-        if valid.any():
-            act[valid] = batch.neighbor_sat_ids[rows[valid], actions[valid]]
+            self._finalize_revisited(batch, self._to_numpy(states, np.float32), self._to_numpy(action_masks, bool))
+        actions = self._empty_action_indices(len(batch.flowlet_ids), states, action_masks)
+        if len(decision_rows) > 0:
+            selected = self.select_actions(
+                self._take_rows(states, decision_rows),
+                self._take_rows(action_masks, decision_rows),
+            )
+            actions = self._put_rows(actions, decision_rows, selected)
+        act = self._action_indices_to_next_hops(batch, actions, action_masks)
         if self.is_train():
-            self._remember_pending(batch, states, action_masks, actions)
+            self._remember_pending(
+                batch,
+                self._to_numpy(states, np.float32),
+                self._to_numpy(action_masks, bool),
+                self._to_numpy(actions, np.int64),
+            )
         return RoutingDecision(next_hop_sat_ids=act)
 
-    def select_actions(self, states: np.ndarray, action_masks: np.ndarray) -> np.ndarray:
+    def select_actions(self, states, action_masks):
         raise NotImplementedError
 
     def add_transition(
@@ -202,11 +212,96 @@ class BatchedRLAgent(BaseAgent):
         self.observe_flowlet_outcomes(flowlets, current_time)
         if not self._pending:
             return
+        if self._has_vector_flowlet_arrays(flowlets):
+            self._finalize_vector_pending(flowlets)
+            return
+        raise RuntimeError("BatchedRLAgent expects vector flowlet arrays with shape [num_envs, capacity].")
+
+    def build_states(self, batch: RoutingBatch):
+        n = len(batch.flowlet_ids)
+        if batch.observations is None:
+            raise RuntimeError("RoutingBatch is missing the legacy 94-dimensional RL observation.")
+        if isinstance(batch.observations, torch.Tensor):
+            observations = batch.observations.to(dtype=torch.float32)
+        else:
+            observations = np.asarray(batch.observations, dtype=np.float32)
+        expected_shape = (n, self.obs_dim)
+        if tuple(observations.shape) != expected_shape:
+            raise RuntimeError(f"Expected observation shape {expected_shape}, got {observations.shape}.")
+        return observations
+
+    def observe_flowlet_outcomes(self, flowlets, _current_time: float) -> None:
+        if not self.is_train():
+            return
+        if not self._pending:
+            return
+        if self._has_vector_flowlet_arrays(flowlets):
+            self._observe_vector_flowlet_outcomes(flowlets)
+            return
+        raise RuntimeError("BatchedRLAgent expects vector flowlet arrays with shape [num_envs, capacity].")
+
+    def _observe_vector_flowlet_outcomes(self, flowlets) -> None:
+        status = np.asarray(flowlets.status)
+        if status.ndim != 2:
+            return
+        capacity = status.shape[1]
+        for env_id in list(self._pending_by_env.keys()):
+            env_pending = self._pending_by_env.get(int(env_id))
+            if not env_pending or env_id < 0 or env_id >= status.shape[0]:
+                continue
+            pending_ids = np.fromiter(env_pending, dtype=np.int64, count=len(env_pending))
+            pending_ids = pending_ids[pending_ids < capacity]
+            if len(pending_ids) == 0:
+                continue
+            terminal_mask = (status[env_id, pending_ids] == FLOWLET_DELIVERED) | (
+                status[env_id, pending_ids] == FLOWLET_DROPPED
+            )
+            for flowlet_id in pending_ids[terminal_mask]:
+                key = (int(env_id), int(flowlet_id))
+                pending = self._pop_pending(key)
+                if pending is None:
+                    continue
+                terminal_status = int(status[env_id, flowlet_id])
+                transition_reward = self._compute_reward(
+                    pending=pending,
+                    current_distance=float(flowlets.remaining_gcd[env_id, flowlet_id]),
+                    total_delay=float(
+                        flowlets.queue_delay[env_id, flowlet_id]
+                        + flowlets.transmission_delay[env_id, flowlet_id]
+                        + flowlets.propagation_delay[env_id, flowlet_id]
+                    ),
+                    queue_cost=float(flowlets.total_queue_cost[env_id, flowlet_id]),
+                    ttl_remaining=float(flowlets.ttl[env_id, flowlet_id]),
+                    terminal_status=terminal_status,
+                    truncated=False,
+                )
+                self.add_transition(
+                    state=pending.state,
+                    action=pending.action,
+                    action_mask=pending.action_mask,
+                    reward=transition_reward.reward,
+                    cost=self._buffer_cost(transition_reward.cost),
+                    done=True,
+                    truncated=False,
+                    next_state=np.zeros(self.obs_dim, dtype=np.float32),
+                    next_action_mask=np.zeros(self.action_dim, dtype=bool),
+                    target_cost=pending.target_cost,
+                    weight=pending.weight,
+                    flowlet_id=pending.flowlet_id,
+                    agent_id=pending.agent_id,
+                    next_agent_id=-1,
+                )
+                self._record_transition_added()
+
+    def _finalize_vector_pending(self, flowlets) -> None:
+        status = np.asarray(flowlets.status)
+        if status.ndim != 2:
+            return
+        capacity = status.shape[1]
         pending_keys = list(self._pending.keys())
         for key in pending_keys:
-            env_id, flowlet_id = key
-            env_flowlets = self._flowlets_for_env(flowlets, env_id)
-            if env_flowlets is None or flowlet_id >= env_flowlets.count:
+            env_id, flowlet_id = int(key[0]), int(key[1])
+            if env_id < 0 or env_id >= status.shape[0] or flowlet_id >= capacity:
                 self._pop_pending(key)
                 continue
             pending = self._pop_pending(key)
@@ -214,14 +309,14 @@ class BatchedRLAgent(BaseAgent):
                 continue
             transition_reward = self._compute_reward(
                 pending=pending,
-                current_distance=float(env_flowlets.remaining_gcd[flowlet_id]),
+                current_distance=float(flowlets.remaining_gcd[env_id, flowlet_id]),
                 total_delay=float(
-                    env_flowlets.queue_delay[flowlet_id]
-                    + env_flowlets.transmission_delay[flowlet_id]
-                    + env_flowlets.propagation_delay[flowlet_id]
+                    flowlets.queue_delay[env_id, flowlet_id]
+                    + flowlets.transmission_delay[env_id, flowlet_id]
+                    + flowlets.propagation_delay[env_id, flowlet_id]
                 ),
-                queue_cost=float(env_flowlets.total_queue_cost[flowlet_id]),
-                ttl_remaining=float(env_flowlets.ttl[flowlet_id]),
+                queue_cost=float(flowlets.total_queue_cost[env_id, flowlet_id]),
+                ttl_remaining=float(flowlets.ttl[env_id, flowlet_id]),
                 terminal_status=None,
                 truncated=True,
             )
@@ -243,85 +338,17 @@ class BatchedRLAgent(BaseAgent):
             )
             self._record_transition_added()
 
-    def build_states(self, batch: RoutingBatch) -> np.ndarray:
-        n = len(batch.flowlet_ids)
-        if batch.observations is None:
-            raise RuntimeError("RoutingBatch is missing the legacy 94-dimensional RL observation.")
-        observations = np.asarray(batch.observations, dtype=np.float32)
-        expected_shape = (n, self.obs_dim)
-        if observations.shape != expected_shape:
-            raise RuntimeError(f"Expected observation shape {expected_shape}, got {observations.shape}.")
-        return observations
-
-    def observe_flowlet_outcomes(self, flowlets, _current_time: float) -> None:
-        if not self.is_train():
-            return
-        if not self._pending:
-            return
-        if hasattr(flowlets, "env_flowlets"):
-            for env_id, env_flowlets in enumerate(flowlets.env_flowlets):
-                self._observe_single_env_flowlet_outcomes(env_id=env_id, flowlets=env_flowlets)
-            return
-        self._observe_single_env_flowlet_outcomes(env_id=0, flowlets=flowlets)
-
-    def _observe_single_env_flowlet_outcomes(self, env_id: int, flowlets) -> None:
-        env_pending = self._pending_by_env.get(int(env_id))
-        if not env_pending:
-            return
-        pending_ids = np.fromiter(
-            env_pending,
-            dtype=np.int64,
-            count=len(env_pending),
-        )
-        pending_ids = pending_ids[pending_ids < flowlets.count]
-        if len(pending_ids) == 0:
-            return
-        terminal_mask = (flowlets.status[pending_ids] == FLOWLET_DELIVERED) | (
-            flowlets.status[pending_ids] == FLOWLET_DROPPED
-        )
-        for flowlet_id in pending_ids[terminal_mask]:
-            key = (int(env_id), int(flowlet_id))
-            pending = self._pop_pending(key)
-            if pending is None:
-                continue
-            terminal_status = int(flowlets.status[flowlet_id])
-            transition_reward = self._compute_reward(
-                pending=pending,
-                current_distance=float(flowlets.remaining_gcd[flowlet_id]),
-                total_delay=float(
-                    flowlets.queue_delay[flowlet_id]
-                    + flowlets.transmission_delay[flowlet_id]
-                    + flowlets.propagation_delay[flowlet_id]
-                ),
-                queue_cost=float(flowlets.total_queue_cost[flowlet_id]),
-                ttl_remaining=float(flowlets.ttl[flowlet_id]),
-                terminal_status=terminal_status,
-                truncated=False,
-            )
-            self.add_transition(
-                state=pending.state,
-                action=pending.action,
-                action_mask=pending.action_mask,
-                reward=transition_reward.reward,
-                cost=self._buffer_cost(transition_reward.cost),
-                done=True,
-                truncated=False,
-                next_state=np.zeros(self.obs_dim, dtype=np.float32),
-                next_action_mask=np.zeros(self.action_dim, dtype=bool),
-                target_cost=pending.target_cost,
-                weight=pending.weight,
-                flowlet_id=pending.flowlet_id,
-                agent_id=pending.agent_id,
-                next_agent_id=-1,
-            )
-            self._record_transition_added()
-
     def _finalize_revisited(self, batch: RoutingBatch, states: np.ndarray, action_masks: np.ndarray) -> None:
         total_delay = self._total_delay(batch)
         queue_cost = self._optional(batch.total_queue_cost, len(batch.flowlet_ids))
         remaining_gcd = self._optional(batch.remaining_gcd, len(batch.flowlet_ids))
-        env_ids = batch.row_env_ids
-        for row, flowlet_id in enumerate(batch.flowlet_ids):
+        env_ids = self._to_numpy(batch.row_env_ids, np.int64)
+        flowlet_ids = self._to_numpy(batch.flowlet_ids, np.int64)
+        current_sat_ids = self._to_numpy(batch.current_sat_ids, np.int64)
+        ttl = self._optional(batch.ttl, len(batch.flowlet_ids))
+        decision_rows = self._decision_rows_numpy(batch, len(flowlet_ids))
+        for row in decision_rows:
+            flowlet_id = flowlet_ids[row]
             key = (int(env_ids[row]), int(flowlet_id))
             pending = self._pop_pending(key)
             if pending is None:
@@ -331,7 +358,7 @@ class BatchedRLAgent(BaseAgent):
                 current_distance=float(remaining_gcd[row]),
                 total_delay=float(total_delay[row]),
                 queue_cost=float(queue_cost[row]),
-                ttl_remaining=float(batch.ttl[row]),
+                ttl_remaining=float(ttl[row]),
                 terminal_status=None,
                 truncated=False,
             )
@@ -353,7 +380,7 @@ class BatchedRLAgent(BaseAgent):
                 weight=pending.weight,
                 flowlet_id=pending.flowlet_id,
                 agent_id=pending.agent_id,
-                next_agent_id=int(batch.current_sat_ids[row]),
+                next_agent_id=int(current_sat_ids[row]),
             )
             self._record_transition_added()
 
@@ -369,12 +396,18 @@ class BatchedRLAgent(BaseAgent):
         shortest_gcd = self._optional(batch.shortest_gcd, len(batch.flowlet_ids))
         initial_gcd = np.maximum(self._optional(batch.initial_gcd, len(batch.flowlet_ids)), 1e-6)
         packet_count = self._optional(batch.packet_count, len(batch.flowlet_ids))
-        env_ids = batch.row_env_ids
-        for row, action in enumerate(actions):
+        env_ids = self._to_numpy(batch.row_env_ids, np.int64)
+        flowlet_ids = self._to_numpy(batch.flowlet_ids, np.int64)
+        agent_ids = self._to_numpy(batch.agent_ids, np.int64)
+        flowlet_size = self._optional(batch.flowlet_size, len(batch.flowlet_ids))
+        ttl = self._optional(batch.ttl, len(batch.flowlet_ids))
+        decision_rows = self._decision_rows_numpy(batch, len(flowlet_ids))
+        for row in decision_rows:
+            action = actions[row]
             if action < 0 or not action_masks[row, action]:
                 continue
             env_id = int(env_ids[row])
-            flowlet_id = int(batch.flowlet_ids[row])
+            flowlet_id = int(flowlet_ids[row])
             key = (env_id, flowlet_id)
             updated_shortest = self._updated_shortest_gcd.pop(key, float(shortest_gcd[row]))
             self._set_pending(
@@ -382,7 +415,7 @@ class BatchedRLAgent(BaseAgent):
                 PendingTransition(
                     env_id=env_id,
                     flowlet_id=flowlet_id,
-                    agent_id=int(batch.agent_ids[row]),
+                    agent_id=int(agent_ids[row]),
                     state=states[row].copy(),
                     action=int(action),
                     action_mask=action_masks[row].copy(),
@@ -390,8 +423,8 @@ class BatchedRLAgent(BaseAgent):
                     queue_cost=float(queue_cost[row]),
                     shortest_gcd=float(updated_shortest),
                     initial_gcd=float(initial_gcd[row]),
-                    flowlet_size=float(batch.flowlet_size[row]),
-                    ttl=float(batch.ttl[row]),
+                    flowlet_size=float(flowlet_size[row]),
+                    ttl=float(ttl[row]),
                     delay_norm=self.reward_config.delay_norm,
                     target_cost=self._target_cost(),
                     weight=max(float(packet_count[row]), 1.0),
@@ -468,6 +501,8 @@ class BatchedRLAgent(BaseAgent):
     def _optional(values: np.ndarray | None, length: int) -> np.ndarray:
         if values is None:
             return np.zeros(length, dtype=np.float64)
+        if isinstance(values, torch.Tensor):
+            return values.detach().cpu().numpy().astype(np.float64, copy=False)
         return np.asarray(values, dtype=np.float64)
 
     def _total_delay(self, batch: RoutingBatch) -> np.ndarray:
@@ -478,14 +513,19 @@ class BatchedRLAgent(BaseAgent):
         )
 
     @staticmethod
-    def _flowlets_for_env(flowlets, env_id: int):
-        if hasattr(flowlets, "env_flowlets"):
-            if env_id < 0 or env_id >= len(flowlets.env_flowlets):
-                return None
-            return flowlets.env_flowlets[env_id]
-        return flowlets if env_id == 0 else None
+    def _has_vector_flowlet_arrays(flowlets) -> bool:
+        status = getattr(flowlets, "status", None)
+        if status is None:
+            return False
+        return np.asarray(status).ndim == 2
 
-    def _valid_random_actions(self, action_masks: np.ndarray) -> np.ndarray:
+    def _valid_random_actions(self, action_masks):
+        if isinstance(action_masks, torch.Tensor):
+            scores = torch.rand(action_masks.shape, device=action_masks.device)
+            scores = scores.masked_fill(~action_masks, -1.0)
+            actions = torch.argmax(scores, dim=1)
+            actions = torch.where(action_masks.any(dim=1), actions, torch.full_like(actions, -1))
+            return actions
         actions = np.full(len(action_masks), -1, dtype=np.int64)
         for row, mask in enumerate(action_masks):
             valid_actions = np.flatnonzero(mask)
@@ -522,10 +562,95 @@ class BatchedRLAgent(BaseAgent):
             stats["replay"] = replay_buffer.metadata_summary()
         return stats
 
-    def _masked_argmax(self, values: torch.Tensor, action_masks: np.ndarray) -> np.ndarray:
+    def _masked_argmax(self, values: torch.Tensor, action_masks):
         mask = torch.as_tensor(action_masks, dtype=torch.bool, device=values.device)
         masked = values.masked_fill(~mask, -1e9)
-        actions = torch.argmax(masked, dim=1).cpu().numpy().astype(np.int64)
-        has_action = action_masks.any(axis=1)
-        actions[~has_action] = -1
+        actions = torch.argmax(masked, dim=1)
+        has_action = mask.any(dim=1)
+        actions = torch.where(has_action, actions, torch.full_like(actions, -1))
+        if isinstance(action_masks, torch.Tensor):
+            return actions.to(action_masks.device)
+        actions = actions.cpu().numpy().astype(np.int64)
         return actions
+
+    @staticmethod
+    def _to_numpy(values, dtype=None) -> np.ndarray:
+        if isinstance(values, torch.Tensor):
+            array = values.detach().cpu().numpy()
+        else:
+            array = np.asarray(values)
+        if dtype is not None:
+            return array.astype(dtype, copy=False)
+        return array
+
+    @staticmethod
+    def _as_bool_mask(values, like):
+        if isinstance(values, torch.Tensor):
+            device = like.device if isinstance(like, torch.Tensor) else values.device
+            return values.to(device=device, dtype=torch.bool)
+        return np.asarray(values, dtype=bool)
+
+    @staticmethod
+    def _as_decision_mask(batch: RoutingBatch, action_masks):
+        if batch.decision_mask is None:
+            if isinstance(action_masks, torch.Tensor):
+                return torch.ones(len(action_masks), dtype=torch.bool, device=action_masks.device)
+            return np.ones(len(action_masks), dtype=bool)
+        if isinstance(action_masks, torch.Tensor):
+            return torch.as_tensor(batch.decision_mask, dtype=torch.bool, device=action_masks.device)
+        return np.asarray(batch.decision_mask, dtype=bool)
+
+    def _decision_rows_numpy(self, batch: RoutingBatch, length: int) -> np.ndarray:
+        if batch.decision_rows is not None:
+            return self._to_numpy(batch.decision_rows, np.int64)
+        if batch.decision_mask is None:
+            return np.arange(length, dtype=np.int64)
+        return np.flatnonzero(self._to_numpy(batch.decision_mask, bool))
+
+    @staticmethod
+    def _empty_action_indices(length: int, states, action_masks):
+        if isinstance(states, torch.Tensor):
+            return torch.full((length,), -1, dtype=torch.long, device=states.device)
+        if isinstance(action_masks, torch.Tensor):
+            return torch.full((length,), -1, dtype=torch.long, device=action_masks.device)
+        return np.full(length, -1, dtype=np.int64)
+
+    @staticmethod
+    def _take_rows(values, rows: np.ndarray):
+        if isinstance(values, torch.Tensor):
+            return values[torch.as_tensor(rows, dtype=torch.long, device=values.device)]
+        return values[rows]
+
+    @staticmethod
+    def _put_rows(actions, rows: np.ndarray, selected):
+        if isinstance(actions, torch.Tensor):
+            actions[torch.as_tensor(rows, dtype=torch.long, device=actions.device)] = (
+                selected.to(device=actions.device, dtype=torch.long)
+                if isinstance(selected, torch.Tensor)
+                else torch.as_tensor(selected, dtype=torch.long, device=actions.device)
+            )
+            return actions
+        actions[rows] = selected.detach().cpu().numpy().astype(np.int64, copy=False) if isinstance(selected, torch.Tensor) else np.asarray(selected, dtype=np.int64)
+        return actions
+
+    @staticmethod
+    def _action_indices_to_next_hops(batch: RoutingBatch, actions, action_masks):
+        if isinstance(actions, torch.Tensor) or isinstance(action_masks, torch.Tensor):
+            mask = action_masks if isinstance(action_masks, torch.Tensor) else torch.as_tensor(action_masks, dtype=torch.bool)
+            device = mask.device
+            act_idx = actions.to(device=device, dtype=torch.long) if isinstance(actions, torch.Tensor) else torch.as_tensor(actions, dtype=torch.long, device=device)
+            rows = torch.arange(len(act_idx), dtype=torch.long, device=device)
+            safe_actions = torch.clamp(act_idx, min=0)
+            valid = (act_idx >= 0) & mask[rows, safe_actions]
+            next_hops = torch.full((len(act_idx),), -1, dtype=torch.long, device=device)
+            neighbor_sat_ids = batch.neighbor_sat_ids.to(device=device, dtype=torch.long)
+            if len(act_idx) > 0:
+                next_hops = torch.where(valid, neighbor_sat_ids[rows, safe_actions], next_hops)
+            return next_hops
+
+        rows = np.arange(len(actions))
+        valid = (actions >= 0) & action_masks[rows, np.maximum(actions, 0)]
+        act = np.full(len(actions), -1, dtype=np.int64)
+        if valid.any():
+            act[valid] = batch.neighbor_sat_ids[rows[valid], actions[valid]]
+        return act

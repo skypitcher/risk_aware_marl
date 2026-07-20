@@ -1,7 +1,7 @@
 import argparse
 import time
 
-from sat_net import RoutingEnv
+from sat_net import ArrayVectorRoutingEnv
 from sat_net.pipeline import run_marl_rollout
 from sat_net.agent import create_agent
 from sat_net.config import DEFAULT_MAIN_CONFIG, DEFAULT_SPF_AGENT_CONFIG, load_config, load_env_config, merge_section
@@ -9,23 +9,34 @@ from sat_net.config import DEFAULT_MAIN_CONFIG, DEFAULT_SPF_AGENT_CONFIG, load_c
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", type=str, default=DEFAULT_MAIN_CONFIG)
-    parser.add_argument("--env", type=str, default=None)
     parser.add_argument("--seed", type=int, default=None)
     parser.add_argument("--duration_seconds", type=float, default=None)
+    parser.add_argument("--concurrent_flowlets_per_env", type=int, default=None)
+    parser.add_argument("--region_chunk_size", type=int, default=None)
     args_raw = parser.parse_args()
 
     main_config = load_config(args_raw.config)
     args = merge_section(
-        {"config": DEFAULT_MAIN_CONFIG, "env": None, "seed": 3333, "duration_seconds": 60.0},
+        {
+            "config": DEFAULT_MAIN_CONFIG,
+            "seed": 3333,
+            "duration_seconds": 60.0,
+            "concurrent_flowlets_per_env": None,
+            "region_chunk_size": 32,
+        },
         main_config,
         "spf",
         vars(args_raw),
     )
 
     start_time = time.time()
-    env_config = load_env_config(main_config, override_path=args.env)
+    env_config = load_env_config(main_config)
+    if args.get("concurrent_flowlets_per_env", None) is not None:
+        env_config.traffic.concurrent_flowlets_per_env = int(args.concurrent_flowlets_per_env)
+    if args.get("region_chunk_size", None) is not None:
+        env_config.traffic.region_chunk_size = int(args.region_chunk_size)
     agent_config = load_config(DEFAULT_SPF_AGENT_CONFIG)
-    env = RoutingEnv(env_config)
+    env = ArrayVectorRoutingEnv(env_config, num_envs=1)
     agent = create_agent(agent_config)
     result = run_marl_rollout(
         env=env,

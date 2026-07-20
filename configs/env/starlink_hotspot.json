@@ -1,9 +1,0 @@
-{
-    "extends": "starlink_world_base.json",
-    "progress_interval_seconds": 10,
-    "traffic": {
-        "packet_rate_per_ms": 10000,
-        "slot_ms": 1,
-        "mean_packets_per_flowlet": 256
-    }
-}

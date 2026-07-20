@@ -1,6 +1,0 @@
-{
-    "extends": "starlink_world_base.json",
-    "traffic": {
-        "packet_rate_per_ms": 300
-    }
-}

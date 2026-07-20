@@ -2,8 +2,10 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
+from typing import Any
 
 import numpy as np
+import torch
 
 
 ACTION_N = 0
@@ -17,80 +19,119 @@ ACTION_COUNT = 4
 class RoutingBatch:
     """Multi-agent routing decisions for flowlets currently resident at satellites."""
 
-    flowlet_ids: np.ndarray
-    current_sat_ids: np.ndarray
-    source_region_ids: np.ndarray
-    target_region_ids: np.ndarray
-    target_access_sat_ids: np.ndarray
-    neighbor_sat_ids: np.ndarray
-    neighbor_link_ids: np.ndarray
-    action_mask: np.ndarray
-    neighbor_queue_load: np.ndarray
-    neighbor_link_capacity: np.ndarray
-    neighbor_link_delay: np.ndarray
-    neighbor_link_free_time: np.ndarray
-    flowlet_size: np.ndarray
-    packet_count: np.ndarray
-    is_normal: np.ndarray
-    creation_time: np.ndarray
-    ttl: np.ndarray
+    flowlet_ids: Any
+    current_sat_ids: Any
+    source_region_ids: Any
+    target_region_ids: Any
+    target_access_sat_ids: Any
+    neighbor_sat_ids: Any
+    neighbor_link_ids: Any
+    action_mask: Any
+    neighbor_queue_load: Any
+    neighbor_link_capacity: Any
+    neighbor_link_delay: Any
+    neighbor_link_free_time: Any
+    flowlet_size: Any
+    packet_count: Any
+    is_normal: Any
+    creation_time: Any
+    ttl: Any
     current_time: float
     region_next_hop_table: np.ndarray | None = None
     region_next_hop_version: int = 0
-    region_next_hop_tables: tuple[np.ndarray | None, ...] | None = None
+    region_next_hop_tables: Any | None = None
     region_next_hop_versions: np.ndarray | None = None
-    observations: np.ndarray | None = None
-    hops: np.ndarray | None = None
-    queue_delay: np.ndarray | None = None
-    transmission_delay: np.ndarray | None = None
-    propagation_delay: np.ndarray | None = None
-    total_queue_cost: np.ndarray | None = None
-    remaining_gcd: np.ndarray | None = None
-    shortest_gcd: np.ndarray | None = None
-    initial_gcd: np.ndarray | None = None
-    last_action1: np.ndarray | None = None
-    last_action2: np.ndarray | None = None
-    last_node1: np.ndarray | None = None
-    last_node2: np.ndarray | None = None
-    env_ids: np.ndarray | None = None
-    current_times: np.ndarray | None = None
+    node_state: Any | None = None
+    link_state: Any | None = None
+    observations: Any | None = None
+    hops: Any | None = None
+    queue_delay: Any | None = None
+    transmission_delay: Any | None = None
+    propagation_delay: Any | None = None
+    total_queue_cost: Any | None = None
+    remaining_gcd: Any | None = None
+    shortest_gcd: Any | None = None
+    initial_gcd: Any | None = None
+    last_action1: Any | None = None
+    last_action2: Any | None = None
+    last_node1: Any | None = None
+    last_node2: Any | None = None
+    env_ids: Any | None = None
+    current_times: Any | None = None
+    decision_mask: Any | None = None
+    decision_rows: Any | None = None
 
     @property
-    def agent_ids(self) -> np.ndarray:
+    def agent_ids(self) -> Any:
         """Satellite-agent id for each row in this decision batch."""
         return self.current_sat_ids
 
     @property
-    def row_env_ids(self) -> np.ndarray:
+    def row_env_ids(self) -> Any:
         if self.env_ids is None:
+            if isinstance(self.flowlet_ids, torch.Tensor):
+                return torch.zeros(len(self.flowlet_ids), dtype=torch.long, device=self.flowlet_ids.device)
             return np.zeros(len(self.flowlet_ids), dtype=np.int64)
         return self.env_ids
 
     @property
-    def row_current_times(self) -> np.ndarray:
+    def row_current_times(self) -> Any:
         if self.current_times is None:
+            if isinstance(self.flowlet_ids, torch.Tensor):
+                return torch.full(
+                    (len(self.flowlet_ids),),
+                    float(self.current_time),
+                    dtype=torch.float32,
+                    device=self.flowlet_ids.device,
+                )
             return np.full(len(self.flowlet_ids), float(self.current_time), dtype=np.float64)
         return self.current_times
 
     @property
     def decision_count(self) -> int:
+        return self.active_decision_count
+
+    @property
+    def batch_size(self) -> int:
         return len(self.flowlet_ids)
 
     @property
-    def active_agent_ids(self) -> np.ndarray:
+    def active_decision_count(self) -> int:
+        if self.decision_rows is not None:
+            return len(self.decision_rows)
+        if self.decision_mask is None:
+            return len(self.flowlet_ids)
+        if isinstance(self.decision_mask, torch.Tensor):
+            return int(self.decision_mask.sum().detach().cpu().item())
+        return int(np.asarray(self.decision_mask, dtype=bool).sum())
+
+    @property
+    def active_agent_ids(self) -> Any:
         if len(self.current_sat_ids) == 0:
+            if isinstance(self.current_sat_ids, torch.Tensor):
+                return torch.empty(0, dtype=torch.long, device=self.current_sat_ids.device)
             return np.empty(0, dtype=np.int64)
+        if isinstance(self.current_sat_ids, torch.Tensor):
+            # Avoid torch.unique(..., dim=0): it is unsupported on Apple MPS and
+            # this property is only used for lightweight progress statistics.
+            return self.current_sat_ids
+        current_sat_ids = self.current_sat_ids
+        if self.decision_mask is not None:
+            current_sat_ids = current_sat_ids[np.asarray(self.decision_mask, dtype=bool)]
         if self.env_ids is not None:
-            env_agent_pairs = np.column_stack((self.env_ids, self.current_sat_ids))
+            env_ids = self.env_ids
+            if self.decision_mask is not None:
+                env_ids = env_ids[np.asarray(self.decision_mask, dtype=bool)]
+            env_agent_pairs = np.column_stack((env_ids, current_sat_ids))
             return np.unique(env_agent_pairs, axis=0)
-        return np.unique(self.current_sat_ids)
+        return np.unique(current_sat_ids)
 
 
 @dataclass(slots=True)
 class RoutingDecision:
     """Next-hop satellite ids selected by a batched routing policy."""
 
-    next_hop_sat_ids: np.ndarray
+    next_hop_sat_ids: Any
 
 
 class BaseAgent(ABC):
